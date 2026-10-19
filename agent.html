@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NAVIGATOR — Agent Workspace · SIH 26171</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23061032'/%3E%3Ccircle cx='12' cy='12' r='6.5' fill='none' stroke='%2346d7ff' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%23a06bff'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/src/styles/main.css" />
+  <link rel="stylesheet" href="/src/styles/agent.css" />
+</head>
+<body class="agent-body">
+  <!-- Top App Bar -->
+  <header class="agent-header">
+    <div class="agent-header__left">
+      <a class="nav__brand" href="/">
+        <span class="nav__logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
+        </span>
+        <span class="nav__wordmark">NAVIGATOR<sup>WORKSPACE</sup></span>
+      </a>
+      <span class="agent-pill">Autonomous Mode</span>
+      <span class="agent-pill agent-pill--vault">Local Vault Active</span>
+    </div>
+    <div class="agent-header__right">
+      <div class="agent-ws-indicator" id="wsIndicator">
+        <span class="status-dot status-dot--offline" id="wsDot"></span>
+        <span class="status-text" id="wsText">Connecting...</span>
+      </div>
+      <button id="btnNewSession" class="btn btn--sm btn--ghost">New Mission</button>
+      <a href="/" class="btn btn--sm btn--ghost">Overview ←</a>
+    </div>
+  </header>
+
+  <!-- Workspace Split Grid -->
+  <main class="agent-workspace">
+    <!-- Left: Timeline & Chat Feed -->
+    <section class="agent-timeline">
+      <!-- Input Panel -->
+      <div class="agent-input-card">
+        <label for="missionInput" class="agent-input-label">
+          <span>MISSION DIRECTIVE</span>
+          <span class="agent-state-badge" id="missionStateBadge">READY</span>
+        </label>
+        <textarea id="missionInput" class="agent-textarea" rows="2" placeholder="e.g. Buy me a yellow dress from amazon (proceed until checkout)"></textarea>
+
+        <!-- Quick Presets -->
+        <div class="agent-presets">
+          <span class="agent-presets__label">Quick Missions:</span>
+          <button class="preset-chip" data-prompt="open WhatsApp and search for Mom to send a message">💬 WhatsApp Message</button>
+          <button class="preset-chip" data-prompt="Open YouTube, search for Interstellar main theme, and play the first video">▶️ YouTube Video Play</button>
+          <button class="preset-chip" data-prompt="buy me a yellow dress from amazon">👗 Yellow dress on Amazon (to checkout)</button>
+          <button class="preset-chip" data-prompt="Find Realme 15 Pro on Amazon and check its price and display specs">📱 Realme 15 Pro specs</button>
+        </div>
+
+        <div class="agent-actions">
+          <button id="btnStartMission" class="btn btn--primary" disabled>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Start Mission
+          </button>
+          <button id="btnCancelMission" class="btn btn--ghost" hidden>Cancel</button>
+          <span id="missionSubtext" class="agent-subtext">Automated browsing with fail-closed privacy.</span>
+        </div>
+      </div>
+
+      <!-- Human Credential / Action Banner (shown when sign-in or payment reached) -->
+      <div class="human-gate" id="humanGate" hidden>
+        <div class="human-gate__icon">🔐</div>
+        <div class="human-gate__content">
+          <h4 id="humanGateTitle">Sign-in or Payment Confirmation Required</h4>
+          <p id="humanGateMsg">Amazon requires your credentials or authentication in your Chrome browser tab. Please switch to the tab, complete sign-in/verification, and click Continue.</p>
+          <pre id="humanGateAction" class="human-gate__action" hidden></pre>
+          <div class="human-gate__buttons">
+            <button id="btnGateApprove" class="btn btn--primary btn--sm">✓ I Have Completed This / Continue</button>
+            <button id="btnGateReject" class="btn btn--ghost btn--sm">Abort Mission</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Mission Execution Feed -->
+      <div class="agent-feed-card">
+        <div class="agent-feed-header">
+          <h3>EXECUTION TIMELINE</h3>
+          <span id="feedStepsCount" class="agent-counter">0 steps executed</span>
+        </div>
+        <ol class="agent-steps" id="agentStepsList">
+          <li class="agent-step-placeholder">Submit a mission directive to begin autonomous browser execution.</li>
+        </ol>
+
+        <!-- Final Result Card (Rich display with product title, price, direct link) -->
+        <div class="agent-result-card" id="agentResultCard" hidden>
+          <div class="agent-result-card__header">
+            <span class="agent-result-badge" id="resultBadge">✓ Mission Completed</span>
+            <span class="agent-result-time" id="resultTimestamp"></span>
+          </div>
+          <div class="agent-result-card__body" id="resultContent">
+            <!-- Dynamically populated with title, price, direct link -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right: Browser Inspector & Privacy Sentinel -->
+    <aside class="agent-sidebar">
+      <!-- Active Tab Inspector -->
+      <div class="inspector-card">
+        <div class="inspector-card__header">
+          <h4>BROWSER INSPECTOR</h4>
+          <span class="live-dot">● LIVE</span>
+        </div>
+        <div class="inspector-field">
+          <label>ACTIVE TAB URL</label>
+          <div class="inspector-url-box">
+            <a id="inspectorUrl" href="#" target="_blank" rel="noopener noreferrer">Waiting for task...</a>
+          </div>
+        </div>
+        <div class="inspector-field">
+          <label>PAGE TITLE</label>
+          <div id="inspectorTitle" class="inspector-text">—</div>
+        </div>
+        <div class="inspector-field">
+          <label>LATEST EVIDENCE</label>
+          <div id="inspectorEvidence" class="inspector-code">Ready</div>
+        </div>
+        <!-- Live Visual Perception Frame -->
+        <div class="inspector-viewport-wrap">
+          <div class="inspector-viewport-header">
+            <label>VISUAL PERCEPTION FRAME</label>
+            <span class="obstacle-badge obstacle-badge--clear" id="obstacleBadge">✓ Workflow Clear</span>
+          </div>
+          <div class="inspector-viewport" id="inspectorViewport">
+            <img id="inspectorScreenshot" class="inspector-screenshot" alt="Visual Workflow Frame" hidden />
+            <div id="inspectorScreenshotPlaceholder" class="inspector-screenshot-placeholder">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6">
+                <rect x="3" y="3" width="18" height="18" rx="3"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <path d="M21 15l-5-5L5 21"/>
+              </svg>
+              <span>Awaiting visual tab capture...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Privacy Sentinel Card -->
+      <div class="inspector-card">
+        <div class="inspector-card__header">
+          <h4>PRIVACY SENTINEL</h4>
+          <span class="shield-badge">SHIELDED</span>
+        </div>
+        <ul class="sentinel-list">
+          <li>
+            <span class="sentinel-icon">🔒</span>
+            <div>
+              <strong>Local Vault Redaction</strong>
+              <p>Passwords, credit cards, SSNs, and auth tokens are stripped locally before model call.</p>
+            </div>
+          </li>
+          <li>
+            <span class="sentinel-icon">⚡</span>
+            <div>
+              <strong>On-Device Perception</strong>
+              <p>DOM candidates & visual bounding boxes analyzed without uploading full screenshots.</p>
+            </div>
+          </li>
+          <li>
+            <span class="sentinel-icon">🛡️</span>
+            <div>
+              <strong>Human-in-the-Loop Gate</strong>
+              <p>Pauses automatically on sign-in or payment submission.</p>
+            </div>
+          </li>
+        </ul>
+      </div>
+
+      <!-- System Telemetry -->
+      <div class="inspector-card inspector-card--telemetry">
+        <div class="telemetry-grid">
+          <div class="telemetry-item">
+            <span class="telemetry-val" id="telPlannerLatency">1.4s</span>
+            <span class="telemetry-lbl">Planner Speed</span>
+          </div>
+          <div class="telemetry-item">
+            <span class="telemetry-val" id="telStepsDone">0 / 25</span>
+            <span class="telemetry-lbl">Step Budget</span>
+          </div>
+          <div class="telemetry-item">
+            <span class="telemetry-val">0</span>
+            <span class="telemetry-lbl">PII Leaks</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script type="module" src="/src/agentApp.ts"></script>
+</body>
+</html>

@@ -1,0 +1,115 @@
+"""Bounded agent loop: budgets, cancellation, repeated-failure recovery."""
+import asyncio
+
+import pytest
+
+from app import agentLoop
+
+
+class FakeHub:
+    """Scripted extension+planner stand-in. Feeds queued results per action type."""
+    def __init__(self, script: dict[str, list[dict]]):
+        self.script = script
+        self.executed: list[str] = []
+        self.alerted: list[str] = []
+        self.ext_online = True
+
+    async def send_action(self, task_id: str, action: dict, timeout_s: float = 45.0):
+        await asyncio.sleep(0.02)  # let cancellation land mid-loop in tests
+        t = action["type"]
+        self.executed.append(t)
+        q = self.script.setdefault(t, [{}])
+        if not q:
+            return {"ok": True}
+        head = q[0]
+        if "fail_n" in head:
+            n = head.setdefault("_n", head["fail_n"])
+            if n > 0:
+                head["_n"] = n - 1
+                return {"ok": False, "error": {"code": head.get("code", "TIMEOUT"), "message": head.get("msg", "x"), "recoverable": True}}
+            q.pop(0)  # exhausted — subsequent calls fall through to next item
+            return {"ok": True}
+        if len(q) > 1:
+            return q.pop(0)
+        return q[0]
+
+
+def test_budget_abort_at_max_steps(monkeypatch):
+    monkeypatch.setattr(agentLoop, "MAX_STEPS", 3)
+    hub = FakeHub({"click": [{"ok": True}]})
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=lambda i, p, h: {"goal": "loop forever",
+                                      "steps": [{"why": "again", "action": {"type": "click", "risk": "write", "verify": "v", "timeoutMs": 100, "target": {"targetId": "b1"}}}]},
+        obs_factory=lambda: {"tabId": 1, "url": "http://x/", "title": "t", "interactive": [], "scroll": {}, "dpr": 1},
+    ))
+    assert state["final"] == "budget_exceeded"
+    assert len(hub.executed) <= 4
+
+
+def test_cancellation_between_actions():
+    hub = FakeHub({"click": [{"ok": True} for _ in range(10)]})
+    state_holder = {}
+
+    class Planner:
+        calls = 0
+        def __call__(self, i, p, h):
+            return {"goal": "g", "steps": [{"why": "w", "action": {"type": "click", "risk": "write", "verify": "v", "timeoutMs": 100, "target": {"targetId": "b1"}}}]}
+
+    async def scenario():
+        async def cancel_soon():
+            await asyncio.sleep(0.05)
+            agentLoop.request_cancel("test-task")
+        hub2 = FakeHub({"click": [{"ok": True} for _ in range(10)]})
+        state_holder["hub"] = hub2
+        state = await asyncio.gather(
+            agentLoop.run_with_injection(
+                hub2, planner=Planner(),
+                obs_factory=lambda: {"tabId": 1, "url": "u", "title": "t", "interactive": [], "scroll": {}, "dpr": 1},
+            ),
+            cancel_soon(),
+        )
+        return state[0]
+
+    state = asyncio.run(scenario())
+    assert state["final"] == "cancelled"
+
+
+def test_repeated_identical_error_triggers_replan_penalized():
+    hub = FakeHub({"click": [{"ok": False, "error": {"code": "STALE_TARGET", "message": "gone", "recoverable": True}, "fail_n": 9},
+                             {"ok": True}]})
+    plans: list[dict] = []
+    calls = {"n": 0}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            plans.append(h)
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                return {"goal": "g", "steps": []}
+            return {"goal": "g", "steps": [{"why": "w", "action": {"type": "click", "risk": "write", "verify": "v", "timeoutMs": 100, "target": {"targetId": "b1"}}}]}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(),
+        obs_factory=lambda: {"tabId": 1, "url": "u", "title": "t", "interactive": [], "scroll": {}, "dpr": 1},
+    ))
+    assert state["final"] == "completed"
+    # after the first identical STALE_TARGET failure, the next planner call must see a penalty entry
+    assert any(isinstance(h, dict) and "penalty" in h for call_hist in plans for h in call_hist)
+
+
+def test_summary_contains_evidence():
+    hub = FakeHub({"navigate": [{"ok": True, "evidence": "https://www.google.com/search?q=jwst"}]})
+    calls = {"n": 0}
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"goal": "search", "steps": [{"why": "go", "action": {"type": "navigate", "risk": "write", "verify": "url", "timeoutMs": 1000, "params": {"url": "https://www.google.com/search?q=jwst"}}}]}
+            return {"goal": "search", "steps": []}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(),
+        obs_factory=lambda: {"tabId": 1, "url": "https://www.google.com/search?q=jwst", "title": "jwst - Google Search", "interactive": [], "scroll": {}, "dpr": 1},
+    ))
+    assert state["final"] == "completed"
+    assert "google.com" in (state["summary"] or "")

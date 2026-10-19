@@ -1,0 +1,17 @@
+{
+  "name": "sih-26171-landing",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "node tests/structure.test.mjs && node tests/console.test.mjs"
+  },
+  "devDependencies": {
+    "sharp": "^0.35.5",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}

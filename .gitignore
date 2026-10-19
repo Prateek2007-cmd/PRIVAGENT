@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+extension/node_modules/
+backend/venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+extension/dist/
+
+# Python cache & test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+backend/.pytest_cache/
+
+# Environment variables & secrets
+.env
+*.env
+backend/.env
+backend/*.env
+!backend/.env.example
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
