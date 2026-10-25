@@ -657,3 +657,68 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Dynamic Start Mission Working State (Motion Up & Down) */
+.btn--working {
+  position: relative;
+  background: linear-gradient(135deg, rgba(70, 215, 255, 0.95), rgba(160, 107, 255, 0.95)) !important;
+  color: #04122b !important;
+  cursor: wait !important;
+  box-shadow: 0 0 20px rgba(70, 215, 255, 0.45), 0 4px 14px rgba(160, 107, 255, 0.35) !important;
+  animation: working-float 1s ease-in-out infinite alternate !important;
+  transition: all 0.25s ease;
+}
+
+@keyframes working-float {
+  0% {
+    transform: translateY(0);
+  }
+  100% {
+    transform: translateY(-5px);
+  }
+}
+
+.btn-working-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.btn-working-spinner {
+  animation: working-spin 1.1s linear infinite;
+}
+
+@keyframes working-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.btn-working-dots {
+  display: inline-block;
+  animation: working-dots-pulse 1.2s infinite ease-in-out;
+}
+
+@keyframes working-dots-pulse {
+  0%, 20% { opacity: 0.25; }
+  50% { opacity: 1; }
+  100% { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn--working {
+    animation: none !important;
+  }
+  .btn-working-spinner {
+    animation: none !important;
+  }
+  .btn-working-dots {
+    animation: none !important;
+  }
+}
+

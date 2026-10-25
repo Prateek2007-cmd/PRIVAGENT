@@ -30,6 +30,10 @@ class TaskRecord:
     confirm_event: asyncio.Event = field(default_factory=asyncio.Event)
     confirm_decision: Optional[bool] = None
     screenshot: Optional[str] = None
+    # Phase timings for the UI telemetry (milliseconds).
+    planner_ms: Optional[int] = None
+    observe_ms: Optional[int] = None
+    act_ms: Optional[int] = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -147,6 +151,9 @@ class Hub:
                 "stepsDone": task.steps_done,
                 "message": task.message,
                 "screenshot": task.screenshot,
+                "plannerMs": task.planner_ms,
+                "observeMs": task.observe_ms,
+                "actMs": task.act_ms,
             },
         }
         for ws in list(self.client_sockets):

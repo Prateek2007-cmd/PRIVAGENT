@@ -28,6 +28,7 @@ const inspectorUrl = document.getElementById("inspectorUrl") as HTMLAnchorElemen
 const inspectorTitle = document.getElementById("inspectorTitle") as HTMLElement | null;
 const inspectorEvidence = document.getElementById("inspectorEvidence") as HTMLElement | null;
 const telStepsDone = document.getElementById("telStepsDone") as HTMLElement | null;
+const telPlannerLatency = document.getElementById("telPlannerLatency") as HTMLElement | null;
 const obstacleBadge = document.getElementById("obstacleBadge") as HTMLElement | null;
 const inspectorScreenshot = document.getElementById("inspectorScreenshot") as HTMLImageElement | null;
 const inspectorScreenshotPlaceholder = document.getElementById("inspectorScreenshotPlaceholder") as HTMLElement | null;
@@ -159,9 +160,34 @@ function addStepItem(message: string): void {
   }
 }
 
+const START_MISSION_HTML = `
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+  Start Mission
+`.trim();
+
+const WORKING_MISSION_HTML = `
+  <span class="btn-working-content">
+    <svg class="btn-working-spinner" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+    Working<span class="btn-working-dots">...</span>
+  </span>
+`.trim();
+
+function setButtonWorking(working: boolean): void {
+  if (!btnStartMission) return;
+  if (working) {
+    btnStartMission.disabled = true;
+    btnStartMission.classList.add("btn--working");
+    btnStartMission.innerHTML = WORKING_MISSION_HTML;
+  } else {
+    btnStartMission.classList.remove("btn--working");
+    btnStartMission.innerHTML = START_MISSION_HTML;
+    btnStartMission.disabled = !missionInput?.value.trim();
+  }
+}
+
 function renderCompletion(taskState: string, message: string): void {
   setTaskState(taskState);
-  if (btnStartMission) btnStartMission.disabled = false;
+  setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (humanGate) humanGate.hidden = true;
 
@@ -212,7 +238,7 @@ document.querySelectorAll(".preset-chip").forEach(chip => {
 
 btnStartMission?.addEventListener("click", async () => {
   if (!missionInput || !btnStartMission || !missionInput.value.trim()) return;
-  btnStartMission.disabled = true;
+  setButtonWorking(true);
   if (btnCancelMission) btnCancelMission.hidden = false;
   if (stepsList) stepsList.innerHTML = "";
   if (resultCard) resultCard.hidden = true;
@@ -222,6 +248,7 @@ btnStartMission?.addEventListener("click", async () => {
   stepCounter = 0;
   if (stepsCount) stepsCount.textContent = "0 steps executed";
   if (telStepsDone) telStepsDone.textContent = "0 / 25";
+  if (telPlannerLatency) telPlannerLatency.textContent = "-";
   setTaskState("planning");
 
   try {
@@ -242,7 +269,7 @@ btnStartMission?.addEventListener("click", async () => {
       } catch { /* offline */ }
       setTaskState("cancelled");
       if (btnCancelMission) btnCancelMission.hidden = true;
-      btnStartMission.disabled = false;
+      setButtonWorking(false);
       return;
     }
 
@@ -260,7 +287,7 @@ btnStartMission?.addEventListener("click", async () => {
   } catch (err) {
     setTaskState("failed");
     addStepItem(`⚠️ Backend connection failed: ${err}`);
-    btnStartMission.disabled = false;
+    setButtonWorking(false);
     cancelRequested = false;
     if (btnCancelMission) btnCancelMission.hidden = true;
   }
@@ -280,13 +307,13 @@ btnCancelMission?.addEventListener("click", async () => {
     }
   }
   setTaskState("cancelled");
-  if (btnStartMission) btnStartMission.disabled = false;
+  setButtonWorking(false);
 });
 
 btnNewSession?.addEventListener("click", () => {
   currentTaskId = null;
   if (missionInput) missionInput.value = "";
-  if (btnStartMission) btnStartMission.disabled = true;
+  setButtonWorking(false);
   if (btnCancelMission) btnCancelMission.hidden = true;
   if (stepsList) stepsList.innerHTML = '<li class="agent-step-placeholder">Submit a mission directive to begin autonomous browser execution.</li>';
   if (resultCard) resultCard.hidden = true;
@@ -345,7 +372,15 @@ function connectWebSocket(): void {
       const env = JSON.parse(ev.data) as {
         type: string;
         taskId: string;
-        payload: { taskState: string; stepsDone: number; message: string; screenshot?: string | null };
+        payload: {
+          taskState: string;
+          stepsDone: number;
+          message: string;
+          screenshot?: string | null;
+          plannerMs?: number | null;
+          observeMs?: number | null;
+          actMs?: number | null;
+        };
       };
       if (env.type !== "PROGRESS" || env.taskId !== currentTaskId) return;
       const p = env.payload;
@@ -353,6 +388,9 @@ function connectWebSocket(): void {
       setTaskState(p.taskState);
       addStepItem(`[${p.stepsDone}] ${p.message}`);
       updateVisualFrame(p.screenshot, p.message, p.taskState);
+      if (telPlannerLatency && typeof p.plannerMs === "number") {
+        telPlannerLatency.textContent = `${(p.plannerMs / 1000).toFixed(1)}s`;
+      }
 
       if (p.taskState === "awaiting_confirmation") {
         fetch(`${API}/api/task/${env.taskId}`)

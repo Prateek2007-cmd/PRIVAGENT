@@ -34,10 +34,26 @@ interface AgentApi {
 }
 
 async function withAgent(tabId: number): Promise<AgentApi> {
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["content.js"],
-  });
+  // Reuse the content script when it is already injected. Re-injecting the
+  // whole bundle on every list/click/observe added a measurable round trip to
+  // each step; a cheap presence probe is enough, and `list()` re-registers
+  // element ids after any SPA re-render.
+  let injected = false;
+  try {
+    const [probe] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => Boolean((window as unknown as { __navigatorAgent?: unknown }).__navigatorAgent),
+    });
+    injected = Boolean(probe?.result);
+  } catch {
+    injected = false;
+  }
+  if (!injected) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"],
+    });
+  }
   return {
     list: async () => {
       const [r] = await chrome.scripting.executeScript({
@@ -456,10 +472,18 @@ async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>):
 async function ensureTabActive(tabId: number): Promise<void> {
   if (typeof chrome === "undefined" || !chrome.tabs) return;
   try {
-    await chrome.tabs.update(tabId, { active: true });
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab?.windowId && chrome.windows) {
-      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => null);
+    if (!tab) return;
+    // Avoid redundant activation/focus churn: focus changes are slow and
+    // every observation used to pay for them even when already focused.
+    if (!tab.active) {
+      await chrome.tabs.update(tabId, { active: true });
+    }
+    if (tab.windowId && chrome.windows) {
+      const win = await chrome.windows.get(tab.windowId).catch(() => null);
+      if (win && !win.focused) {
+        await chrome.windows.update(tab.windowId, { focused: true }).catch(() => null);
+      }
     }
   } catch {}
 }

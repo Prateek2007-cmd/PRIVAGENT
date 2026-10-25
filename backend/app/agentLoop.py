@@ -17,6 +17,7 @@ from .contracts import PrivacyViolation
 from .hub import Hub, hub as real_hub, TaskRecord
 from .planner import plan_from_observation
 from .privacy import classify_and_redact, redact_text_urls, redact_url
+from .providers.errors import ProviderUnavailable
 
 MAX_STEPS = config.MAX_STEPS
 MAX_RETRIES = config.MAX_RETRIES
@@ -187,6 +188,7 @@ async def run_with_injection(
     on_progress: Optional[Callable[..., None]] = None,
     confirm_gate: Optional[Any] = None,
     confirm_timeout_s: float = 120.0,
+    on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Test entrypoint mirroring run_task's flow with injectable parts."""
     try:
@@ -199,6 +201,7 @@ async def run_with_injection(
             on_progress=on_progress,
             confirm_gate=confirm_gate,
             confirm_timeout_s=confirm_timeout_s,
+            on_metrics=on_metrics,
         )
     finally:
         # Never leak cancellation markers: task ids are unique, but a stale
@@ -216,6 +219,7 @@ async def _run_loop(
     on_progress: Optional[Callable[..., None]],
     confirm_gate: Optional[Any],
     confirm_timeout_s: float,
+    on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
     penalties: list[str] = []
@@ -239,6 +243,15 @@ async def _run_loop(
             except TypeError:
                 on_progress()
 
+    def metrics(phase: str, started: float) -> None:
+        """Report one phase's wall time. Never lets telemetry break the loop."""
+        if not on_metrics:
+            return
+        try:
+            on_metrics({"phase": phase, "ms": int((time.perf_counter() - started) * 1000)})
+        except Exception:
+            pass
+
     while steps_done < MAX_STEPS:
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None}
@@ -249,8 +262,10 @@ async def _run_loop(
             raw_obs = cached_obs
             cached_obs = None
         else:
+            observe_started = time.perf_counter()
             _maybe = obs_factory()
             raw_obs = await _maybe if asyncio.iscoroutine(_maybe) else _maybe
+            metrics("observe", observe_started)
         try:
             payload, _decision = classify_and_redact(_to_obs(raw_obs), instruction=instruction)
         except PrivacyViolation:
@@ -268,6 +283,7 @@ async def _run_loop(
         # event loop so cancel/confirm endpoints stay responsive during a
         # slow model call.
         raw_plan = None
+        plan_started = time.perf_counter()
         try:
             raw_plan = await asyncio.to_thread(
                 _call_planner, planner, instruction, payload_dict, h_view, working_memory
@@ -290,6 +306,16 @@ async def _run_loop(
                 }
             progress(f"Replanning after invalid plan: {reason}")
             continue
+        except ProviderUnavailable as exc:
+            # Quota/outage is not a mission bug. Fail fast with the operator
+            # message instead of retrying a provider that cannot answer.
+            return {
+                "final": "failed",
+                "steps": steps_done,
+                "summary": f"Planner unavailable: {redact_text_urls(str(exc))[:400]}",
+            }
+        finally:
+            metrics("plan", plan_started)
         invalid_plans = 0
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None}
@@ -363,7 +389,9 @@ async def _run_loop(
                 return {"final": "failed", "steps": steps_done,
                         "summary": f"user rejected action: {action.get('type')}"}
 
+        action_started = time.perf_counter()
         result = await _execute_with_retries(ext_hub, action, task_id)
+        metrics("act", action_started)
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None}
         steps_done += 1
@@ -615,6 +643,19 @@ async def run_task(task_id: str) -> None:
             record.screenshot = screenshot
         real_hub.spawn(real_hub.broadcast_progress(record))
 
+    def on_metrics(fields: dict[str, Any]) -> None:
+        """Phase timings are attached to the next progress broadcast."""
+        phase = fields.get("phase")
+        ms = fields.get("ms")
+        if not isinstance(ms, int):
+            return
+        if phase == "plan":
+            record.planner_ms = ms
+        elif phase == "observe":
+            record.observe_ms = ms
+        elif phase == "act":
+            record.act_ms = ms
+
     try:
         state = await run_with_injection(
             real_hub,
@@ -624,6 +665,7 @@ async def run_task(task_id: str) -> None:
             instruction=record.instruction,
             on_progress=on_step_progress,
             confirm_gate=_ConfirmGate(record),
+            on_metrics=on_metrics,
         )
         final_state = {"completed": "completed", "failed": "failed", "cancelled": "cancelled",
                        "budget_exceeded": "failed"}.get(state["final"], "failed")

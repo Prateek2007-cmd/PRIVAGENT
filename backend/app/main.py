@@ -123,6 +123,9 @@ async def get_task(task_id: str) -> dict[str, Any]:
         "message": task.message,
         "pending_confirmation": task.pending_confirmation,
         "screenshot": task.screenshot,
+        "plannerMs": task.planner_ms,
+        "observeMs": task.observe_ms,
+        "actMs": task.act_ms,
     }
 
 

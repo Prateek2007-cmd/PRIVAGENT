@@ -202,3 +202,46 @@ def test_persistently_invalid_plans_fail_honestly():
     summary = (state["summary"] or "").lower()
     assert "incomplete" in summary
     assert "valid action" in summary
+
+
+def test_provider_outage_fails_fast_without_consuming_a_step():
+    """A daily-quota 429 must be reported, not retried into a 40s stall."""
+    from app.providers.errors import ProviderUnavailable
+
+    def planner(instruction, payload, history, working_memory=None):
+        raise ProviderUnavailable("Groq quota exhausted; retry in about 23m.")
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        FakeHub({}), planner=planner, obs_factory=_youtube_obs,
+    ))
+
+    assert state["final"] == "failed"
+    assert state["steps"] == 0
+    summary = state["summary"] or ""
+    assert summary.startswith("Planner unavailable:")
+    assert "23m" in summary
+
+
+def test_loop_reports_phase_metrics():
+    seen: list[dict] = []
+    hub = FakeHub({"navigate": [{"ok": True, "evidence": "https://www.google.com/"}]})
+    calls = {"n": 0}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"goal": "go", "steps": [{"why": "go", "action": {
+                    "type": "navigate", "risk": "write", "verify": "url", "timeoutMs": 1000,
+                    "params": {"url": "https://www.google.com/"}}}]}
+            return {"goal": "go", "steps": [], "answer": "done"}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=_youtube_obs, on_metrics=seen.append,
+    ))
+
+    assert state["final"] == "completed"
+    phases = [m["phase"] for m in seen]
+    assert "plan" in phases
+    assert "act" in phases
+    assert all(isinstance(m["ms"], int) and m["ms"] >= 0 for m in seen)
