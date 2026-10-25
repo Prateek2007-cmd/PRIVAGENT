@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from typing import Any, Optional, Protocol
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from .contracts import ACTION_TYPES, TaskPlan
+from .contracts import ACTION_TYPES, BrowserAction, PlannedStep, TaskPlan
 from .privacy import PrivacyFilteredPayload
 
 ACTION_LIST = ", ".join(ACTION_TYPES)
@@ -71,7 +72,9 @@ CORE OPERATING PRINCIPLES:
      * If user specified a SPECIFIC PERSON (e.g. "Akash", "John", "Mom"):
        - Search for that exact person name: Find search box (name "Search or start new chat", data-tab="3"), type name with clear: true, submit: true:
          {{"type": "type", "risk": "write", "target": {{"name": "Search or start new chat"}}, "params": {{"text": "<name>", "clear": true, "submit": true}}, "verify": "searched contact"}}
-       - Then click the contact row matching that name.
+       - submit: true (or a following Enter press) is REQUIRED: in WhatsApp Web, submitting the search opens the first matching chat automatically. Without it the result list stays flat and the right pane keeps its placeholder.
+       - After submitting, verify that the composer ("Type a message") is visible. If the right pane still shows "Download WhatsApp for Windows", "Keep your phone connected", or has no composer, the chat did NOT open: click the matching chat row ONCE (target the row, role="listitem" / role="row", never an inner label inside the row), then observe again.
+       - Only type the message after the composer exists. Never send the message text into the search box.
      * If user specified "first chat", "recent chat", or no specific recipient:
        - DO NOT search. Click the topmost chat row directly.
      * LEFTOVER SEARCH CLEARING: If the search box already contains text from a previous search or shows a "Cancel search" / "x-alt" button, clear it first before selecting a chat.
@@ -104,6 +107,20 @@ CORE OPERATING PRINCIPLES:
    - NEVER repeat an action that already succeeded in the previous step.
    - Once the user's primary instruction has been carried out (message sent, search answered, order placed/checkout reached), DO NOT linger or perform redundant clicks. Immediately conclude with:
      {{"goal": "...", "notes": "...", "steps": [], "answer": "..."}}
+
+9. STRICT COMPLETION VERIFICATION (NO FALSE SUCCESS):
+   - Claim success ONLY for effects you can actually see in the current page observation or in the action history.
+   - Sending a message: success requires a successful `type` into an OPEN chat composer (with submit: true) and evidence the message left the composer. If the `type` action failed, if no chat is open, or if the right pane still shows a placeholder ("Download WhatsApp for Windows", "Keep your phone connected"), you MUST NOT claim the message was sent. Conclude with an honest failure in "answer" that names what blocked you.
+   - Reading private data (attendance, marks, grades, fees, invoices, account details): you MUST NOT claim completion while the URL is still a login page (`/login`, `Default.aspx`, `msg=loginrequired`, `signin`) or while a login/validation error is visible (e.g. "Pls write the Htno", "invalid credentials", "required"). The task failed unless you reached the authenticated page and actually read the data.
+   - Never describe an attempt as an achievement: "login attempted", "clicked Sign in", "credentials entered" are NOT success. If the requested data was not retrieved, say so.
+   - If you ran out of useful steps, are blocked, or are unsure, conclude with steps: [] and put an honest failure in "answer": what you tried, what blocked you, and what the human must do next.
+10. LOGIN WALLS, CAPTCHAS & HUMAN HANDOFF:
+   - Detect human-only blockers: a CAPTCHA (reCAPTCHA, hCaptcha, Cloudflare Turnstile, "I'm not a robot"), a QR login (WhatsApp Web "scan the QR code"), or a login form you cannot complete because credentials are missing/empty.
+   - NEVER click "Sign in" / "Login" / submit repeatedly and NEVER press Enter in a loop. One attempt is enough; repeating it cannot succeed and burns the step budget.
+   - Instead emit exactly ONE wait action and stop:
+     {{"type": "wait", "risk": "sensitive", "timeoutMs": 30000, "verify": "waiting for user to complete CAPTCHA and log in"}}
+   - The operator is shown: "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."
+   - After the human continues, observe again before acting. If the same blocker is still present, conclude with an honest failure in "answer" instead of looping.
 
 Action Schema Requirements:
 - Every action needs: type, risk ("read"|"write"|"sensitive"), verify, timeoutMs (number).
@@ -173,7 +190,7 @@ def plan_from_observation(*, instruction: str, payload: PrivacyFilteredPayload,
         raw = provider.plan_call(instruction, payload, hist, working_memory=working_memory)
     else:
         raw = provider.plan_call(instruction, payload, hist)
-    plan = _validate_plan(raw)
+    plan = _validate_plan(raw, payload=payload, history=hist, instruction=instruction)
     return plan
 
 
@@ -201,7 +218,33 @@ def _normalize_raw_plan(raw: dict[str, Any]) -> dict[str, Any]:
             risk = act.get("risk", "read")
             if atype in {"type", "click", "navigate", "press", "new_tab", "close_tab"} and risk == "read":
                 act["risk"] = "write"
+
+            # 1. Extract params
+            params = dict(act.get("params", {})) if isinstance(act.get("params"), dict) else {}
+            for field in ("url", "direction", "text", "clear", "submit", "key", "containerId", "tabId", "factor"):
+                if field in act and field not in params:
+                    params[field] = act.pop(field)
+
+            # 2. Extract and normalize target from any location
             target = act.get("target")
+            if target is None:
+                if "target" in params:
+                    target = params.pop("target")
+                elif "targetId" in act:
+                    target = {"targetId": act.pop("targetId")}
+                elif "target_id" in act:
+                    target = {"targetId": act.pop("target_id")}
+                elif "name" in act:
+                    target = {"name": act.pop("name")}
+                elif "id" in act and act["id"] not in {"click", "type", "navigate", "wait", "press"}:
+                    target = {"targetId": act.pop("id")}
+                elif "targetId" in params:
+                    target = {"targetId": params.pop("targetId")}
+                elif "target_id" in params:
+                    target = {"targetId": params.pop("target_id")}
+                elif "name" in params and atype in {"click", "type"}:
+                    target = {"name": params.pop("name")}
+
             if isinstance(target, str):
                 act["target"] = {"targetId": target}
             elif isinstance(target, dict):
@@ -210,22 +253,95 @@ def _normalize_raw_plan(raw: dict[str, Any]) -> dict[str, Any]:
                     t["targetId"] = t.pop("id")
                 if "target_id" in t and "targetId" not in t:
                     t["targetId"] = t.pop("target_id")
+                if "label" in t and "name" not in t:
+                    t["name"] = t.pop("label")
+                elif "title" in t and "name" not in t:
+                    t["name"] = t.pop("title")
+                elif "text" in t and "name" not in t:
+                    t["name"] = t.pop("text")
+                elif "selector" in t and "name" not in t:
+                    t["name"] = t.pop("selector")
                 act["target"] = t
-            params = dict(act.get("params", {})) if isinstance(act.get("params"), dict) else {}
-            for field in ("url", "direction", "text", "clear", "submit", "key", "containerId", "tabId", "factor"):
-                if field in act and field not in params:
-                    params[field] = act.pop(field)
+            elif target is not None:
+                act["target"] = {"targetId": str(target)}
+
+            # 3. LLMs routinely emit {"type": "press", "target": {...}} to mean
+            # "activate this control" (a thumbnail, a button). `press` is only
+            # a physical key event, so reinterpret the intent instead of
+            # failing the whole plan:
+            #   press + target, no key -> click that target
+            #   press with neither     -> Enter (the universal default)
+            if act.get("type") == "press" and not _has_key(params.get("key")):
+                if _has_target_ref(act.get("target")):
+                    act["type"] = "click"
+                    atype = "click"
+                    # A click changes page state; never leave it below the floor.
+                    if act.get("risk") == "read":
+                        act["risk"] = "write"
+                else:
+                    params["key"] = "Enter"
+
+            # 4. Fallback for click or type when target is completely absent
+            if act.get("type") in {"click", "type"} and not _has_target_ref(act.get("target")):
+                candidate_name = None
+                if isinstance(params.get("text"), str) and atype == "click":
+                    candidate_name = params["text"]
+                elif isinstance(params.get("query"), str):
+                    candidate_name = params["query"]
+                elif isinstance(act.get("why"), str):
+                    why = act["why"].strip()
+                    if '"' in why:
+                        candidate_name = why.split('"')[1]
+                    elif "'" in why:
+                        candidate_name = why.split("'")[1]
+
+                if candidate_name and candidate_name.strip():
+                    act["target"] = {"name": candidate_name.strip()}
+                elif act.get("type") == "type":
+                    act["target"] = {"name": "activeElement"}
+
             act["params"] = params
-            if "timeoutMs" not in act and "timeout_ms" in act:
-                act["timeoutMs"] = act["timeout_ms"]
-            elif "timeoutMs" not in act:
+
+            # 5. Sanitize timeoutMs: default when missing or 0
+            raw_timeout = act.get("timeoutMs") if "timeoutMs" in act else act.get("timeout_ms")
+            if raw_timeout is None or raw_timeout == 0 or raw_timeout == "" or raw_timeout is False:
                 act["timeoutMs"] = 10000
+            else:
+                try:
+                    act["timeoutMs"] = int(raw_timeout)
+                except (TypeError, ValueError):
+                    act["timeoutMs"] = 10000
+
             if "verify" not in act or not act["verify"]:
-                act["verify"] = f"executed {atype}"
+                act["verify"] = f"executed {act.get('type') or atype}"
             s["action"] = act
         norm_steps.append(s)
-    data["steps"] = norm_steps
+    # Recovery plans sometimes overshoot the per-plan budget. Executing the
+    # first MAX_STEPS_PER_PLAN steps is strictly better than aborting the run
+    # with PLAN_INVALID; the loop still enforces MAX_STEPS globally.
+    data["steps"] = norm_steps[:MAX_STEPS_PER_PLAN]
     return data
+
+
+def _has_key(value: Any) -> bool:
+    """A usable keyboard key: a non-blank string."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _has_target_ref(target: Any) -> bool:
+    """True when the action points at something clickable."""
+    if not isinstance(target, dict):
+        return False
+    coords = target.get("coords")
+    return bool(
+        target.get("targetId")
+        or target.get("name")
+        or (
+            isinstance(coords, dict)
+            and coords.get("x") is not None
+            and coords.get("y") is not None
+        )
+    )
 
 
 def _safe_nav_url(url: Optional[str]) -> bool:
@@ -255,7 +371,214 @@ def _require_target(action: Any) -> None:
         )
 
 
-def _validate_plan(raw: dict[str, Any]) -> TaskPlan:
+_CAPTCHA_MARKERS = (
+    "recaptcha",
+    "hcaptcha",
+    "cf-turnstile",
+    "turnstile",
+    "i'm not a robot",
+)
+_LOGIN_SEGMENTS = {"login", "signin", "sign-in", "sign_in", "log-in", "logon", "auth/login"}
+_LOGIN_HOSTS = ("accounts.google.com", "login.microsoftonline.com", "login.live.com")
+_MESSAGING_HOSTS = ("whatsapp.com", "web.telegram.org", "slack.com", "teams.microsoft.com")
+_SEND_INTENT_RE = re.compile(r"\b(send|sending|message|text|dm|reply)\b", re.IGNORECASE)
+_SUCCESS_WORD_RE = re.compile(r"\b(sent|delivered|successfully|success)\b", re.IGNORECASE)
+_FAILURE_WORD_RE = re.compile(
+    r"\b(not|never|unable|cannot|can't|couldn't|failed|blocked|incomplete)\b", re.IGNORECASE
+)
+_HANDOFF_VERIFY = "waiting for user to complete CAPTCHA and log in"
+_HANDOFF_REASON = "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."
+
+
+def _payload_url(payload: Any) -> str:
+    if payload is None:
+        return ""
+    url = getattr(payload, "url", None)
+    if url is None and isinstance(payload, dict):
+        url = payload.get("url")
+    return str(url or "")
+
+
+def _payload_interactive(payload: Any) -> list[Any]:
+    els = getattr(payload, "interactive", None)
+    if els is None and isinstance(payload, dict):
+        els = payload.get("interactive")
+    return list(els or [])
+
+
+def _element_text(el: Any) -> str:
+    if isinstance(el, dict):
+        parts = [el.get("name"), el.get("inputType"), el.get("role"), el.get("tag")]
+    else:
+        parts = [
+            getattr(el, "name", None),
+            getattr(el, "input_type", None),
+            getattr(el, "role", None),
+            getattr(el, "tag", None),
+        ]
+    return " ".join(str(p).lower() for p in parts if p)
+
+
+def _has_captcha(payload: Any) -> bool:
+    for el in _payload_interactive(payload):
+        text = _element_text(el)
+        if any(marker in text for marker in _CAPTCHA_MARKERS):
+            return True
+    return False
+
+
+def _is_login_surface(url: str) -> bool:
+    """True for a page that still looks like a sign-in gate.
+
+    Substring matching is deliberately avoided for the path (``/login-help`` is
+    not a login page); the explicit portal markers are matched on the full URL
+    because they are unambiguous.
+    """
+    if not url:
+        return False
+    low = url.lower()
+    if "loginrequired" in low or "msg=login" in low:
+        return True
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _LOGIN_HOSTS):
+        return True
+    path = (parts.path or "").lower().rstrip("/")
+    if path.endswith("default.aspx"):
+        return True
+    segments = {s for s in re.split(r"[/;]+", path) if s}
+    return any(s in _LOGIN_SEGMENTS or s.startswith("login.") or s.startswith("signin.") for s in segments)
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _claims_message_sent(answer: Optional[str]) -> bool:
+    text = answer or ""
+    return bool(_SUCCESS_WORD_RE.search(text)) and not _FAILURE_WORD_RE.search(text)
+
+
+def _missing_chat_composer(
+    payload: Any, history: list[dict[str, Any]], instruction: str, answer: Optional[str]
+) -> bool:
+    """A messaging completion claim with no open chat / composer.
+
+    Only fires when the run is on a messaging host, the instruction asked to
+    send something, the answer claims success, no successful ``type`` exists in
+    history, and the observation has no composer. That combination cannot be a
+    real delivery.
+    """
+    host = _host_of(_payload_url(payload))
+    if not host or not any(host == h or host.endswith("." + h) for h in _MESSAGING_HOSTS):
+        return False
+    if not _SEND_INTENT_RE.search(instruction or ""):
+        return False
+    if not _claims_message_sent(answer):
+        return False
+    if any("type a message" in _element_text(el) or "composer" in _element_text(el)
+           for el in _payload_interactive(payload)):
+        return False
+    return not any(
+        h.get("result_ok") and (h.get("action") or {}).get("type") == "type"
+        for h in history
+    )
+
+
+def _handoff_recently(history: list[dict[str, Any]]) -> bool:
+    """True when a human handoff already asked the operator for help."""
+    for entry in history[-3:]:
+        action = entry.get("action") or {}
+        if action.get("type") == "wait" and action.get("risk") == "sensitive":
+            return True
+    return False
+
+
+def _handoff_plan(goal: str, notes: Optional[str], reason: str) -> TaskPlan:
+    wait = BrowserAction(
+        type="wait",
+        risk="sensitive",
+        verify=_HANDOFF_VERIFY,
+        timeout_ms=30000,
+    )
+    return TaskPlan(
+        goal=goal,
+        notes=notes,
+        steps=[PlannedStep(why=f"{reason}. {_HANDOFF_REASON}", action=wait)],
+    )
+
+
+def _honest_failure(goal: str, notes: Optional[str], reason: str) -> TaskPlan:
+    return TaskPlan(
+        goal=goal,
+        notes=notes,
+        steps=[],
+        answer=(
+            f"Task incomplete: {reason}. I stopped instead of claiming success — "
+            "check the page in your browser for the actual state."
+        ),
+        blocked=True,
+    )
+
+
+def _detect_blocker(
+    payload: Any, history: list[dict[str, Any]], instruction: str, answer: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """Classify why a completion claim cannot be trusted.
+
+    ``human`` blockers can be resolved by the operator (CAPTCHA / sign-in), so
+    the first one becomes a single sensitive wait. Everything else is reported
+    as an honest failure.
+    """
+    if _has_captcha(payload):
+        return ("human", "a CAPTCHA is blocking the page")
+    if _is_login_surface(_payload_url(payload)):
+        return ("human", "the page is still a sign-in/login screen")
+    if _missing_chat_composer(payload, history, instruction, answer):
+        return ("failed", "no chat conversation is open, so the message was never sent")
+    if history and history[-1].get("result_ok") is False:
+        action = history[-1].get("action") or {}
+        return ("failed", f"the last action ({action.get('type') or 'unknown'}) failed")
+    return None
+
+
+def _guard_completion(
+    plan: TaskPlan,
+    payload: Any,
+    history: list[dict[str, Any]],
+    instruction: str,
+) -> TaskPlan:
+    """Deterministic backstop for the prompt's completion rules.
+
+    The model is instructed not to claim unverifiable success, but a single bad
+    completion ends the mission with a false "Mission Completed". This only
+    rewrites plans that claim completion (steps == []) while the observation or
+    history proves the task is blocked.
+    """
+    if plan.steps:
+        return plan
+    blocker = _detect_blocker(payload, history, instruction, plan.answer)
+    if blocker is None:
+        return plan
+    kind, reason = blocker
+    if kind == "human" and not _handoff_recently(history):
+        return _handoff_plan(plan.goal, plan.notes, reason)
+    return _honest_failure(plan.goal, plan.notes, reason)
+
+
+def _validate_plan(
+    raw: dict[str, Any],
+    *,
+    payload: Any = None,
+    history: Optional[list[dict[str, Any]]] = None,
+    instruction: str = "",
+) -> TaskPlan:
     norm = _normalize_raw_plan(raw)
     try:
         plan = TaskPlan.model_validate(norm)
@@ -316,7 +639,7 @@ def _validate_plan(raw: dict[str, Any]) -> TaskPlan:
         elif a.type == "new_tab":
             if p is None or not _safe_nav_url(p.url):
                 raise ValueError(f"PLAN_INVALID: unsafe new_tab url {getattr(p, 'url', None)!r}")
-    return plan
+    return _guard_completion(plan, payload, history or [], instruction)
 
 
 __all__ = ["SYSTEM_FRAME", "build_prompt", "plan_from_observation"]

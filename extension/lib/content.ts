@@ -22,6 +22,7 @@ interface NavigatorAgent {
   click: (targetId: string, name?: string) => { ok: boolean; error?: string };
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
+  getClickPoint: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
   type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string };
   submit: (targetId: string, name?: string) => { ok: boolean; error?: string };
   scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
@@ -207,9 +208,11 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
   }
 
   // 3. Search within open Shadow Roots
-  const shadowNodes = queryAllWithShadow(document, `[data-navigator-id="${CSS.escape(cid)}"], #${CSS.escape(cid)}`);
-  if (shadowNodes.length > 0 && (shadowNodes[0] as HTMLElement).isConnected) {
-    return shadowNodes[0] as HTMLElement;
+  if (cid) {
+    const shadowNodes = queryAllWithShadow(document, `[data-navigator-id="${CSS.escape(cid)}"], #${CSS.escape(cid)}`);
+    if (shadowNodes.length > 0 && (shadowNodes[0] as HTMLElement).isConnected) {
+      return shadowNodes[0] as HTMLElement;
+    }
   }
 
   // 4. Refresh candidates if registry was empty
@@ -270,6 +273,34 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
   return null;
 }
 
+/**
+ * Chat rows / list items. WhatsApp renders a chat row as a container whose
+ * inner text labels are what name-matching usually resolves, but the selection
+ * handler lives on the row. Clicking the label's own centre can therefore hit
+ * a non-activating child.
+ */
+const CHAT_ROW_SELECTOR =
+  '[role="listitem"], [role="row"], div[tabindex="-1"], ' +
+  '[data-testid*="cell-frame"], [data-testid*="list-item"], [data-testid*="chat-list-item"]';
+
+const EXPLICIT_CONTROL_SELECTOR =
+  'button, a[href], input, textarea, select, [role="button"], [role="link"], ' +
+  '[role="checkbox"], [role="radio"], [contenteditable="true"]';
+
+/** Nearest activatable row for a text label, or null for real controls. */
+function rowFor(el: HTMLElement): HTMLElement | null {
+  // A control keeps its own activation point: promoting it to the row would
+  // click empty space instead of the button.
+  if (el.matches(EXPLICIT_CONTROL_SELECTOR)) return null;
+  const row = el.closest(CHAT_ROW_SELECTOR) as HTMLElement | null;
+  if (!row || row === el) return null;
+  const r = row.getBoundingClientRect();
+  // Guard against `div[tabindex="-1"]` scroll containers: a real row is
+  // small, not most of the viewport.
+  if (r.height > Math.max(240, (window.innerHeight || 800) * 0.5)) return null;
+  return row;
+}
+
 window.__navigatorAgent = {
   list: () => {
     registry.clear();
@@ -282,6 +313,25 @@ window.__navigatorAgent = {
       el.scrollIntoView({ block: "center", behavior: "instant" });
     } catch {}
     const r = el.getBoundingClientRect();
+    return {
+      x: Math.round(r.left + Math.max(1, r.width / 2)),
+      y: Math.round(r.top + Math.max(1, r.height / 2)),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
+  },
+  /**
+   * Activation point for a click: the resolved element, promoted to its chat
+   * row when the planner matched an inner label. Always the true centre.
+   */
+  getClickPoint: (targetId, name) => {
+    const el = elementFor(targetId, name);
+    if (!el) return null;
+    const target = rowFor(el) || el;
+    try {
+      target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    } catch {}
+    const r = target.getBoundingClientRect();
     return {
       x: Math.round(r.left + Math.max(1, r.width / 2)),
       y: Math.round(r.top + Math.max(1, r.height / 2)),
@@ -386,83 +436,124 @@ window.__navigatorAgent = {
     return { ok: true, targetId: el.id || undefined };
   },
   type: (targetId, text, clear, name) => {
-    let el = elementFor(targetId, name);
-    const nm = (name || "").toLowerCase();
+    // Framework-owned nodes (React containers, Lexical editors) can throw from
+    // inside property setters and selection APIs. Never let that escape as an
+    // unhandled exception: report it so the executor can surface STALE_TARGET.
+    try {
+      let el = elementFor(targetId, name);
+      const nm = (name || "").toLowerCase();
 
-    // Specialized WhatsApp Web element resolution:
-    if (window.location.hostname.includes("whatsapp.com")) {
-      if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
-        const waComposer = document.querySelector('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"]') as HTMLElement | null;
-        if (waComposer) el = waComposer;
-      } else if (nm.includes("search") || nm.includes("find")) {
-        const waSearch = document.querySelector('div[data-tab="3"], [data-testid="chat-list-search"], [aria-label="Search input textbox"]') as HTMLElement | null;
-        if (waSearch) el = waSearch;
-        if (clear || !text) {
-          const cancelSearch = document.querySelector('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], [data-icon="back"], button[aria-label*="cancel search" i]') as HTMLElement | null;
-          if (cancelSearch) {
-            try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
+      // Specialized WhatsApp Web element resolution:
+      if (window.location.hostname.includes("whatsapp.com")) {
+        if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
+          const waComposer = document.querySelector('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"]') as HTMLElement | null;
+          if (waComposer) el = waComposer;
+        } else if (nm.includes("search") || nm.includes("find")) {
+          const waSearch = document.querySelector('div[data-tab="3"], [data-testid="chat-list-search"], [aria-label="Search input textbox"]') as HTMLElement | null;
+          if (waSearch) el = waSearch;
+          if (clear || !text) {
+            const cancelSearch = document.querySelector('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], [data-icon="back"], button[aria-label*="cancel search" i]') as HTMLElement | null;
+            if (cancelSearch) {
+              try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
+            }
           }
         }
       }
-    }
 
-    if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable)) {
-      const inner = el.querySelector("input, textarea, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
-      if (inner) el = inner;
-    }
-    if (!el) {
-      if (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement || (document.activeElement as HTMLElement)?.isContentEditable) {
-        el = document.activeElement as HTMLElement;
+      if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable)) {
+        const inner = el.querySelector("input, textarea, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
+        if (inner) el = inner;
       }
-    }
-    if (!el) return { ok: false, error: "STALE_TARGET" };
-
-    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
-      el.focus();
-      try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        if (clear) {
-          sel?.removeAllRanges();
-          sel?.addRange(range);
-          document.execCommand("delete", false);
-        } else {
-          range.collapse(false);
-          sel?.removeAllRanges();
-          sel?.addRange(range);
+      if (!el) {
+        const active = document.activeElement as HTMLElement | null;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active?.isContentEditable) {
+          el = active;
         }
-      } catch {}
-
-      let inserted = false;
-      try {
-        inserted = document.execCommand("insertText", false, text);
-      } catch {}
-      if (!inserted || !el.textContent?.includes(text)) {
-        el.textContent = (clear ? "" : el.textContent || "") + text;
-        el.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
       }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    } else {
-      const input = el as HTMLInputElement | HTMLTextAreaElement;
-      input.focus();
-      if (clear) input.value = "";
-      const val = (clear ? "" : input.value) + text;
-      const proto = input instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) {
-        setter.call(input, val);
+      // A rich-text editor often keeps the caret in a child node while the
+      // planner targeted the wrapper: trust the focused editable.
+      if (!el) return { ok: false, error: "STALE_TARGET" };
+      const active = document.activeElement as HTMLElement | null;
+      const editable =
+        el.isContentEditable
+        || el.getAttribute("contenteditable") === "true"
+        || active?.isContentEditable === true;
+      if (
+        editable
+        && !(el instanceof HTMLInputElement)
+        && !(el instanceof HTMLTextAreaElement)
+        && active?.isContentEditable
+        && !el.isContentEditable
+      ) {
+        el = active;
+      }
+
+      if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+        el.focus();
+        try {
+          const sel = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          if (clear) {
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+            document.execCommand("delete", false);
+          } else {
+            // Caret at the end so existing text is preserved.
+            range.selectNodeContents(el);
+            range.collapse(false);
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+          }
+        } catch {}
+
+        let inserted = false;
+        try {
+          inserted = document.execCommand("insertText", false, text);
+        } catch {}
+        if (!inserted || !el.textContent?.includes(text)) {
+          // Last resort: write the text and emit the same InputEvent real
+          // typing produces, so framework listeners still update state.
+          el.textContent = (clear ? "" : el.textContent || "") + text;
+          try {
+            el.dispatchEvent(new InputEvent("beforeinput", {
+              bubbles: true, cancelable: true, inputType: "insertText", data: text,
+            }));
+          } catch {}
+          el.dispatchEvent(new InputEvent("input", {
+            bubbles: true, cancelable: true, inputType: "insertText", data: text,
+          }));
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
       } else {
-        input.value = val;
+        const input = el as HTMLInputElement | HTMLTextAreaElement;
+        input.focus();
+        if (clear) input.value = "";
+        const val = (clear ? "" : input.value) + text;
+        const proto = input instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        try {
+          if (setter) setter.call(input, val);
+          else input.value = val;
+        } catch {
+          // Some input types reject direct assignment; the native setter is
+          // the last attempt before reporting failure.
+          input.value = val;
+        }
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
 
-    // Submission is intentionally NOT done here. The executor performs one
-    // and only one send/submit trigger, avoiding double-sent messages.
-    return { ok: true };
+      // Submission is intentionally NOT done here. The executor performs one
+      // and only one send/submit trigger, avoiding double-sent messages.
+      return { ok: true };
+    } catch (e) {
+      // Bounded: a framework error can echo the value it rejected, and this
+      // string travels back to the backend.
+      const detail = String((e as Error)?.message ?? e).slice(0, 120);
+      return { ok: false, error: `type failed: ${detail}` };
+    }
   },
   submit: (targetId, name) => {
     const el = elementFor(targetId, name) ||

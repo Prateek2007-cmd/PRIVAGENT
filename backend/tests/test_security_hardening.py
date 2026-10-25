@@ -15,7 +15,7 @@ from app.agentLoop import (
 from app.contracts import BrowserObservation, PrivacyViolation
 from app.hub import Hub
 from app.main import _origin_allowed, app
-from app.planner import _validate_plan
+from app.planner import MAX_STEPS_PER_PLAN, _validate_plan
 from app.privacy import classify_and_redact
 
 
@@ -261,9 +261,13 @@ def _plan(*actions: dict[str, Any]) -> dict[str, Any]:
     return {"goal": "g", "steps": [{"why": "w", "action": a} for a in actions]}
 
 
-def test_plan_rejects_too_many_steps():
-    with pytest.raises(ValueError, match="maximum"):
-        _validate_plan(_plan(*[_action() for _ in range(4)]))
+def test_plan_clamps_too_many_steps():
+    """Recovery plans can overshoot the budget; run the leading steps instead
+    of aborting the whole mission with PLAN_INVALID. The agent loop still
+    enforces the global MAX_STEPS budget."""
+    plan = _validate_plan(_plan(*[_action() for _ in range(4)]))
+
+    assert len(plan.steps) == MAX_STEPS_PER_PLAN
 
 
 @pytest.mark.parametrize("url", [

@@ -281,6 +281,12 @@ async def _run_loop(
         if not steps:
             final_ans = raw_plan.get("answer") or raw_plan.get("summary")
             summary_msg = final_ans if final_ans else _summary(raw_obs, history)
+            if raw_plan.get("blocked"):
+                # The planner guard proved the task is incomplete. Report it as
+                # a failure so the UI never renders "Mission Completed" over an
+                # unverified claim.
+                return {"final": "failed", "steps": steps_done,
+                        "summary": summary_msg or "Task incomplete: the result could not be verified."}
             return {"final": "completed", "steps": steps_done, "summary": summary_msg}
 
         first = steps[0] if isinstance(steps, list) else None
@@ -324,13 +330,7 @@ async def _run_loop(
             is_strict and action.get("risk") == "write" and action.get("type") not in ("navigate", "scroll", "zoom", "wait", "observe", "select_tab")
         )
         if confirm_gate is not None and needs_confirm:
-            gate_msg = (
-                "WhatsApp Web requires QR code scan. Please scan the QR code in your WhatsApp tab to log in, then click Continue."
-                if is_wa_qr else (
-                    "Site requires Sign-In or Payment Credentials. Please sign in or complete authentication in your browser tab, then click Continue."
-                    if is_auth_page else None
-                )
-            )
+            gate_msg = _gate_message(action, is_wa_qr, is_auth_page)
             approved = await _request_confirmation(confirm_gate, action, task_id, confirm_timeout_s, custom_message=gate_msg)
             if is_cancelled(task_id):
                 return {"final": "cancelled", "steps": steps_done, "summary": None}
@@ -441,6 +441,23 @@ def _is_whatsapp_qr(raw_url: str, raw_obs: Any) -> bool:
     return False
 
 
+HANDOFF_MESSAGE = "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."
+
+
+def _gate_message(action: dict[str, Any], is_wa_qr: bool, is_auth_page: bool) -> Optional[str]:
+    """Operator-facing instruction shown with the confirmation gate."""
+    if is_wa_qr:
+        return ("WhatsApp Web requires QR code scan. Please scan the QR code in your "
+                "WhatsApp tab to log in, then click Continue.")
+    if action.get("type") == "wait" and action.get("risk") == "sensitive":
+        # The planner's human-in-the-loop handoff (CAPTCHA / login wall).
+        return HANDOFF_MESSAGE
+    if is_auth_page:
+        return ("Site requires Sign-In or Payment Credentials. Please sign in or complete "
+                "authentication in your browser tab, then click Continue.")
+    return None
+
+
 async def _request_confirmation(gate: Any, action: dict[str, Any], task_id: str, timeout_s: float, custom_message: Optional[str] = None) -> bool:
     """Pause and await a human decision. Returns True if approved.
     gate contract: confirm_requests list + asyncio.Event confirm_event + decision:bool|None."""
@@ -468,7 +485,16 @@ def _summary(obs: Any, history: list[dict[str, Any]]) -> str:
     # Summary is persisted and rendered; never surface tokens from the URL or
     # from evidence strings that echo navigated-to URLs.
     evidence = redact_text_urls(str(last_ok)) if last_ok else "none"
-    return f"final url: {redact_url(str(raw_url))} | last evidence: {evidence}"
+    # Running out of steps is a failure, not a victory. Say why, so the UI shows
+    # a truthful reason instead of a generic completion line.
+    note = ""
+    last = history[-1] if history else None
+    if last and last.get("result_ok") is False:
+        act = (last.get("action") or {}).get("type") or "action"
+        note = f"Task incomplete: the last {act} failed ({redact_text_urls(str(last.get('error') or 'error'))}). "
+    elif _is_auth_url(str(raw_url)):
+        note = "Task incomplete: the page is still a sign-in screen, so the requested data was not retrieved. "
+    return note + f"final url: {redact_url(str(raw_url))} | last evidence: {evidence}"
 
 
 def _same_failure(history: list[dict[str, Any]], entry: dict[str, Any]) -> Optional[str]:

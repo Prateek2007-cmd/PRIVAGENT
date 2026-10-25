@@ -26,6 +26,7 @@ interface AgentApi {
   click: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
+  clickPoint: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
   type: (targetId: string, text: string, clear: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
   submit: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
@@ -49,6 +50,15 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         target: { tabId },
         func: (id: string, nm?: string) =>
           (window as unknown as { __navigatorAgent?: { getCoords: (i: string, n?: string) => { x: number; y: number; width: number; height: number } | null } }).__navigatorAgent?.getCoords(id, nm) ?? null,
+        args: [targetId, name ?? ""],
+      });
+      return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
+    },
+    clickPoint: async (targetId: string, name?: string) => {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (id: string, nm?: string) =>
+          (window as unknown as { __navigatorAgent?: { getClickPoint: (i: string, n?: string) => { x: number; y: number; width: number; height: number } | null } }).__navigatorAgent?.getClickPoint(id, nm) ?? null,
         args: [targetId, name ?? ""],
       });
       return (r?.result as { x: number; y: number; width: number; height: number } | null) ?? null;
@@ -111,19 +121,57 @@ export function isConsoleUrl(url: string): boolean {
   }
 }
 
+/**
+ * Can the agent drive this tab?
+ *
+ * Deliberately broader than `isBlockedUrl`: a brand-new tab reports
+ * `about:blank` (or an empty URL while committing) and *is* a legitimate place
+ * to start a mission, even though `about:blank` must never be a navigation
+ * target. Console/privileged pages remain excluded.
+ */
+export function isDrivableTabUrl(url: string): boolean {
+  const u = (url || "").trim().toLowerCase();
+  if (!u) return true;
+  if (u === "about:blank") return true;
+  if (isConsoleUrl(url)) return false;
+  return !isBlockedUrl(url);
+}
+
 async function activeTab(): Promise<number | null> {
+  const usable = (t: chrome.tabs.Tab) => t.id !== undefined && isDrivableTabUrl(t.url ?? "");
   // Prefer the tab the user is actually looking at.
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (active?.id !== undefined && !isBlockedUrl(active.url ?? "") && !isConsoleUrl(active.url ?? "")) {
-    return active.id;
+  if (active && usable(active)) {
+    return active.id!;
   }
   // Otherwise fall back to the most recently used permitted tab.
   const all = await chrome.tabs.query({});
   const candidates = all
-    .filter(t => t.id !== undefined && !isBlockedUrl(t.url ?? "") && !isConsoleUrl(t.url ?? ""))
+    .filter(usable)
     .sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
   return candidates[0]?.id ?? null;
 }
+
+/**
+ * Return a drivable tab, creating one when the browser has nothing usable
+ * (only the NAVIGATOR console, chrome:// pages, or no window at all).
+ *
+ * Without this, every action aborted with a non-recoverable
+ * "no active tab" before the planner could navigate anywhere.
+ */
+export async function getOrCreateActiveTab(defaultUrl = "about:blank"): Promise<number> {
+  const existing = await activeTab();
+  if (existing !== null) return existing;
+  const created = await chrome.tabs.create({ url: defaultUrl, active: true });
+  if (created.id === undefined) {
+    throw new Error("could not create a browser tab");
+  }
+  if (defaultUrl !== "about:blank") {
+    await waitForStable(created.id, 5000, defaultUrl);
+  }
+  return created.id;
+}
+
 
 async function currentUrl(tabId: number): Promise<string> {
   const tab = await chrome.tabs.get(tabId);
@@ -337,8 +385,9 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
         };
       }
       case "observe": {
-        const tabId = await activeTab();
-        if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
+        // Observation is the loop's entry point; a missing tab must not abort
+        // the mission before the first plan.
+        const tabId = await getOrCreateActiveTab();
         return { ok: true, observation: await observe(tabId) };
       }
     }
@@ -352,31 +401,45 @@ function err(code: AgentError["code"], message: string, recoverable: boolean): A
 }
 
 async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>): Promise<ActionResult> {
-  const tabId = await activeTab();
-  if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
   const p = action.params;
-  if (p.direction === "back") { await chrome.tabs.goBack(tabId); }
-  else if (p.direction === "forward") { await chrome.tabs.goForward(tabId); }
-  else if (p.direction === "reload") { await chrome.tabs.reload(tabId); }
-  else if (p.url) {
-    if (isBlockedUrl(p.url)) {
-      return err("NAVIGATION_FAILED", `blocked scheme: ${p.url}`, false);
+  const existing = await activeTab();
+
+  // Browser-history navigation needs a tab that exists; there is nowhere to
+  // go back to otherwise, so this stays a recoverable error.
+  if (p.direction === "back" || p.direction === "forward" || p.direction === "reload") {
+    if (existing === null) {
+      return err("NAVIGATION_FAILED", "no tab to navigate", true);
     }
-    const cur = await chrome.tabs.get(tabId).catch(() => null);
-    let targetTabId = tabId;
-    if (cur?.url && isConsoleUrl(cur.url)) {
-      const newTab = await chrome.tabs.create({ url: p.url, active: true });
-      targetTabId = newTab.id!;
-    } else {
-      await chrome.tabs.update(tabId, { url: p.url });
-    }
-    const url = await waitForStable(targetTabId, action.timeoutMs, p.url);
-    return { ok: true, observation: await observe(targetTabId), evidence: url };
-  } else {
+    if (p.direction === "back") { await chrome.tabs.goBack(existing); }
+    else if (p.direction === "forward") { await chrome.tabs.goForward(existing); }
+    else { await chrome.tabs.reload(existing); }
+    const url = await waitForStable(existing, action.timeoutMs);
+    return { ok: true, observation: await observe(existing), evidence: url };
+  }
+
+  if (!p.url) {
     return err("NAVIGATION_FAILED", "navigate needs url or direction", false);
   }
-  const url = await waitForStable(tabId, action.timeoutMs);
-  return { ok: true, observation: await observe(tabId), evidence: url };
+  if (isBlockedUrl(p.url)) {
+    return err("NAVIGATION_FAILED", `blocked scheme: ${p.url}`, false);
+  }
+
+  const cur = existing !== null ? await chrome.tabs.get(existing).catch(() => null) : null;
+  let targetTabId: number;
+  if (existing === null || (cur?.url && isConsoleUrl(cur.url))) {
+    // No usable tab (or only the dashboard): open the destination directly
+    // instead of failing the mission before it starts.
+    const newTab = await chrome.tabs.create({ url: p.url, active: true });
+    if (newTab.id === undefined) {
+      return err("NAVIGATION_FAILED", "could not create a browser tab", false);
+    }
+    targetTabId = newTab.id;
+  } else {
+    targetTabId = existing;
+    await chrome.tabs.update(existing, { url: p.url });
+  }
+  const url = await waitForStable(targetTabId, action.timeoutMs, p.url);
+  return { ok: true, observation: await observe(targetTabId), evidence: url };
 }
 
 async function ensureTabActive(tabId: number): Promise<void> {
@@ -388,6 +451,130 @@ async function ensureTabActive(tabId: number): Promise<void> {
       await chrome.windows.update(tab.windowId, { focused: true }).catch(() => null);
     }
   } catch {}
+}
+
+/**
+ * CDP virtual-key descriptors.
+ *
+ * `windowsVirtualKeyCode` is what React/Lexical-based editors read off the
+ * event; without it their keydown handlers treat the press as unknown.
+ */
+const CDP_KEYS = {
+  Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+  Backspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+  A: { key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
+} as const;
+
+const CTRL_MODIFIER = 2;
+const META_MODIFIER = 4;
+
+export type CdpKeyIntent = "enter" | "backspace" | "selectAll";
+
+/**
+ * Build the raw CDP key events for one intent.
+ *
+ * Exported for tests: the modifier bitmask and the rawKeyDown/keyUp pairing are
+ * the parts that silently break native editing if they drift.
+ */
+export function cdpKeySequence(
+  intent: CdpKeyIntent,
+  isMac = false,
+): Array<Record<string, unknown>> {
+  const modifiers = intent === "selectAll" ? (isMac ? META_MODIFIER : CTRL_MODIFIER) : 0;
+  const desc =
+    intent === "enter" ? CDP_KEYS.Enter
+    : intent === "backspace" ? CDP_KEYS.Backspace
+    : CDP_KEYS.A;
+  const base = {
+    modifiers,
+    key: desc.key,
+    code: desc.code,
+    windowsVirtualKeyCode: desc.windowsVirtualKeyCode,
+    nativeVirtualKeyCode: desc.nativeVirtualKeyCode,
+  };
+  // rawKeyDown fires the page's keydown/default action; keyUp mirrors it so
+  // editors never see a stuck modifier or a half-pressed key.
+  return [{ type: "rawKeyDown", ...base }, { type: "keyUp", ...base }];
+}
+
+function isMacPlatform(): boolean {
+  try {
+    return /Mac/i.test(navigator.platform || navigator.userAgent || "");
+  } catch {
+    return false;
+  }
+}
+
+async function dispatchKeySequence(
+  target: { tabId: number },
+  sequence: Array<Record<string, unknown>>,
+): Promise<void> {
+  for (const event of sequence) {
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", event);
+  }
+}
+
+/**
+ * Type into the focused element through Chrome's native input pipeline.
+ *
+ * This is the primary path for modern SPAs (React-controlled inputs,
+ * Flipkart's container `<div>`, WhatsApp Web's Lexical contenteditable).
+ * `Input.insertText` goes through the same editing command a real keystroke
+ * uses, so it fires `beforeinput`/`input` and updates the framework's state —
+ * unlike assigning `HTMLInputElement.prototype.value`, which those apps
+ * reject or overwrite on their next render.
+ *
+ * Returns false when the native path is unavailable, so the caller can fall
+ * back to the in-page implementation.
+ */
+async function cdpType(
+  tabId: number,
+  coords: { x: number; y: number } | null,
+  text: string,
+  clear: boolean,
+): Promise<boolean> {
+  if (typeof chrome === "undefined" || !chrome.debugger) return false;
+  // Without coordinates we cannot focus the field with trusted input, and
+  // insertText would land in whatever happens to be focused instead.
+  if (!coords || coords.x <= 0 || coords.y <= 0) return false;
+
+  await ensureTabActive(tabId);
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+  } catch (e: any) {
+    if (!e?.message?.includes("already attached")) {
+      return false;
+    }
+  }
+
+  try {
+    const x = Math.round(coords.x);
+    const y = Math.round(coords.y);
+    // A trusted click both focuses the field and places the caret, which is
+    // what allows insertText to target the right editable.
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse",
+    });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse",
+    });
+
+    if (clear) {
+      await dispatchKeySequence(target, cdpKeySequence("selectAll", isMacPlatform()));
+      await dispatchKeySequence(target, cdpKeySequence("backspace"));
+    }
+
+    await chrome.debugger.sendCommand(target, "Input.insertText", { text });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      await chrome.debugger.detach(target);
+    } catch {}
+  }
 }
 
 async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
@@ -457,30 +644,15 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
 
   let down = false;
   try {
-    if (key === "Enter") {
-      await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
-        type: "keyDown",
-        windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-        code: "Enter",
-        key: "Enter",
-        text: "\r",
-        unmodifiedText: "\r",
-      });
-      // keyDown may already submit the form; treat a failed keyUp as a
-      // successful attempt so no second Enter is dispatched.
-      down = true;
-      await new Promise(r => setTimeout(r, 15));
-      await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
-        type: "keyUp",
-        windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-        code: "Enter",
-        key: "Enter",
-      });
-      return true;
-    }
-    return false;
+    if (key !== "Enter") return false;
+    const [keyDown, keyUp] = cdpKeySequence("enter");
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyDown);
+    // keyDown may already submit the form; treat a failed keyUp as a
+    // successful attempt so no second Enter is dispatched.
+    down = true;
+    await new Promise(r => setTimeout(r, 15));
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", keyUp);
+    return true;
   } catch {
     return down;
   } finally {
@@ -491,8 +663,7 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
 }
 
 async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId: string): Promise<ActionResult> {
-  const tabId = await activeTab();
-  if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
+  const tabId = await getOrCreateActiveTab();
   await ensureTabActive(tabId);
   const before = await currentUrl(tabId);
   const agent = await withAgent(tabId);
@@ -523,8 +694,9 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   const targetId = target?.targetId || action.target.targetId || "";
   const targetName = target?.name || action.target.name || "";
 
-  // 1. Get exact onscreen coordinates after scrollIntoView
-  const coords = await agent.getCoords(targetId, targetName);
+  // 1. Activation point: a chat row's true centre when the planner matched an
+  //    inner label, so list selection handlers fire reliably.
+  const coords = await agent.clickPoint(targetId, targetName);
   let cdpSuccess = false;
   if (coords && coords.x > 0 && coords.y > 0) {
     // 2. One trusted click via Chrome DevTools Protocol
@@ -562,8 +734,7 @@ function findSubmitControl(cands: AgentElement[]): AgentElement | undefined {
 }
 
 async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string): Promise<ActionResult> {
-  const tabId = await activeTab();
-  if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
+  const tabId = await getOrCreateActiveTab();
   await ensureTabActive(tabId);
   const before = await currentUrl(tabId);
   const agent = await withAgent(tabId);
@@ -572,15 +743,25 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   const targetId = target?.targetId || action.target.targetId || "";
   const targetName = target?.name || action.target.name || "";
 
-  // 1. Ensure target element is focused via a single trusted click.
+  // 1. Type through Chrome's native input pipeline. A trusted click focuses
+  //    the field and places the caret in the same session.
   const coords = await agent.getCoords(targetId, targetName);
-  if (coords && coords.x > 0 && coords.y > 0) {
-    await cdpClick(tabId, coords.x, coords.y);
-  }
+  const clear = action.params.clear ?? true;
+  const nativeTyped = await cdpType(tabId, coords, action.params.text, clear);
 
-  // 2. Type only. Submission is a separate, single action below.
-  const res = await agent.type(targetId, action.params.text, action.params.clear ?? true, targetName);
-  if (!res.ok) return err("STALE_TARGET", res.error ?? "type failed", true);
+  // 2. In-page fallback only when the native path is unavailable. It is
+  //    wrapped because a framework-owned node can throw from inside the
+  //    injected script (the old "execution failed" path).
+  if (!nativeTyped) {
+    let res: { ok: boolean; error?: string };
+    try {
+      res = await agent.type(targetId, action.params.text, clear, targetName);
+    } catch (e) {
+      const detail = String(e instanceof Error ? e.message : e).slice(0, 120);
+      return err("STALE_TARGET", `type failed: ${detail}`, true);
+    }
+    if (!res.ok) return err("STALE_TARGET", res.error ?? "type failed", true);
+  }
 
   // Let a controlled input paint validation/autocomplete before this
   // observation is cached for the next planning step.
@@ -627,8 +808,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
 }
 
 async function doPress(action: Extract<BrowserAction, { type: "press" }>): Promise<ActionResult> {
-  const tabId = await activeTab();
-  if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
+  const tabId = await getOrCreateActiveTab();
   await ensureTabActive(tabId);
   const before = await currentUrl(tabId);
   const key = action.params.key;
@@ -658,8 +838,7 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>): Promi
 }
 
 async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>): Promise<ActionResult> {
-  const tabId = await activeTab();
-  if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
+  const tabId = await getOrCreateActiveTab();
   await ensureTabActive(tabId);
   const agent = await withAgent(tabId);
   const res = await agent.scroll(action.params.direction, action.params.containerId);
@@ -675,8 +854,7 @@ async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>): Pro
 }
 
 async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>): Promise<ActionResult> {
-  const tabId = await activeTab();
-  if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
+  const tabId = await getOrCreateActiveTab();
   const p = action.params;
   const current = await chrome.tabs.getZoom(tabId);
   let newZoom = current;

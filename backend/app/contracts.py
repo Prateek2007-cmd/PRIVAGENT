@@ -113,6 +113,9 @@ class TaskPlan(BaseModel):
     steps: list[PlannedStep]
     answer: Optional[str] = None
     notes: Optional[str] = None
+    # Set by the planner guard when the run is honestly reported as incomplete.
+    # The loop turns this into a failed task instead of "Mission Completed".
+    blocked: bool = False
 
 
 class UserTask(BaseModel):
