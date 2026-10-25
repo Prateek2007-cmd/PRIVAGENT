@@ -10,8 +10,8 @@ here too, and screenshots are withheld unless explicitly opted in.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic import BaseModel
@@ -194,10 +194,19 @@ class PrivacyFilteredPayload:
     elements_original: int
     elements_sent: int
     screenshot: Optional[str] = None
+    tabs: list[dict[str, Any]] = field(default_factory=list)
 
     def to_context_block(self) -> str:
         """Render as an UNTRUSTED-DATA block for the planner prompt."""
-        lines = [f"URL: {self.url}", f"TITLE: {self.title}"]
+        lines = [f"URL: {self.url}", f"TITLE: {self.title}", f"TAB_ID: {self.tab_id}"]
+        if self.tabs and len(self.tabs) > 1:
+            lines.append("OPEN TABS:")
+            for t in self.tabs:
+                tid = t.get("tabId")
+                turl = t.get("url") or ""
+                ttitle = t.get("title") or ""
+                is_act = " (active)" if tid == self.tab_id or t.get("active") else ""
+                lines.append(f"  - [Tab {tid}]{is_act} {turl} — {ttitle}")
         def _pri(e: InteractiveElement) -> int:
             nm = (e.name or "").lower()
             if any(k in nm for k in ("search", "type a message", "send", "skip", "close", "submit", "groups", "group", "cancel search")):
@@ -241,6 +250,14 @@ def classify_and_redact(
                 and _SAFE_SCREENSHOT_RE.match(raw_shot)
             ):
                 safe_screenshot = raw_shot
+        scrubbed_tabs = []
+        for t in getattr(obs, "tabs", None) or []:
+            scrubbed_tabs.append({
+                "tabId": t.get("tabId"),
+                "url": redact_url(t.get("url") or ""),
+                "title": _redact_text(t.get("title") or "", MAX_TITLE_LEN),
+                "active": bool(t.get("active")),
+            })
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
             url=redact_url(obs.url),
@@ -251,6 +268,7 @@ def classify_and_redact(
             elements_original=len(obs.interactive),
             elements_sent=len(redacted),
             screenshot=safe_screenshot,
+            tabs=scrubbed_tabs,
         )
         decision = PrivacyDecision(send=True, reason="redaction succeeded", violations=[])
         return payload, decision

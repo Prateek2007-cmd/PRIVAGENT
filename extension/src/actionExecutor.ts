@@ -3,6 +3,7 @@ import type {
   AgentError,
   BrowserAction,
   BrowserObservation,
+  TabInfo,
 } from "./contracts";
 import { validateAction } from "./contracts";
 import { findTarget } from "./targeting";
@@ -368,11 +369,21 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
       case "new_tab": return await doNewTab(action);
       case "select_tab": {
         await chrome.tabs.update(action.params.tabId, { active: true });
-        return { ok: true, evidence: `tab ${action.params.tabId} active` };
+        await waitForStable(action.params.tabId, action.timeoutMs);
+        return {
+          ok: true,
+          observation: await observe(action.params.tabId),
+          evidence: `tab ${action.params.tabId} active`,
+        };
       }
       case "close_tab": {
         await chrome.tabs.remove(action.params.tabId);
-        return { ok: true, evidence: `tab ${action.params.tabId} closed` };
+        const nextTabId = await getOrCreateActiveTab();
+        return {
+          ok: true,
+          observation: await observe(nextTabId),
+          evidence: `tab ${action.params.tabId} closed`,
+        };
       }
       case "wait": {
         const tabId = await activeTab();
@@ -956,10 +967,25 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
   });
   const m = meta?.result ?? { y: 0, w: 0, h: 0, dpr: 1 };
   const screenshot = await captureScreenshot(tabId);
+
+  let openTabs: TabInfo[] | undefined;
+  try {
+    const all = await chrome.tabs.query({});
+    openTabs = all
+      .filter(t => t.id !== undefined && isDrivableTabUrl(t.url ?? ""))
+      .map(t => ({
+        tabId: t.id!,
+        url: t.url ?? "",
+        title: t.title ?? "",
+        active: Boolean(t.id === tabId || t.active),
+      }));
+  } catch {}
+
   return sanitizeObservation({
     tabId,
     url: tab.url ?? "",
     title: tab.title ?? "",
+    tabs: openTabs,
     interactive: list.map(e => ({
       targetId: e.targetId,
       role: e.role,

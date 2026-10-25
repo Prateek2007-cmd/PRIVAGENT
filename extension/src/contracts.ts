@@ -137,6 +137,13 @@ export interface InteractiveElement {
   bounds?: { x: number; y: number; width: number; height: number };
 }
 
+export interface TabInfo {
+  tabId: number;
+  url: string;
+  title: string;
+  active: boolean;
+}
+
 export interface BrowserObservation {
   tabId: number;
   url: string;
@@ -145,6 +152,7 @@ export interface BrowserObservation {
   scroll: { y: number; viewport: { w: number; h: number } };
   dpr: number;
   screenshot?: string;
+  tabs?: TabInfo[];
 }
 
 export interface ActionResult {

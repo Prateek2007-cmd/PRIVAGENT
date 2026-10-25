@@ -83,6 +83,7 @@ class BrowserObservation(BaseModel):
     scroll: dict[str, Any]
     dpr: float = 1.0
     screenshot: Optional[str] = None
+    tabs: Optional[list[dict[str, Any]]] = None
 
     model_config = {"populate_by_name": True}
 

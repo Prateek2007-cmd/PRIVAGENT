@@ -122,12 +122,23 @@ CORE OPERATING PRINCIPLES:
    - The operator is shown: "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."
    - After the human continues, observe again before acting. If the same blocker is still present, conclude with an honest failure in "answer" instead of looping.
 
+11. MULTI-TAB WORKFLOWS & CROSS-SITE OPERATIONS:
+   - When a task requires gathering information, images, or assets from another site (e.g. searching Google to upload or test on a target app):
+     * DO NOT overwrite the primary site by calling `navigate` in the same tab.
+     * Open a new tab using: {{"type": "new_tab", "risk": "write", "params": {{"url": "https://..."}}}}
+     * Extract the link, facts, or data into "notes".
+     * Switch back to the primary tab using: {{"type": "select_tab", "risk": "write", "params": {{"tabId": <number>}}}}
+     * Complete the action (e.g. paste URL, upload, type) on the primary tab.
+   - When finished with a helper tab, you may close it: {{"type": "close_tab", "risk": "write", "params": {{"tabId": <number>}}}}
+   - Always refer to the OPEN TABS list in your page context to find the right tabId.
+
 Action Schema Requirements:
 - Every action needs: type, risk ("read"|"write"|"sensitive"), verify, timeoutMs (number).
 - Type params: {{"text": ..., "clear": true, "submit": true|false}}.
 - Navigate params: {{"url": ...}}. Press params: {{"key": ...}}.
 - Scroll params: {{"direction": "down"|"up"|"top"|"bottom"}}.
 - Zoom params: {{"direction": "in"|"out"|"reset", "factor": 1.25}}.
+- New tab params: {{"url": ...}}. Select/close tab params: {{"tabId": number}}.
 - Max 3 steps per plan. Never invent an action type outside the list.
 """.format(actions=ACTION_LIST)
 
