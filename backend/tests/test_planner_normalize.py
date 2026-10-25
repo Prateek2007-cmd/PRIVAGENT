@@ -160,3 +160,82 @@ def test_type_without_target_defaults_to_active_element():
     plan = _validate_plan(_plan({"type": "type", "risk": "write", "params": {"text": "hello world"}}))
     assert plan.steps[0].action.target["name"] == "activeElement"
 
+
+# --- Targetless clicks: the live "PLAN_INVALID after 1 step" failure -------
+
+def test_click_derives_target_from_quoted_step_why():
+    """`why` belongs to the step; reading it from the action was a dead branch."""
+    raw = {
+        "goal": "open a chat",
+        "steps": [{
+            "why": 'Click "Mummy" in the chat list',
+            "action": {"type": "click", "risk": "write", "verify": "chat opened", "timeoutMs": 5000},
+        }],
+    }
+    plan = _validate_plan(raw)
+    assert plan.steps[0].action.target["name"] == "Mummy"
+
+
+def test_click_derives_target_from_params_selector():
+    plan = _validate_plan(
+        _plan({"type": "click", "risk": "write", "params": {"selector": "Search"}})
+    )
+    assert plan.steps[0].action.target["name"] == "Search"
+
+
+def test_later_underspecified_step_is_dropped_not_the_whole_plan():
+    raw = {
+        "goal": "search and play",
+        "steps": [
+            {"why": "search", "action": {
+                "type": "type", "risk": "write", "verify": "typed", "timeoutMs": 5000,
+                "target": {"name": "Search"}, "params": {"text": "Interstellar", "submit": True},
+            }},
+            {"why": "click the first video", "action": {
+                "type": "click", "risk": "write", "verify": "video opened", "timeoutMs": 5000,
+                "target": {"role": "link"},
+            }},
+        ],
+    }
+    plan = _validate_plan(raw)
+    assert len(plan.steps) == 1
+    assert plan.steps[0].action.type == "type"
+
+
+def test_underspecified_first_step_still_raises():
+    raw = {
+        "goal": "play",
+        "steps": [{"why": "click the first video", "action": {
+            "type": "click", "risk": "write", "verify": "opened", "timeoutMs": 5000,
+            "target": {"role": "link"},
+        }}],
+    }
+    with pytest.raises(ValueError, match="requires a target"):
+        _validate_plan(raw)
+
+
+def test_role_only_target_resolves_when_the_page_has_one_match():
+    from app.contracts import BrowserObservation
+    from app.privacy import classify_and_redact
+
+    obs = BrowserObservation.model_validate({
+        "tabId": 1, "url": "https://www.youtube.com/", "title": "YouTube",
+        "interactive": [{
+            "targetId": "nav-el-7", "role": "button", "name": "Search", "tag": "button",
+            "visible": True, "enabled": True,
+            "bounds": {"x": 10, "y": 10, "width": 60, "height": 30},
+        }],
+        "scroll": {"y": 0, "viewport": {"w": 1280, "h": 800}}, "dpr": 1.0,
+    })
+    payload, _ = classify_and_redact(obs, instruction="search youtube")
+
+    raw = {
+        "goal": "search",
+        "steps": [{"why": "submit", "action": {
+            "type": "click", "risk": "write", "verify": "results", "timeoutMs": 5000,
+            "target": {"role": "button"},
+        }}],
+    }
+    plan = _validate_plan(raw, payload=payload)
+    assert plan.steps[0].action.target["name"] == "Search"
+

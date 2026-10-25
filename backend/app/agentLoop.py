@@ -23,6 +23,9 @@ MAX_RETRIES = config.MAX_RETRIES
 TASK_TIMEOUT_S = config.TASK_TIMEOUT_S
 MAX_NOTES_CHARS = 4000
 MAX_HISTORY_TEXT_CHARS = 400
+# A malformed plan must not kill the mission. Give the model a bounded number
+# of replans with the exact validation error before failing honestly.
+MAX_INVALID_PLANS = 3
 
 # TIMEOUT is ambiguous: the extension may still be executing the action. Only
 # retry action types that cannot duplicate a side effect.
@@ -218,6 +221,7 @@ async def _run_loop(
     penalties: list[str] = []
     working_memory: dict[str, Any] = {}
     steps_done = 0
+    invalid_plans = 0
     start = time.monotonic()
     # A successful action already returns the post-action observation from the
     # extension. Replanning on that snapshot removes one full observe round
@@ -263,9 +267,30 @@ async def _run_loop(
         # Planner providers are synchronous HTTP clients. Run them off the
         # event loop so cancel/confirm endpoints stay responsive during a
         # slow model call.
-        raw_plan = await asyncio.to_thread(
-            _call_planner, planner, instruction, payload_dict, h_view, working_memory
-        )
+        raw_plan = None
+        try:
+            raw_plan = await asyncio.to_thread(
+                _call_planner, planner, instruction, payload_dict, h_view, working_memory
+            )
+        except ValueError as exc:
+            # A plan that fails schema/target validation is a planner mistake,
+            # not a mission-fatal error. Replan with the exact reason instead of
+            # surfacing "loop error" after one step.
+            invalid_plans += 1
+            reason = redact_text_urls(str(exc))[:300]
+            penalties.append(
+                f"invalid plan ({reason}); re-emit a valid plan. Every click/type "
+                "needs target.targetId or target.name from the page context."
+            )
+            if invalid_plans >= MAX_INVALID_PLANS:
+                return {
+                    "final": "failed",
+                    "steps": steps_done,
+                    "summary": f"Task incomplete: the planner could not produce a valid action ({reason}).",
+                }
+            progress(f"Replanning after invalid plan: {reason}")
+            continue
+        invalid_plans = 0
         if is_cancelled(task_id):
             return {"final": "cancelled", "steps": steps_done, "summary": None}
         if not isinstance(raw_plan, dict):

@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cdpKeySequence,
+  executeAction,
   getOrCreateActiveTab,
   isBlockedUrl,
   isConsoleUrl,
   isDrivableTabUrl,
   isPageSettled,
+  observe,
 } from "../src/actionExecutor";
+import type { BrowserAction } from "../src/contracts";
 
 describe("action executor URL guards", () => {
   it("blocks privileged and scriptable schemes", () => {
@@ -176,5 +179,68 @@ describe("tab lifecycle", () => {
     ]);
     await expect(getOrCreateActiveTab()).resolves.toBe(5);
     expect(create).not.toHaveBeenCalled();
+  });
+});
+
+describe("observation on unscriptable tabs", () => {
+  it("returns a metadata-only observation for about:blank", async () => {
+    const executeScript = vi.fn();
+    vi.stubGlobal("chrome", {
+      tabs: {
+        get: vi.fn(async (id: number) => ({ id, url: "about:blank", title: "", windowId: 1 })),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: { executeScript },
+    });
+
+    const obs = await observe(7);
+
+    expect(obs.tabId).toBe(7);
+    expect(obs.url).toBe("about:blank");
+    expect(obs.interactive).toEqual([]);
+    // No injection attempt at all: Chrome would reject it and kill the mission.
+    expect(executeScript).not.toHaveBeenCalled();
+  });
+
+  it("degrades to metadata when injection is refused on a scriptable URL", async () => {
+    vi.stubGlobal("chrome", {
+      tabs: {
+        get: vi.fn(async (id: number) => ({ id, url: "https://example.com/", title: "Example", windowId: 1 })),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: {
+        executeScript: vi.fn(async () => {
+          throw new Error('Cannot access contents of url "https://example.com/".');
+        }),
+      },
+    });
+
+    const obs = await observe(9);
+
+    expect(obs.url).toBe("https://example.com/");
+    expect(obs.title).toBe("Example");
+    expect(obs.interactive).toEqual([]);
+  });
+
+  it("observe still succeeds when no tab exists, using a fresh blank tab", async () => {
+    vi.stubGlobal("chrome", {
+      tabs: {
+        query: vi.fn(async (q: chrome.tabs.QueryInfo) => (q.active ? [] : [])),
+        create: vi.fn(async () => ({ id: 99, url: "about:blank" })),
+        get: vi.fn(async (id: number) => ({ id, url: "about:blank", title: "", windowId: 1 })),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: { executeScript: vi.fn() },
+    });
+
+    const action = {
+      type: "observe", risk: "read", verify: "fresh observation", timeoutMs: 5000,
+    } as BrowserAction;
+
+    const result = await executeAction(action, "task-1");
+
+    expect(result.ok).toBe(true);
+    expect(result.observation?.url).toBe("about:blank");
+    expect(result.observation?.interactive).toEqual([]);
   });
 });

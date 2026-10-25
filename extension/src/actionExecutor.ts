@@ -944,28 +944,70 @@ async function captureScreenshot(tabId: number): Promise<string | undefined> {
   }
 }
 
+/** Surfaces where a content script can never run (about:blank, chrome://, data:, ...). */
+function isScriptableUrl(url: string): boolean {
+  const u = (url || "").trim();
+  if (!u) return false;
+  return !isBlockedUrl(u);
+}
+
+/**
+ * Metadata-only observation for a tab we cannot script yet.
+ *
+ * A freshly created tab starts on about:blank, and Chrome refuses script
+ * injection there ("Extension manifest must request permission to access this
+ * host"). Returning the tab's own URL with no elements lets the planner emit a
+ * navigate instead of the mission dying on its first observation.
+ */
+function emptyObservation(tabId: number, url: string, title: string): BrowserObservation {
+  return sanitizeObservation({
+    tabId,
+    url,
+    title,
+    interactive: [],
+    scroll: { y: 0, viewport: { w: 1280, h: 800 } },
+    dpr: 1,
+  });
+}
+
 export async function observe(tabId: number): Promise<BrowserObservation> {
   await ensureTabActive(tabId);
   const tab = await chrome.tabs.get(tabId);
-  const agent = await withAgent(tabId);
-  let list = await agent.list();
+  const url = tab.url ?? "";
+  const title = tab.title ?? "";
 
-  // If the list is empty, poll briefly for SPA elements before returning an
-  // empty observation. 100ms polls replace the old 400ms cadence, so a page
-  // that hydrates in 60ms is observed immediately instead of after 400ms.
-  if (list.length === 0) {
-    for (let i = 0; i < 10; i++) {
-      await sleep(100);
-      list = await agent.list();
-      if (list.length > 0) break;
-    }
+  if (!isScriptableUrl(url)) {
+    return emptyObservation(tabId, url, title);
   }
 
-  const [meta] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => ({ y: scrollY, w: innerWidth, h: innerHeight, dpr: devicePixelRatio }),
-  });
-  const m = meta?.result ?? { y: 0, w: 0, h: 0, dpr: 1 };
+  let list: AgentElement[] = [];
+  let meta = { y: 0, w: 0, h: 0, dpr: 1 };
+  try {
+    const agent = await withAgent(tabId);
+    list = await agent.list();
+
+    // If the list is empty, poll briefly for SPA elements before returning an
+    // empty observation. 100ms polls replace the old 400ms cadence, so a page
+    // that hydrates in 60ms is observed immediately instead of after 400ms.
+    if (list.length === 0) {
+      for (let i = 0; i < 10; i++) {
+        await sleep(100);
+        list = await agent.list();
+        if (list.length > 0) break;
+      }
+    }
+
+    const [m] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({ y: scrollY, w: innerWidth, h: innerHeight, dpr: devicePixelRatio }),
+    });
+    meta = m?.result ?? meta;
+  } catch {
+    // Injection refused (host permission, PDF viewer, tab mid-commit): degrade
+    // to metadata so the loop can recover instead of aborting the mission.
+    return emptyObservation(tabId, url, title);
+  }
+
   const screenshot = await captureScreenshot(tabId);
 
   let openTabs: TabInfo[] | undefined;
@@ -983,8 +1025,8 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
 
   return sanitizeObservation({
     tabId,
-    url: tab.url ?? "",
-    title: tab.title ?? "",
+    url,
+    title,
     tabs: openTabs,
     interactive: list.map(e => ({
       targetId: e.targetId,
@@ -999,8 +1041,8 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
       value: undefined,
       bounds: e.bounds,
     })),
-    scroll: { y: m.y, viewport: { w: m.w, h: m.h } },
-    dpr: m.dpr,
+    scroll: { y: meta.y, viewport: { w: meta.w, h: meta.h } },
+    dpr: meta.dpr,
     screenshot,
   });
 }

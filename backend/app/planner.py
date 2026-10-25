@@ -134,6 +134,7 @@ CORE OPERATING PRINCIPLES:
 
 Action Schema Requirements:
 - Every action needs: type, risk ("read"|"write"|"sensitive"), verify, timeoutMs (number).
+- Click/type MUST carry a target: {{"target": {{"targetId": "<targetId from page-context>"}}}} or {{"target": {{"name": "<visible label>"}}}}. A target with only a role (e.g. {{"role": "link"}}) is rejected as underspecified: name the exact element (for a video result, its title).
 - Type params: {{"text": ..., "clear": true, "submit": true|false}}.
 - Navigate params: {{"url": ...}}. Press params: {{"key": ...}}.
 - Scroll params: {{"direction": "down"|"up"|"top"|"bottom"}}.
@@ -292,19 +293,43 @@ def _normalize_raw_plan(raw: dict[str, Any]) -> dict[str, Any]:
                 else:
                     params["key"] = "Enter"
 
-            # 4. Fallback for click or type when target is completely absent
+            # 4. Fallback for click or type when the target is absent or empty.
+            #    Models omit targets more often than they invent bad ones, so
+            #    recover a usable label from every plausible field instead of
+            #    rejecting the whole plan (which used to kill the mission on
+            #    step 1).
             if act.get("type") in {"click", "type"} and not _has_target_ref(act.get("target")):
                 candidate_name = None
-                if isinstance(params.get("text"), str) and atype == "click":
-                    candidate_name = params["text"]
-                elif isinstance(params.get("query"), str):
-                    candidate_name = params["query"]
-                elif isinstance(act.get("why"), str):
-                    why = act["why"].strip()
-                    if '"' in why:
-                        candidate_name = why.split('"')[1]
-                    elif "'" in why:
-                        candidate_name = why.split("'")[1]
+                for source in (
+                    params.get("name"),
+                    params.get("label"),
+                    params.get("selector"),
+                    params.get("query"),
+                    params.get("text") if atype == "click" else None,
+                    act.get("text") if atype == "click" else None,
+                    act.get("label"),
+                    act.get("selector"),
+                    act.get("name"),
+                ):
+                    if not isinstance(source, str):
+                        continue
+                    text = source.strip()
+                    # Selectors are only useful as a fallback name when they
+                    # quote a human label ("[...='Mummy']"); otherwise the
+                    # raw selector would never match an accessible name.
+                    if text:
+                        candidate_name = text
+                        break
+                if candidate_name is None:
+                    # `why` lives on the STEP, not inside the action. This was
+                    # the actual reason targetless clicks were rejected.
+                    for prose in (s.get("why"), act.get("why"), act.get("reason")):
+                        if not isinstance(prose, str):
+                            continue
+                        quoted = _quoted_name(prose)
+                        if quoted:
+                            candidate_name = quoted
+                            break
 
                 if candidate_name and candidate_name.strip():
                     act["target"] = {"name": candidate_name.strip()}
@@ -337,6 +362,19 @@ def _normalize_raw_plan(raw: dict[str, Any]) -> dict[str, Any]:
 def _has_key(value: Any) -> bool:
     """A usable keyboard key: a non-blank string."""
     return isinstance(value, str) and bool(value.strip())
+
+
+def _quoted_name(text: str) -> Optional[str]:
+    """First quoted fragment in prose, e.g. 'Click "Mummy" in the list'."""
+    for quote in ('"', "'", "“", "‘"):
+        close = {'"': '"', "'": "'", "“": "”", "‘": "’"}[quote]
+        start = text.find(quote)
+        if start == -1:
+            continue
+        end = text.find(close, start + 1)
+        if end > start + 1:
+            return text[start + 1:end].strip()
+    return None
 
 
 def _has_target_ref(target: Any) -> bool:
@@ -415,6 +453,56 @@ def _payload_interactive(payload: Any) -> list[Any]:
     if els is None and isinstance(payload, dict):
         els = payload.get("interactive")
     return list(els or [])
+
+
+def _el_field(el: Any, name: str, default: Any = None) -> Any:
+    if isinstance(el, dict):
+        return el.get(name, default)
+    attr = "target_id" if name == "targetId" else ("input_type" if name == "inputType" else name)
+    return getattr(el, attr, default)
+
+
+def _enrich_targets_from_role(norm: dict[str, Any], payload: Any) -> dict[str, Any]:
+    """Resolve a role-only target when the page has exactly one match.
+
+    Models increasingly emit ``{"target": {"role": "button"}}`` with no name.
+    Guessing between several matches is worse than replanning, but a single
+    unambiguous element can be resolved deterministically here.
+    """
+    els = _payload_interactive(payload)
+    steps = norm.get("steps")
+    if not els or not isinstance(steps, list):
+        return norm
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        act = step.get("action")
+        if not isinstance(act, dict) or act.get("type") not in {"click", "type"}:
+            continue
+        target = act.get("target")
+        if not isinstance(target, dict) or _has_target_ref(target):
+            continue
+        role = str(target.get("role") or "").strip().lower()
+        if not role:
+            continue
+        matches = [
+            el for el in els
+            if str(_el_field(el, "role", "") or "").strip().lower() == role
+            and _el_field(el, "visible", True)
+            and _el_field(el, "enabled", True)
+        ]
+        if len(matches) != 1:
+            continue
+        el = matches[0]
+        tid = _el_field(el, "targetId")
+        name = _el_field(el, "name")
+        resolved = dict(target)
+        if tid:
+            resolved["targetId"] = tid
+        if name:
+            resolved["name"] = name
+        act["target"] = resolved
+    return norm
 
 
 def _element_text(el: Any) -> str:
@@ -583,6 +671,56 @@ def _guard_completion(
     return _honest_failure(plan.goal, plan.notes, reason)
 
 
+def _validate_step(step: PlannedStep) -> None:
+    """Raise PLAN_INVALID for one structurally invalid action."""
+    if not step.why.strip():
+        raise ValueError("PLAN_INVALID: every step needs a non-empty 'why'")
+    a = step.action
+    if a.type not in ACTION_TYPES:
+        raise ValueError(f"PLAN_INVALID: action type {a.type!r} outside whitelist")
+    if a.risk == "read" and a.type in {"type", "click", "navigate", "press", "new_tab", "close_tab"}:
+        # floor breach: these change page/task state at minimum
+        raise ValueError(f"PLAN_INVALID: action {a.type} cannot be risk=read")
+    if not (MIN_TIMEOUT_MS <= a.timeout_ms <= MAX_TIMEOUT_MS):
+        raise ValueError(
+            f"PLAN_INVALID: timeoutMs {a.timeout_ms} outside "
+            f"[{MIN_TIMEOUT_MS}, {MAX_TIMEOUT_MS}]"
+        )
+
+    p = a.params
+    if a.type in {"click", "type"}:
+        _require_target(a)
+    if a.type == "type":
+        if p is None or p.text is None:
+            raise ValueError("PLAN_INVALID: type action requires params.text")
+    elif a.type == "navigate":
+        if p is None or not (p.url or p.direction):
+            raise ValueError("PLAN_INVALID: navigate needs params.url or params.direction")
+        if p.direction is not None and p.direction not in _NAV_DIRECTIONS:
+            raise ValueError(f"PLAN_INVALID: unknown navigate direction {p.direction!r}")
+        if p.url is not None and not _safe_nav_url(p.url):
+            raise ValueError(f"PLAN_INVALID: unsafe navigate url {p.url!r}")
+    elif a.type == "press":
+        if p is None or not (p.key or "").strip():
+            raise ValueError("PLAN_INVALID: press action requires params.key")
+    elif a.type == "scroll":
+        if p is None or p.direction not in _SCROLL_DIRECTIONS:
+            raise ValueError("PLAN_INVALID: scroll requires a valid params.direction")
+    elif a.type == "zoom":
+        if p is None:
+            raise ValueError("PLAN_INVALID: zoom requires params")
+        if p.direction not in _ZOOM_DIRECTIONS and p.factor is None:
+            raise ValueError("PLAN_INVALID: zoom requires direction or factor")
+        if p.factor is not None and not (0.25 <= p.factor <= 3.0):
+            raise ValueError("PLAN_INVALID: zoom factor must be between 0.25 and 3.0")
+    elif a.type in {"select_tab", "close_tab"}:
+        if p is None or p.tab_id is None or p.tab_id < 0:
+            raise ValueError(f"PLAN_INVALID: {a.type} requires a non-negative params.tabId")
+    elif a.type == "new_tab":
+        if p is None or not _safe_nav_url(p.url):
+            raise ValueError(f"PLAN_INVALID: unsafe new_tab url {getattr(p, 'url', None)!r}")
+
+
 def _validate_plan(
     raw: dict[str, Any],
     *,
@@ -590,7 +728,7 @@ def _validate_plan(
     history: Optional[list[dict[str, Any]]] = None,
     instruction: str = "",
 ) -> TaskPlan:
-    norm = _normalize_raw_plan(raw)
+    norm = _enrich_targets_from_role(_normalize_raw_plan(raw), payload)
     try:
         plan = TaskPlan.model_validate(norm)
     except ValidationError as exc:
@@ -603,53 +741,20 @@ def _validate_plan(
             f"PLAN_INVALID: plan has {len(plan.steps)} steps; maximum is {MAX_STEPS_PER_PLAN}"
         )
 
-    for step in plan.steps:
-        if not step.why.strip():
-            raise ValueError("PLAN_INVALID: every step needs a non-empty 'why'")
-        a = step.action
-        if a.type not in ACTION_TYPES:
-            raise ValueError(f"PLAN_INVALID: action type {a.type!r} outside whitelist")
-        if a.risk == "read" and a.type in {"type", "click", "navigate", "press", "new_tab", "close_tab"}:
-            # floor breach: these change page/task state at minimum
-            raise ValueError(f"PLAN_INVALID: action {a.type} cannot be risk=read")
-        if not (MIN_TIMEOUT_MS <= a.timeout_ms <= MAX_TIMEOUT_MS):
-            raise ValueError(
-                f"PLAN_INVALID: timeoutMs {a.timeout_ms} outside "
-                f"[{MIN_TIMEOUT_MS}, {MAX_TIMEOUT_MS}]"
-            )
-
-        p = a.params
-        if a.type in {"click", "type"}:
-            _require_target(a)
-        if a.type == "type":
-            if p is None or p.text is None:
-                raise ValueError("PLAN_INVALID: type action requires params.text")
-        elif a.type == "navigate":
-            if p is None or not (p.url or p.direction):
-                raise ValueError("PLAN_INVALID: navigate needs params.url or params.direction")
-            if p.direction is not None and p.direction not in _NAV_DIRECTIONS:
-                raise ValueError(f"PLAN_INVALID: unknown navigate direction {p.direction!r}")
-            if p.url is not None and not _safe_nav_url(p.url):
-                raise ValueError(f"PLAN_INVALID: unsafe navigate url {p.url!r}")
-        elif a.type == "press":
-            if p is None or not (p.key or "").strip():
-                raise ValueError("PLAN_INVALID: press action requires params.key")
-        elif a.type == "scroll":
-            if p is None or p.direction not in _SCROLL_DIRECTIONS:
-                raise ValueError("PLAN_INVALID: scroll requires a valid params.direction")
-        elif a.type == "zoom":
-            if p is None:
-                raise ValueError("PLAN_INVALID: zoom requires params")
-            if p.direction not in _ZOOM_DIRECTIONS and p.factor is None:
-                raise ValueError("PLAN_INVALID: zoom requires direction or factor")
-            if p.factor is not None and not (0.25 <= p.factor <= 3.0):
-                raise ValueError("PLAN_INVALID: zoom factor must be between 0.25 and 3.0")
-        elif a.type in {"select_tab", "close_tab"}:
-            if p is None or p.tab_id is None or p.tab_id < 0:
-                raise ValueError(f"PLAN_INVALID: {a.type} requires a non-negative params.tabId")
-        elif a.type == "new_tab":
-            if p is None or not _safe_nav_url(p.url):
-                raise ValueError(f"PLAN_INVALID: unsafe new_tab url {getattr(p, 'url', None)!r}")
+    # Execute the longest valid prefix instead of discarding an otherwise good
+    # plan because a later step was underspecified. Only a bad FIRST step is
+    # fatal, and the loop then replans with an explanatory penalty.
+    valid_steps: list[PlannedStep] = []
+    for index, step in enumerate(plan.steps):
+        try:
+            _validate_step(step)
+        except ValueError:
+            if index == 0:
+                raise
+            break
+        valid_steps.append(step)
+    if len(valid_steps) != len(plan.steps):
+        plan = plan.model_copy(update={"steps": valid_steps})
     return _guard_completion(plan, payload, history or [], instruction)
 
 
