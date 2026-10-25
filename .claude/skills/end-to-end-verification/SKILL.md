@@ -8,19 +8,19 @@ description: End-to-end testing protocol and benchmark evaluation for representa
 ## Complete Test Battery
 Execute all test suites across the stack:
 ```bash
-# 1. Frontend landing page structure & console tests
+# 1. Frontend structure, console & sanitizer tests (25 checks)
 npm test
 
-# 2. Extension Vitest suite
+# 2. Extension Vitest suite (35 tests)
 cd extension && npm test && cd ..
 
-# 3. Backend Pytest suite (34 unit + integration tests)
+# 3. Backend Pytest suite (81 tests, including security hardening)
 cd backend && venv\Scripts\python.exe -m pytest tests && cd ..
 
-# 4. Benchmark evaluation suite (Tasks A through H)
+# 4. Benchmark evaluation suite (Tasks A through H, mock harness)
 backend\venv\Scripts\python.exe backend/scripts/benchmark_eval.py
 
-# 5. Live Gemini API smoke test
+# 5. Live provider smoke test (requires GEMINI_API_KEY)
 backend\venv\Scripts\python.exe backend/scripts/check_gemini.py
 ```
 

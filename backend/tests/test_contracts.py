@@ -14,7 +14,10 @@ from app.contracts import (
     TaskProgress,
     UserTask,
 )
+from app import agentLoop
+from app.hub import TaskRecord
 from app.main import app
+from app.privacy import classify_and_redact
 
 
 def read_action_types_from_ts() -> list[str]:
@@ -50,6 +53,56 @@ def test_roundtrip_action_camelcase():
         "timeoutMs": 5000, "target": {"targetId": "b1"},
     })
     assert a.timeout_ms == 5000
+
+
+def _assert_no_nulls(value):
+    if isinstance(value, dict):
+        for key, entry in value.items():
+            assert entry is not None, f"unexpected null at {key!r}"
+            _assert_no_nulls(entry)
+    elif isinstance(value, list):
+        for entry in value:
+            _assert_no_nulls(entry)
+
+
+def test_real_planner_omits_unset_optional_params(monkeypatch):
+    """The production WebSocket payload must not carry JSON nulls.
+
+    Pydantic's default model_dump() emits every unset ActionParams field as
+    null; the extension treats null and undefined as absent, but the wire
+    format should stay minimal and unambiguous.
+    """
+    class FakeProvider:
+        def plan_call(self, instruction, payload, history, working_memory=None):
+            return {
+                "goal": "open flipkart",
+                "steps": [{
+                    "why": "open the storefront",
+                    "action": {
+                        "type": "navigate",
+                        "risk": "write",
+                        "verify": "storefront loaded",
+                        "timeoutMs": 5000,
+                        "params": {"url": "https://www.flipkart.com/"},
+                    },
+                }],
+            }
+
+    monkeypatch.setattr(agentLoop, "_provider_for_config", lambda: FakeProvider())
+    record = TaskRecord(task_id="wire-test", instruction="open flipkart")
+    planner = agentLoop._real_planner(record)
+
+    obs = BrowserObservation.model_validate({
+        "tabId": 1, "url": "https://example.com", "title": "Example",
+        "interactive": [], "scroll": {}, "dpr": 1,
+    })
+    payload, _ = classify_and_redact(obs, instruction="open flipkart")
+    plan = planner("open flipkart", payload, [])
+
+    action = plan["steps"][0]["action"]
+    assert action["params"] == {"url": "https://www.flipkart.com/"}
+    assert "target" not in action
+    _assert_no_nulls(plan)
 
 
 def test_task_progress_alias():

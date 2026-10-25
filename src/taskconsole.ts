@@ -1,4 +1,5 @@
 import "./styles/taskconsole.css";
+import { linkify } from "./sanitize";
 
 const API = "http://localhost:8000";
 
@@ -20,21 +21,15 @@ if (summaryEl) summaryEl.hidden = true;
 
 let currentTaskId: string | null = null;
 let confirmResolve: ((decision: boolean) => void) | null = null;
+let cancelRequested = false;
 
 function setState(text: string): void {
   if (stateEl) stateEl.textContent = text;
 }
 
-function escapeHtml(text: string): string {
-  const d = document.createElement("div");
-  d.textContent = text;
-  return d.innerHTML;
-}
-
 function formatSummary(text: string): string {
-  let escaped = escapeHtml(text);
-  escaped = escaped.replace(/(https?:\/\/[^\s&<)]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color: #46d7ff; text-decoration: underline; font-weight: 500;">$1 ↗</a>');
-  return escaped;
+  // Escape + validated http(s) linkification lives in sanitize.ts.
+  return linkify(text);
 }
 
 function actionIcon(msg: string): string {
@@ -52,6 +47,10 @@ function actionIcon(msg: string): string {
 function renderTaskState(taskState: string, message: string): void {
   // Single source of truth: the backend task state. The UI never invents "complete".
   setState(taskState);
+  if (["completed", "failed", "cancelled"].includes(taskState)) {
+    // A terminal task can no longer be approved; never leave a stale modal.
+    if (confirmModal && !confirmModal.hidden) closeConfirm(false);
+  }
   if (taskState === "completed" && summaryEl) {
     summaryEl.innerHTML = `<strong>✓ Completed</strong> · ${formatSummary(message || "Task completed.")}`;
     summaryEl.hidden = false;
@@ -73,6 +72,7 @@ function addStep(message: string): void {
 function openConfirm(message: string, action: unknown): Promise<boolean> {
   return new Promise(resolve => {
     if (!confirmModal) { resolve(false); return; }
+    confirmResolve?.(false);
     confirmResolve = resolve;
     if (confirmMsg) confirmMsg.textContent = message;
     if (confirmAction) confirmAction.textContent = JSON.stringify(action, null, 2);
@@ -104,6 +104,9 @@ input?.addEventListener("input", () => {
 startBtn?.addEventListener("click", async () => {
   if (!input || !startBtn || !input.value.trim()) return;
   startBtn.disabled = true;
+  closeConfirm(false);
+  currentTaskId = null;
+  cancelRequested = false;
   if (stepsEl) stepsEl.innerHTML = "";
   if (summaryEl) summaryEl.hidden = true;
   setState("planning");
@@ -117,6 +120,18 @@ startBtn?.addEventListener("click", async () => {
     const data = (await res.json()) as { taskId: string };
     currentTaskId = data.taskId;
     if (cancelBtn) cancelBtn.hidden = false;
+
+    // Cancel clicked while the task POST was in flight: honour it now that
+    // the real task id exists instead of silently losing the request.
+    if (cancelRequested) {
+      try {
+        await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+      } catch { /* offline */ }
+      setState("cancelled");
+      if (cancelBtn) cancelBtn.hidden = true;
+      startBtn.disabled = false;
+      return;
+    }
 
     try {
       const stRes = await fetch(`${API}/api/task/${currentTaskId}`);
@@ -134,13 +149,24 @@ startBtn?.addEventListener("click", async () => {
   } catch (e) {
     setState(`backend offline — start uvicorn on :8000 (${e})`);
     startBtn.disabled = false;
+    cancelRequested = false;
   }
 });
 
 cancelBtn?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+  const id = currentTaskId;
+  cancelRequested = true;
+  closeConfirm(false);
   if (cancelBtn) cancelBtn.hidden = true;
+  if (id) {
+    try {
+      await fetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
+    } catch {
+      // Offline: keep the UI consistent with the user's intent.
+    }
+  }
+  setState("cancelled");
+  if (startBtn) startBtn.disabled = false;
 });
 
 function connectEvents(): void {

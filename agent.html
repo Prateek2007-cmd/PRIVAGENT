@@ -70,7 +70,7 @@
         <div class="human-gate__icon">🔐</div>
         <div class="human-gate__content">
           <h4 id="humanGateTitle">Sign-in or Payment Confirmation Required</h4>
-          <p id="humanGateMsg">Amazon requires your credentials or authentication in your Chrome browser tab. Please switch to the tab, complete sign-in/verification, and click Continue.</p>
+          <p id="humanGateMsg">This site requires your credentials or authentication in your Chrome browser tab. Please switch to the tab, complete sign-in/verification, and click Continue.</p>
           <pre id="humanGateAction" class="human-gate__action" hidden></pre>
           <div class="human-gate__buttons">
             <button id="btnGateApprove" class="btn btn--primary btn--sm">✓ I Have Completed This / Continue</button>
@@ -161,8 +161,8 @@
           <li>
             <span class="sentinel-icon">⚡</span>
             <div>
-              <strong>On-Device Perception</strong>
-              <p>DOM candidates & visual bounding boxes analyzed without uploading full screenshots.</p>
+              <strong>Local-First Perception</strong>
+              <p>DOM candidates and bounding boxes are analyzed locally. Full screenshots stay on this device unless an operator explicitly opts in with <code>ALLOW_SCREENSHOTS=true</code>.</p>
             </div>
           </li>
           <li>
@@ -179,16 +179,16 @@
       <div class="inspector-card inspector-card--telemetry">
         <div class="telemetry-grid">
           <div class="telemetry-item">
-            <span class="telemetry-val" id="telPlannerLatency">1.4s</span>
-            <span class="telemetry-lbl">Planner Speed</span>
+            <span class="telemetry-val" id="telPlannerLatency">—</span>
+            <span class="telemetry-lbl">Planner Latency</span>
           </div>
           <div class="telemetry-item">
             <span class="telemetry-val" id="telStepsDone">0 / 25</span>
             <span class="telemetry-lbl">Step Budget</span>
           </div>
           <div class="telemetry-item">
-            <span class="telemetry-val">0</span>
-            <span class="telemetry-lbl">PII Leaks</span>
+            <span class="telemetry-val">Off</span>
+            <span class="telemetry-lbl">Remote Vision (opt-in)</span>
           </div>
         </div>
       </div>

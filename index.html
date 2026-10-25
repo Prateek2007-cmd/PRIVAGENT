@@ -45,11 +45,10 @@
         <div class="hero__stars" id="stars"></div>
       </div>
       <img class="hero__art" src="/images/hero-space-02.png" alt="" aria-hidden="true" />
-</div>
       <div class="hero__inner container">
         <p class="hero__kicker reveal"><span class="chip">SIH Problem 26171</span><span class="chip chip--alt">Smart Hackathon·Vision·Privacy</span></p>
         <h1 class="hero__title reveal">An <span class="grad">AI Browser Agent</span><br>That <span class="grad">Respects Your Privacy.</span></h1>
-        <p class="hero__sub reveal">NAVIGATOR sees the web the way you do — understanding every screen, filling every form, executing every workflow — while your data never leaves your local vault. No screenshots uploaded. No sessions recorded. No training on your life.</p>
+        <p class="hero__sub reveal">NAVIGATOR sees the web the way you do — understanding every screen, filling every form, executing every workflow — while credentials and PII are redacted on your machine before any model sees them. Screenshots stay local unless you explicitly opt in. No sessions recorded. No training on your life.</p>
         <div class="hero__cta reveal">
           <a class="btn btn--primary btn--lg" href="#cta">Launch Live Demo
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
@@ -60,12 +59,11 @@
           </a>
         </div>
         <ul class="hero__stats reveal" role="list">
-          <li><strong data-count="100" data-suffix="%">0%</strong><span>on-device inference</span></li>
-          <li><strong data-count="0" data-prefix="">0</strong><span>screens uploaded</span></li>
-          <li><strong data-count="24" data-suffix="/7">0/7</strong><span>autonomous monitoring</span></li>
+          <li><strong data-count="100" data-suffix="%">0%</strong><span>fail-closed redaction</span></li>
+          <li><strong data-count="0" data-prefix="">0</strong><span>screenshots sent by default</span></li>
+          <li><strong data-count="25" data-suffix="">0</strong><span>step task budget</span></li>
         </ul>
       </div>
-      <div class="hero__scroll" aria-hidden="true"><span></span></div>
       <div class="hero__scroll" aria-hidden="true"><span></span></div>
     </header>
 
@@ -99,12 +97,12 @@
       <div class="container split">
         <div class="split__copy">
           <p class="section__kicker reveal">02 · The Solution</p>
-          <h2 class="section__title reveal">Vision-grade understanding.<br><em>Local-only trust.</em></h2>
+          <h2 class="section__title reveal">Vision-grade understanding.<br><em>Local-first trust.</em></h2>
         </div>
         <ul class="pillars reveal">
-          <li><strong>Visual Understanding</strong><p>A fine-tuned vision model reads pixels — pages, charts, CAPTCHA-like UI, scanned docs — the way you do.</p></li>
-          <li><strong>Privacy Preservation</strong><p>Every inference runs on-device. PII is redacted before any optional cloud assist. Nothing is stored, nothing leaves the vault.</p></li>
-          <li><strong>Task Automation</strong><p>Natural-language missions ("renew my passport slot weekly") compiled into supervised browser actions.</p></li>
+          <li><strong>Visual Understanding</strong><p>Live DOM elements, accessibility roles and bounding boxes are mapped into a spatial view. Optional remote vision is off unless an operator opts in.</p></li>
+          <li><strong>Privacy Preservation</strong><p>A local, fail-closed redaction layer strips credentials, cards, tokens and URL secrets before any planner sees a payload. If redaction fails, the task stops.</p></li>
+          <li><strong>Task Automation</strong><p>Natural-language missions ("renew my passport slot weekly") compiled into supervised, schema-validated browser actions.</p></li>
         </ul>
       </div>
     </section>
@@ -116,9 +114,9 @@
         <h2 class="section__title reveal">From mission to completed task in <em>four steps.</em></h2>
         <ol class="flow">
           <li class="flow__step reveal"><span class="flow__num">01</span><h3>Tell the Mission</h3><p>Type or speak the goal. The intent engine parses it into checkable sub-tasks.</p></li>
-          <li class="flow__step reveal"><span class="flow__num">02</span><h3>See the Screen</h3><p>The vision model locates buttons, fields, tables in pixels — no DOM scraping required.</p></li>
-          <li class="flow__step reveal"><span class="flow__num">03</span><h3>Act Under Supervision</h3><p>Actions execute in a sandboxed profile with a live approval gate for sensitive steps.</p></li>
-          <li class="flow__step reveal"><span class="flow__num">04</span><h3>Report, Locally</h3><p>Every run logs to a local ledger you can audit, export or wipe with one click.</p></li>
+          <li class="flow__step reveal"><span class="flow__num">02</span><h3>See the Screen</h3><p>The observer maps interactive elements, accessible names and bounding boxes — with screenshot grounding available as an optional fallback.</p></li>
+          <li class="flow__step reveal"><span class="flow__num">03</span><h3>Act Under Supervision</h3><p>Actions run in your own browser through a Manifest V3 extension, with a live approval gate for sensitive steps.</p></li>
+          <li class="flow__step reveal"><span class="flow__num">04</span><h3>Report, Locally</h3><p>Every run streams into a local timeline with redacted evidence; bounded task records are pruned automatically.</p></li>
         </ol>
       </div>
     </section>
@@ -130,20 +128,20 @@
         <h2 class="section__title reveal">Built like a <em>privacy product,</em> not a demo.</h2>
         <div class="grid grid--2">
           <article class="card card--wide reveal">
-            <h3><span class="dot"></span>Zero-Egress Vision</h3>
-            <p>A quantized VLM runs entirely in a local runtime. Frame pulls and inference never touch the network stack — verifiable in your OS firewall log.</p>
+            <h3><span class="dot"></span>Local-First Vision</h3>
+            <p>Screenshots stay on your device by default. Remote vision is opt-in, capped at 4&nbsp;MB, raster-only, and suppressed whenever a sensitive field is on screen.</p>
           </article>
           <article class="card card--wide reveal">
             <h3><span class="dot"></span>PII Sentinel</h3>
-            <p>Before any assisted mode calls out, a redaction layer masks names, numbers, balances, addresses and faces in the payload.</p>
+            <p>Before any planner call, a local redaction layer masks passwords, card numbers, SSNs, emails, API keys and URL secrets — and fails closed if it cannot.</p>
           </article>
           <article class="card card--wide reveal">
-            <h3><span class="dot"></span>Mission Replay Ledger</h3>
-            <p>Deterministic, tamper-evident history of every click and decision — signed and stored locally for audit and review.</p>
+            <h3><span class="dot"></span>Auditable Run Timeline</h3>
+            <p>Every step streams to the local console with redacted evidence, while bounded in-memory task records are pruned automatically.</p>
           </article>
           <article class="card card--wide reveal">
             <h3><span class="dot"></span>Adaptive UI Resilience</h3>
-            <p>Pixel-level targeting survives redesigns that break selector-based agents instantly.</p>
+            <p>DOM-first targeting with accessible-name matching and a DPR-normalized coordinate fallback survives layout shifts that break selector-only agents.</p>
           </article>
         </div>
       </div>
@@ -156,11 +154,11 @@
         <h2 class="section__title reveal">Where NAVIGATOR earns <em>its clearance.</em></h2>
         <div class="grid grid--3">
           <article class="card reveal"><h3>Govt Portals &amp; Passports</h3><p>Watches appointment availability, auto-fills fields with your locally-saved profile, books the slot in seconds.</p></article>
-          <article class="card reveal"><h3>Banking &amp; Finance</h3><p>Reconciles monthly statements, pays scheduled bills, and flags anomalies — all offline, all local.</p></article>
+          <article class="card reveal"><h3>Banking &amp; Finance</h3><p>Reconciles monthly statements, pays scheduled bills, and flags anomalies — with local redaction and an approval gate before any sensitive action.</p></article>
           <article class="card reveal"><h3>Healthcare</h3><p>Refills prescriptions and fetches reports from portals that never seem to work the same way twice.</p></article>
           <article class="card reveal"><h3>E-Commerce Ops</h3><p>Re-orders stock from vendor portals, tracks dispatch status, escalates delays into your inbox.</p></article>
           <article class="card reveal"><h3>Student Administration</h3><p>Timetable sync, fee reminders, form resubmission — the routine nobody automates, done quietly off-hours.</p></article>
-          <article class="card reveal"><h3>Accessibility Ally</h3><p>For users with motor or vision impairments, NAVIGATOR completes fiddly flows by voice — with nothing recorded.</p></article>
+          <article class="card reveal"><h3>Accessibility Ally</h3><p>For users with motor or vision impairments, NAVIGATOR completes fiddly flows by voice — with credentials redacted from the run log.</p></article>
         </div>
       </div>
     </section>
@@ -171,10 +169,10 @@
         <p class="section__kicker reveal">06 · Technology</p>
         <h2 class="section__title reveal">The <em>stack</em> behind the mission.</h2>
         <div class="grid grid--4">
-          <article class="chipcard reveal"><h3>Vision Core</h3><p>Quantized VLM · ONNX Runtime · 4-bit local inference</p></article>
-          <article class="chipcard reveal"><h3>Agent Brain</h3><p>Planner-executor loop · ReAct-style reasoning · tool-calling</p></article>
-          <article class="chipcard reveal"><h3>Action Layer</h3><p>Playwright-controlled sandbox · supervised approval gate</p></article>
-          <article class="chipcard reveal"><h3>Privacy Vault</h3><p>Local credential store · PII redaction · signed audit ledger</p></article>
+          <article class="chipcard reveal"><h3>Perception Core</h3><p>DOM observer · accessible roles · DPR-aware bounding boxes</p></article>
+          <article class="chipcard reveal"><h3>Agent Brain</h3><p>Bounded planner–executor loop · Gemini / Groq / offline mock</p></article>
+          <article class="chipcard reveal"><h3>Action Layer</h3><p>Chrome MV3 extension · supervised approval gate</p></article>
+          <article class="chipcard reveal"><h3>Privacy Vault</h3><p>Fail-closed redaction · origin isolation · no committed secrets</p></article>
         </div>
       </div>
     </section>
@@ -185,7 +183,7 @@
         <div class="split__copy">
           <p class="section__kicker reveal">07 · Team</p>
           <h2 class="section__title reveal">Project <em>NAVIGATOR</em></h2>
-          <p class="reveal">Built for Smart India Hackathon 2026, problem statement <strong>26171</strong> — in partnership with <strong>ISRO</strong>. A mission-grade browser agent: it sees clearly, acts reliably, and keeps every byte on the ground.</p>
+          <p class="reveal">Built for Smart India Hackathon 2026, problem statement <strong>26171</strong> — in partnership with <strong>ISRO</strong>. A mission-grade browser agent: it sees clearly, acts reliably, and keeps sensitive data on the ground.</p>
           <ul class="badges reveal" role="list">
             <li class="badge badge--isro">ISRO Partnered</li>
             <li class="badge">SIH 26171</li>
@@ -193,9 +191,9 @@
           </ul>
         </div>
         <div class="team reveal">
-          <div class="team__slot"><span class="team__role">Vision</span><span class="team__name">Model Lead</span></div>
+          <div class="team__slot"><span class="team__role">Perception</span><span class="team__name">Model Lead</span></div>
           <div class="team__slot"><span class="team__role">Agent</span><span class="team__name">Planner Lead</span></div>
-          <div class="team__slot"><span class="team__role">Automation</span><span class="team__name">Playwright Lead</span></div>
+          <div class="team__slot"><span class="team__role">Automation</span><span class="team__name">Browser Lead</span></div>
           <div class="team__slot"><span class="team__role">Security</span><span class="team__name">Vault Lead</span></div>
         </div>
       </div>

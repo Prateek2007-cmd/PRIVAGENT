@@ -1,8 +1,9 @@
 """Groq provider — ultra-fast LPU inference via OpenAI-compatible endpoint.
 
-Models: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b.
-Retries transient failures (429/5xx) and auto-cascades to fallback models.
-Never logs the API key.
+Models: openai/gpt-oss-120b (default), openai/gpt-oss-20b, qwen/qwen3.8-27b.
+The Llama 3.3/3.1 models are Enterprise-only on Groq and are intentionally
+not used as defaults. Retries transient failures (429/5xx) and auto-cascades
+to fallback models. Never logs the API key.
 """
 from __future__ import annotations
 
@@ -14,15 +15,17 @@ from typing import Any, Optional
 import httpx
 
 from app.privacy import PrivacyFilteredPayload
+from .. import config
 from ..planner import SYSTEM_FRAME, build_prompt
 
 
 class GroqProvider:
+    DEFAULT_MODEL = "openai/gpt-oss-120b"
     FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b", timeout_s: float = 45.0) -> None:
+    def __init__(self, api_key: str, model: Optional[str] = None, timeout_s: float = 45.0) -> None:
         self._api_key = api_key
-        self._model = model
+        self._model = model or config.GROQ_MODEL or self.DEFAULT_MODEL
         self._timeout_s = timeout_s
         self._client = httpx.Client(timeout=timeout_s)
 
@@ -94,7 +97,6 @@ class GroqProvider:
                 time.sleep(1.0 * (attempt + 1))
 
         # Seamless fallback to Gemini if configured
-        from .. import config
         if config.GEMINI_API_KEY:
             try:
                 from .gemini import GeminiProvider

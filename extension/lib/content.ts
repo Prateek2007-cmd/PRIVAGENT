@@ -9,6 +9,8 @@ interface AgentElement {
   targetId: string;
   role: string;
   name: string;
+  tag: string;
+  inputType?: string;
   cssSelector: string;
   enabled: boolean;
   visible: boolean;
@@ -20,8 +22,9 @@ interface NavigatorAgent {
   click: (targetId: string, name?: string) => { ok: boolean; error?: string };
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
-  type: (targetId: string, text: string, clear: boolean, submit: boolean, name?: string) => { ok: boolean; error?: string; submitted?: boolean };
-  scroll: (direction: "up" | "down" | "top" | "bottom") => { ok: boolean; scrollY: number };
+  type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string };
+  submit: (targetId: string, name?: string) => { ok: boolean; error?: string };
+  scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
 }
 
 declare global {
@@ -165,6 +168,8 @@ function candidates(): AgentElement[] {
       targetId,
       role,
       name,
+      tag: el.tagName.toLowerCase(),
+      inputType: el.tagName.toLowerCase() === "input" ? input.type : undefined,
       cssSelector,
       enabled: !(input as HTMLButtonElement).disabled && !el.hasAttribute("aria-disabled"),
       visible: true,
@@ -285,7 +290,8 @@ window.__navigatorAgent = {
     };
   },
   click: (targetId, name) => {
-    // Specialized WhatsApp handling: clear search filter before clicking Groups or a chat
+    // Specialized WhatsApp handling: clear a stale search filter before
+    // clicking Groups or a chat row.
     if (window.location.hostname.includes("whatsapp.com")) {
       const nm = (name || "").toLowerCase();
       if (nm === "groups" || nm === "group" || nm.includes("group") || nm.includes("chat")) {
@@ -295,19 +301,24 @@ window.__navigatorAgent = {
         }
       }
     }
-    let el = elementFor(targetId, name);
+    const el = elementFor(targetId, name);
     if (!el) return { ok: false, error: "STALE_TARGET" };
     try {
       el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     } catch {}
 
-    try { (el as HTMLElement).focus?.(); } catch {}
+    // Activate exactly ONE element: the control itself, or its nearest
+    // interactive ancestor. Dispatching on the leaf, target, and container
+    // (plus anchor click) fired the same action several times.
+    const clickable = (
+      el.closest('button, [role="button"], a[href], [role="row"], [role="listitem"], [role="gridcell"], [data-testid*="cell-frame"], [data-testid*="list-item"]') as HTMLElement | null
+    ) || el;
+    try { clickable.focus?.(); } catch {}
 
-    const r = el.getBoundingClientRect();
+    const r = clickable.getBoundingClientRect();
     const cx = Math.round(r.left + Math.max(1, r.width / 2));
     const cy = Math.round(r.top + Math.max(1, r.height / 2));
-
-    const downMouse: MouseEventInit = {
+    const base: PointerEventInit = {
       bubbles: true,
       cancelable: true,
       composed: true,
@@ -317,72 +328,25 @@ window.__navigatorAgent = {
       screenX: cx,
       screenY: cy + 100,
       button: 0,
-      buttons: 1,
-    };
-    const downPointer: PointerEventInit = {
-      ...downMouse,
       pointerId: 1,
       pointerType: "mouse",
       isPrimary: true,
-      width: 1,
-      height: 1,
     };
 
-    const upMouse: MouseEventInit = {
-      ...downMouse,
-      buttons: 0,
-    };
-    const upPointer: PointerEventInit = {
-      ...downPointer,
-      buttons: 0,
-    };
-    const clickOpts: MouseEventInit = {
-      ...upMouse,
-      detail: 1,
-    };
+    clickable.dispatchEvent(new PointerEvent("pointerover", base));
+    clickable.dispatchEvent(new PointerEvent("pointerenter", base));
+    clickable.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
+    clickable.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+    clickable.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
+    clickable.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
 
-    // Innermost leaf element at coordinates (where user's finger/mouse actually touches)
-    const leafEl = (document.elementFromPoint(cx, cy) as HTMLElement) || el;
-    try { leafEl.focus?.(); } catch {}
-
-    // 1. Dispatch full sequence on the leaf element so it bubbles up naturally to React / framework listeners
-    leafEl.dispatchEvent(new PointerEvent("pointerover", downPointer));
-    leafEl.dispatchEvent(new PointerEvent("pointerenter", downPointer));
-    leafEl.dispatchEvent(new PointerEvent("pointerdown", downPointer));
-    leafEl.dispatchEvent(new MouseEvent("mousedown", downMouse));
-    leafEl.dispatchEvent(new PointerEvent("pointerup", upPointer));
-    leafEl.dispatchEvent(new MouseEvent("mouseup", upMouse));
-    leafEl.dispatchEvent(new MouseEvent("click", clickOpts));
-    try { leafEl.click(); } catch {}
-
-    // 2. Also dispatch on the target element if distinct from leaf
-    if (el !== leafEl) {
-      el.dispatchEvent(new PointerEvent("pointerdown", downPointer));
-      el.dispatchEvent(new MouseEvent("mousedown", downMouse));
-      el.dispatchEvent(new PointerEvent("pointerup", upPointer));
-      el.dispatchEvent(new MouseEvent("mouseup", upMouse));
-      el.dispatchEvent(new MouseEvent("click", clickOpts));
-      try { el.click(); } catch {}
+    // One activation click. Native .click() dispatches exactly one click and
+    // performs default actions (link navigation, form controls).
+    try {
+      clickable.click();
+    } catch {
+      clickable.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
     }
-
-    // 3. If element is wrapped inside a button, link, or clickable row, also trigger the container
-    const interactiveContainer = el.closest('button, [role="button"], a[href], [role="row"], [role="listitem"], [role="gridcell"], [data-testid*="cell-frame"], [data-testid*="list-item"]') as HTMLElement | null;
-    if (interactiveContainer && interactiveContainer !== el && interactiveContainer !== leafEl) {
-      interactiveContainer.dispatchEvent(new MouseEvent("click", clickOpts));
-      try { interactiveContainer.click(); } catch {}
-    }
-
-    // 4. Anchor navigation follow-through (YouTube, standard links)
-    const anchor = (leafEl.tagName.toLowerCase() === "a" ? leafEl :
-                   (el.tagName.toLowerCase() === "a" ? el :
-                   (leafEl.closest("a") || el.closest("a") || leafEl.querySelector("a") || el.querySelector("a")))) as HTMLAnchorElement | null;
-    if (anchor && anchor.href && !anchor.href.startsWith("javascript:")) {
-      try { anchor.click(); } catch {}
-      if (window.location.hostname.includes("youtube.com") && anchor.pathname.includes("/watch")) {
-        window.location.href = anchor.href;
-      }
-    }
-
     return { ok: true };
   },
   clickCoords: (x, y) => {
@@ -395,7 +359,7 @@ window.__navigatorAgent = {
     const cx = Math.round(x);
     const cy = Math.round(y);
 
-    const downMouse: MouseEventInit = {
+    const base: PointerEventInit = {
       bubbles: true,
       cancelable: true,
       composed: true,
@@ -405,38 +369,28 @@ window.__navigatorAgent = {
       screenX: cx,
       screenY: cy + 100,
       button: 0,
-      buttons: 1,
-    };
-    const downPointer: PointerEventInit = {
-      ...downMouse,
       pointerId: 1,
       pointerType: "mouse",
       isPrimary: true,
     };
-    const upMouse: MouseEventInit = { ...downMouse, buttons: 0 };
-    const upPointer: PointerEventInit = { ...downPointer, buttons: 0 };
-    const clickOpts: MouseEventInit = { ...upMouse, detail: 1 };
 
-    el.dispatchEvent(new PointerEvent("pointerdown", downPointer));
-    el.dispatchEvent(new MouseEvent("mousedown", downMouse));
-    el.dispatchEvent(new PointerEvent("pointerup", upPointer));
-    el.dispatchEvent(new MouseEvent("mouseup", upMouse));
-    el.dispatchEvent(new MouseEvent("click", clickOpts));
-    try { el.click(); } catch {}
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
+    el.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+    el.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+    try {
+      el.click();
+    } catch {
+      el.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
+    }
     return { ok: true, targetId: el.id || undefined };
   },
-  type: (targetId, text, clear, submit, name) => {
+  type: (targetId, text, clear, name) => {
     let el = elementFor(targetId, name);
     const nm = (name || "").toLowerCase();
 
     // Specialized WhatsApp Web element resolution:
     if (window.location.hostname.includes("whatsapp.com")) {
-      // Discard any active accidental voice note immediately
-      const cancelVoice = document.querySelector('[data-icon="cancel"], [data-testid="btn-cancel"], [data-icon="delete-clip"]') as HTMLElement | null;
-      if (cancelVoice) {
-        try { (cancelVoice.closest("button") || cancelVoice).click(); } catch {}
-      }
-
       if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
         const waComposer = document.querySelector('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"]') as HTMLElement | null;
         if (waComposer) el = waComposer;
@@ -506,74 +460,55 @@ window.__navigatorAgent = {
       input.dispatchEvent(new Event("change", { bubbles: true }));
     }
 
-    if (submit) {
-      const keyOpts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
-      el.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
-      el.dispatchEvent(new KeyboardEvent("keypress", keyOpts));
-      el.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
-
-      const clickSend = () => {
-        // Discard accidental voice recording if active
-        const cancelVoice = document.querySelector('[data-icon="cancel"], [data-testid="btn-cancel"], [data-icon="delete-clip"]') as HTMLElement | null;
-        if (cancelVoice) {
-          try { (cancelVoice.closest("button") || cancelVoice).click(); } catch {}
-          return;
-        }
-
-        const sendEl = document.querySelector('[data-testid="compose-btn-send"], [data-icon="send"], span[data-icon="send"], button[aria-label="Send" i], button[aria-label*="Send message" i]') as HTMLElement | null;
-        if (sendEl && !sendEl.closest('[data-icon="ptt"], [aria-label*="voice" i], [aria-label*="audio" i]')) {
-          const clickable = (sendEl.closest("button") || sendEl) as HTMLElement;
-          const r = clickable.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) {
-            const pOpts: PointerEventInit = {
-              bubbles: true,
-              cancelable: true,
-              view: window,
-              clientX: Math.round(r.left + r.width / 2),
-              clientY: Math.round(r.top + r.height / 2),
-              pointerId: 1,
-              pointerType: "mouse",
-              isPrimary: true,
-            };
-            clickable.focus();
-            clickable.dispatchEvent(new PointerEvent("pointerdown", pOpts));
-            clickable.dispatchEvent(new MouseEvent("mousedown", pOpts));
-            clickable.dispatchEvent(new PointerEvent("pointerup", pOpts));
-            clickable.dispatchEvent(new MouseEvent("mouseup", pOpts));
-            clickable.click();
-          }
-        }
-      };
-
-      clickSend();
-      setTimeout(clickSend, 120);
-
-      // Standard form submit
-      const input = el as HTMLInputElement;
-      if (input.form) {
-        try {
-          input.form.requestSubmit();
-        } catch {
-          try { input.form.submit(); } catch {}
-        }
-      }
-
-      // YouTube / General submit buttons
-      const submitBtn = (input.form?.querySelector('button[type="submit"], input[type="submit"]') ||
-                         document.querySelector('#nav-search-submit-button, #search-icon-legacy, input[name="btnK"], button[type="submit"]')) as HTMLElement | null;
-      if (submitBtn) {
-        try { submitBtn.click(); } catch {}
-      }
-
-      return { ok: true, submitted: true };
-    }
+    // Submission is intentionally NOT done here. The executor performs one
+    // and only one send/submit trigger, avoiding double-sent messages.
     return { ok: true };
   },
-  scroll: direction => {
-    const px = Math.round(innerHeight * 0.8);
-    if (direction === "top") scrollTo({ top: 0 });
-    else if (direction === "bottom") scrollTo({ top: document.body.scrollHeight });
-    else scrollBy({ top: direction === "down" ? px : -px });
-    return { ok: true, scrollY: scrollY };
+  submit: (targetId, name) => {
+    const el = elementFor(targetId, name) ||
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    if (!el) return { ok: false, error: "STALE_TARGET" };
+
+    // 1. A real form is the safest single-submit path.
+    const input = el as HTMLInputElement;
+    if (input.form) {
+      try {
+        if (typeof input.form.requestSubmit === "function") {
+          input.form.requestSubmit();
+        } else {
+          input.form.submit();
+        }
+        return { ok: true };
+      } catch {
+        // fall through to a single Enter dispatch
+      }
+    }
+
+    // 2. Otherwise dispatch exactly one Enter sequence.
+    try { el.focus?.(); } catch {}
+    const opts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    el.dispatchEvent(new KeyboardEvent("keydown", opts));
+    el.dispatchEvent(new KeyboardEvent("keypress", opts));
+    el.dispatchEvent(new KeyboardEvent("keyup", opts));
+    return { ok: true };
+  },
+  scroll: (direction, containerId) => {
+    const container = containerId ? elementFor(containerId) : null;
+    const px = Math.round((container ? container.clientHeight : innerHeight) * 0.8);
+    if (direction === "top") {
+      if (container) container.scrollTop = 0;
+      else scrollTo({ top: 0 });
+    } else if (direction === "bottom") {
+      if (container) container.scrollTop = container.scrollHeight;
+      else scrollTo({ top: document.body.scrollHeight });
+    } else if (container) {
+      container.scrollTop += direction === "down" ? px : -px;
+    } else {
+      scrollBy({ top: direction === "down" ? px : -px });
+    }
+    return {
+      ok: true,
+      scrollY: Math.round(container ? container.scrollTop : (window.scrollY || document.scrollingElement?.scrollTop || 0)),
+    };
   },
 };

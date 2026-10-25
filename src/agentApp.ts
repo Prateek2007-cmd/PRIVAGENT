@@ -1,4 +1,5 @@
 import "./styles/agent.css";
+import { escapeHtml, linkify, linkLabel, safeHttpUrl, safeImageSrc } from "./sanitize";
 
 const API = "http://localhost:8000";
 
@@ -37,6 +38,7 @@ const wsText = document.getElementById("wsText") as HTMLElement | null;
 
 let currentTaskId: string | null = null;
 let stepCounter = 0;
+let cancelRequested = false;
 
 function setConnectionStatus(online: boolean, text: string): void {
   if (wsDot) {
@@ -65,7 +67,8 @@ function setTaskState(state: string): void {
 
 function updateVisualFrame(screenshot: string | null | undefined, message: string, taskState: string): void {
   const m = message.toLowerCase();
-  const hasObstacle = m.includes("ad") || m.includes("skip") || m.includes("popup") || m.includes("modal") || m.includes("cookie") || m.includes("banner") || m.includes("dismiss");
+  // Word boundaries matter: "ready"/"loading" contain "ad" as a substring.
+  const hasObstacle = /\b(ad|ads|advert\w*|skip|popup|modal|cookie|banner|dismiss|overlay)\b/.test(m);
 
   if (obstacleBadge) {
     if (taskState === "awaiting_confirmation" || m.includes("sign-in") || m.includes("login") || m.includes("password") || m.includes("payment")) {
@@ -80,8 +83,8 @@ function updateVisualFrame(screenshot: string | null | undefined, message: strin
     }
   }
 
-  if (screenshot && inspectorScreenshot) {
-    const dataUrl = screenshot.startsWith("data:") ? screenshot : `data:image/jpeg;base64,${screenshot}`;
+  const dataUrl = safeImageSrc(screenshot);
+  if (dataUrl && inspectorScreenshot) {
     inspectorScreenshot.src = dataUrl;
     inspectorScreenshot.hidden = false;
     if (inspectorScreenshotPlaceholder) inspectorScreenshotPlaceholder.hidden = true;
@@ -100,28 +103,20 @@ function actionIcon(msg: string): string {
   return "⚡";
 }
 
-function linkify(text: string): string {
-  // Convert markdown links [title](url)
-  let out = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1 ↗</a>');
-  // Convert remaining bare URLs
-  out = out.replace(/(^|[^"])((?:https?:\/\/)[a-zA-Z0-9_\-./?%&=#+]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2 ↗</a>');
-  return out;
-}
-
 function formatResultHtml(rawMessage: string): string {
-  const urlMatch = rawMessage.match(/https?:\/\/[^\s"')]+/);
+  const urlMatch = rawMessage.match(/https?:\/\/[^\s"'<>)]+/);
   const priceMatch = rawMessage.match(/(?:₹|Rs\.?|INR|\$)\s?[\d,]+(?:\.\d+)?/i);
+  const directUrl = urlMatch ? safeHttpUrl(urlMatch[0]) : null;
+  const price = priceMatch ? priceMatch[0] : "";
 
   let showcaseHtml = "";
-  if (urlMatch || priceMatch) {
-    const directUrl = urlMatch ? urlMatch[0] : "";
-    const price = priceMatch ? priceMatch[0] : "";
+  if (directUrl || price) {
     showcaseHtml = `
       <div class="product-showcase">
-        <h4 class="product-showcase__title">Product & Mission Summary</h4>
+        <h4 class="product-showcase__title">Mission Summary</h4>
         <div class="product-showcase__meta">
-          ${price ? `<span class="price-tag">${price}</span>` : ""}
-          ${directUrl ? `<a href="${directUrl}" target="_blank" rel="noopener noreferrer" class="product-link-btn">Open Page on Amazon ↗</a>` : ""}
+          ${price ? `<span class="price-tag">${escapeHtml(price)}</span>` : ""}
+          ${directUrl ? `<a href="${escapeHtml(directUrl)}" target="_blank" rel="noopener noreferrer" class="product-link-btn">Open ${escapeHtml(linkLabel(directUrl))} ↗</a>` : ""}
         </div>
       </div>
     `;
@@ -152,11 +147,12 @@ function addStepItem(message: string): void {
   stepsList.appendChild(li);
   li.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
-  // Update inspector URL if evidence contains URL
-  const urlMatch = message.match(/https?:\/\/[^\s"')]+/);
-  if (urlMatch && inspectorUrl) {
-    inspectorUrl.href = urlMatch[0];
-    inspectorUrl.textContent = urlMatch[0];
+  // Update inspector URL if evidence contains a safe http(s) URL
+  const urlMatch = message.match(/https?:\/\/[^\s"'<>)]+/);
+  const safeUrl = urlMatch ? safeHttpUrl(urlMatch[0]) : null;
+  if (safeUrl && inspectorUrl) {
+    inspectorUrl.href = safeUrl;
+    inspectorUrl.textContent = safeUrl;
   }
   if (inspectorEvidence) {
     inspectorEvidence.textContent = message;
@@ -221,6 +217,8 @@ btnStartMission?.addEventListener("click", async () => {
   if (stepsList) stepsList.innerHTML = "";
   if (resultCard) resultCard.hidden = true;
   hideHumanGate();
+  currentTaskId = null;
+  cancelRequested = false;
   stepCounter = 0;
   if (stepsCount) stepsCount.textContent = "0 steps executed";
   if (telStepsDone) telStepsDone.textContent = "0 / 25";
@@ -235,6 +233,18 @@ btnStartMission?.addEventListener("click", async () => {
     if (!res.ok) throw new Error(`Backend response HTTP ${res.status}`);
     const data = (await res.json()) as { taskId: string };
     currentTaskId = data.taskId;
+
+    // Cancel clicked while the task POST was in flight: honour it now that
+    // the real task id exists instead of silently losing the request.
+    if (cancelRequested) {
+      try {
+        await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+      } catch { /* offline */ }
+      setTaskState("cancelled");
+      if (btnCancelMission) btnCancelMission.hidden = true;
+      btnStartMission.disabled = false;
+      return;
+    }
 
     // Fetch initial task state
     const stRes = await fetch(`${API}/api/task/${currentTaskId}`).catch(() => null);
@@ -251,18 +261,30 @@ btnStartMission?.addEventListener("click", async () => {
     setTaskState("failed");
     addStepItem(`⚠️ Backend connection failed: ${err}`);
     btnStartMission.disabled = false;
+    cancelRequested = false;
     if (btnCancelMission) btnCancelMission.hidden = true;
   }
 });
 
 btnCancelMission?.addEventListener("click", async () => {
-  if (!currentTaskId) return;
-  await fetch(`${API}/api/task/${currentTaskId}/cancel`, { method: "POST" });
+  const id = currentTaskId;
+  cancelRequested = true;
   if (btnCancelMission) btnCancelMission.hidden = true;
+  // Close the human gate immediately: a cancelled task can never be approved.
+  hideHumanGate();
+  if (id) {
+    try {
+      await fetch(`${API}/api/task/${id}/cancel`, { method: "POST" });
+    } catch {
+      // Offline: the UI still reflects the user's intent.
+    }
+  }
   setTaskState("cancelled");
+  if (btnStartMission) btnStartMission.disabled = false;
 });
 
 btnNewSession?.addEventListener("click", () => {
+  currentTaskId = null;
   if (missionInput) missionInput.value = "";
   if (btnStartMission) btnStartMission.disabled = true;
   if (btnCancelMission) btnCancelMission.hidden = true;
@@ -273,6 +295,12 @@ btnNewSession?.addEventListener("click", () => {
     inspectorScreenshot.removeAttribute("src");
   }
   if (inspectorScreenshotPlaceholder) inspectorScreenshotPlaceholder.hidden = false;
+  if (inspectorUrl) {
+    inspectorUrl.removeAttribute("href");
+    inspectorUrl.textContent = "Waiting for task...";
+  }
+  if (inspectorTitle) inspectorTitle.textContent = "—";
+  if (inspectorEvidence) inspectorEvidence.textContent = "Ready";
   if (obstacleBadge) {
     obstacleBadge.className = "obstacle-badge obstacle-badge--clear";
     obstacleBadge.textContent = "✓ Workflow Clear";

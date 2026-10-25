@@ -3,30 +3,69 @@
 Fail-closed: internal redactors raise through; classify_and_redact wraps only
 the assembly step so a crash anywhere yields PrivacyViolation, never a
 partially-redacted payload.
+
+Data minimization covers more than form values: URLs and page titles routinely
+carry session tokens, emails and API keys in query strings. Those are scrubbed
+here too, and screenshots are withheld unless explicitly opted in.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
+from . import config
 from .contracts import BrowserObservation, InteractiveElement, PrivacyDecision, PrivacyViolation
 
 import re
 
 MAX_NAME_LEN = 120
+MAX_TITLE_LEN = 200
+MAX_URL_LEN = 2048
+REDACTED = "[REDACTED]"
+
 SENSITIVE_INPUT_TYPES = {"password", "hidden"}
 SENSITIVE_NAME_TOKENS = (
     "password", "passwd", "pwd", "token", "secret", "api key", "apikey",
     "credit card", "creditcard", "card number", "cvv", "cvc", "ssn", "social security",
-    "pin", "auth", "bearer", "private key"
+    "pin", "auth", "bearer", "private key", "otp", "one-time", "session id",
+    "cookie", "authorization", "security code", "routing number", "iban",
+    "bank account", "upi id",
 )
+
+# Query-string keys whose values must never leave the host.
+SENSITIVE_QUERY_KEYS = re.compile(
+    r"^(?:"
+    r"access_?token|id_?token|refresh_?token|token|api_?key|key|secret|"
+    r"password|passwd|pwd|auth|authorization|session|sessionid|sid|"
+    r"sig|signature|code|otp|email|user|username|login|"
+    r"card|cc|pan|cvv|cvc|ssn|pin"
+    r")$",
+    re.IGNORECASE,
+)
+
+_SAFE_SCREENSHOT_RE = re.compile(
+    r"^data:image/(?:jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=\s]+$",
+    re.IGNORECASE,
+)
+URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 PATTERNS = {
     "credit_card": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
     "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    "api_key": re.compile(r"(?:bearer\s+[a-zA-Z0-9_\-\.]{16,}|(?:ghp|sk|AIza|gho|glpat|eyJ)[a-zA-Z0-9_\-\.]{15,})", re.IGNORECASE),
+    "api_key": re.compile(
+        r"(?:bearer\s+[a-zA-Z0-9_\-\.]{16,}"
+        r"|(?:ghp|gho|glpat|sk_live_|sk_test_|rk_live_|AIza)[a-zA-Z0-9_\-\.]{12,}"
+        r"|\bsk-[a-zA-Z0-9_\-\.]{16,})",
+        re.IGNORECASE,
+    ),
+    "jwt": re.compile(r"\beyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\b"),
+    "aws_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    "email": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
 }
 
 
@@ -37,6 +76,93 @@ def _has_sensitive_value(val: str) -> bool:
     return False
 
 
+def _redact_text(value: str, max_len: int) -> str:
+    """Mask known secret patterns in free text, then truncate."""
+    out = value
+    for pattern in PATTERNS.values():
+        out = pattern.sub(REDACTED, out)
+    return out[:max_len]
+
+
+def _sensitive_query_key(key: str) -> bool:
+    """Match a query key even when it is URL-encoded or array-suffixed."""
+    k = unquote_plus(key).strip().lower()
+    k = re.sub(r"\[[^\]]*\]$", "", k)  # token[] / token[0]
+    return bool(SENSITIVE_QUERY_KEYS.match(k))
+
+
+def redact_url(url: str) -> str:
+    """Strip URL userinfo and mask sensitive query/fragment values.
+
+    Falls back to pattern redaction for unparsable URLs — never returns the
+    original unfiltered string.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _redact_text(url, MAX_URL_LEN)
+
+    netloc = parts.netloc
+    if "@" in netloc:
+        # userinfo may be "user:password" — keep only the host.
+        netloc = REDACTED + "@" + netloc.rsplit("@", 1)[1]
+
+    def _render_query(raw: str) -> str:
+        pairs: list[str] = []
+        for piece in raw.split("&"):
+            if not piece:
+                continue
+            key, sep, value = piece.partition("=")
+            if not sep:
+                pairs.append(key)
+                continue
+            decoded = unquote_plus(value)
+            if _sensitive_query_key(key) or _has_sensitive_value(decoded):
+                pairs.append(f"{key}={REDACTED}")
+            else:
+                # Keep the original encoding: re-encoding an already-escaped
+                # value would turn %20 into %2520 and corrupt the URL.
+                pairs.append(piece)
+        return "&".join(pairs)
+
+    query = _render_query(parts.query) if parts.query else ""
+    fragment = parts.fragment
+    if fragment:
+        # Hash routes often carry a query of their own: #/callback?token=...
+        if "?" in fragment:
+            route, _, frag_query = fragment.partition("?")
+            fragment = f"{route}?{_render_query(frag_query)}"
+        elif "=" in fragment:
+            fragment = _render_query(fragment)
+        else:
+            fragment = _redact_text(fragment, MAX_URL_LEN)
+
+    safe = urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+    return _redact_text(safe, MAX_URL_LEN)
+
+
+def redact_text_urls(text: str) -> str:
+    """Apply :func:`redact_url` to every http(s) URL embedded in free text.
+
+    Evidence and summary strings echo page URLs; those routinely contain
+    session tokens. Redacting the whole string here keeps tokens out of the
+    task record and the UI timeline.
+    """
+    if not text:
+        return text
+    def _one(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        # Keep trailing punctuation out of the parsed URL.
+        suffix = ""
+        while raw and raw[-1] in ".,;:)]}":
+            suffix = raw[-1] + suffix
+            raw = raw[:-1]
+        return redact_url(raw) + suffix
+    return URL_IN_TEXT_RE.sub(_one, text)
+
+
 def _redact_element(el: InteractiveElement) -> InteractiveElement:
     """Pure per-element redactor. Raises through on bad input."""
     value: Optional[str] = el.value
@@ -45,11 +171,14 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
     name_l = (el.name or "").lower()
     if any(tok in name_l for tok in SENSITIVE_NAME_TOKENS):
         value = None
-    if value is not None and _has_sensitive_value(value):
-        value = None
+    if value is not None:
+        if _has_sensitive_value(value):
+            value = None
+        else:
+            value = _redact_text(value, MAX_NAME_LEN)
     return el.model_copy(update={
         "value": value,
-        "name": (el.name or "")[:MAX_NAME_LEN],
+        "name": _redact_text(el.name or "", MAX_NAME_LEN),
     })
 
 
@@ -103,11 +232,19 @@ def classify_and_redact(
             e.input_type in SENSITIVE_INPUT_TYPES or any(tok in (e.name or "").lower() for tok in SENSITIVE_NAME_TOKENS)
             for e in obs.interactive
         )
-        safe_screenshot = None if has_sensitive_element else getattr(obs, "screenshot", None)
+        safe_screenshot = None
+        if getattr(config, "ALLOW_SCREENSHOTS", False) and not has_sensitive_element:
+            raw_shot = getattr(obs, "screenshot", None)
+            if (
+                isinstance(raw_shot, str)
+                and len(raw_shot) <= 4 * 1024 * 1024
+                and _SAFE_SCREENSHOT_RE.match(raw_shot)
+            ):
+                safe_screenshot = raw_shot
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
-            url=obs.url,
-            title=obs.title,
+            url=redact_url(obs.url),
+            title=_redact_text(obs.title, MAX_TITLE_LEN),
             interactive=redacted,
             scroll=obs.scroll,
             dpr=obs.dpr,

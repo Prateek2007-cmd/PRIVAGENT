@@ -13,6 +13,8 @@ interface AgentElement {
   targetId: string;
   role: string;
   name: string;
+  tag: string;
+  inputType?: string;
   cssSelector: string;
   enabled: boolean;
   visible: boolean;
@@ -24,8 +26,9 @@ interface AgentApi {
   click: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
-  type: (targetId: string, text: string, clear: boolean, submit: boolean, name?: string) => Promise<{ ok: boolean; error?: string; submitted?: boolean }>;
-  scroll: (d: "up" | "down" | "top" | "bottom") => Promise<{ ok: boolean; scrollY: number }>;
+  type: (targetId: string, text: string, clear: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  submit: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
 }
 
 async function withAgent(tabId: number): Promise<AgentApi> {
@@ -66,40 +69,58 @@ async function withAgent(tabId: number): Promise<AgentApi> {
       });
       return (r?.result as { ok: boolean; targetId?: string; error?: string }) ?? { ok: false, error: "execution failed" };
     },
-    type: async (targetId: string, text: string, clear: boolean, submit: boolean, name?: string) => {
+    type: async (targetId: string, text: string, clear: boolean, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
-        func: (id: string, val: string, cl: boolean, sub: boolean, nm?: string) =>
-          (window as unknown as { __navigatorAgent?: { type: (i: string, v: string, c: boolean, s: boolean, n?: string) => { ok: boolean; error?: string; submitted?: boolean } } }).__navigatorAgent?.type(id, val, cl, sub, nm) ?? { ok: false, error: "no agent" },
-        args: [targetId, text, clear, submit, name ?? ""],
+        func: (id: string, val: string, cl: boolean, nm?: string) =>
+          (window as unknown as { __navigatorAgent?: { type: (i: string, v: string, c: boolean, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.type(id, val, cl, nm) ?? { ok: false, error: "no agent" },
+        args: [targetId, text, clear, name ?? ""],
       });
-      return (r?.result as { ok: boolean; error?: string; submitted?: boolean }) ?? { ok: false, error: "execution failed" };
+      return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
     },
-    scroll: async (direction: "up" | "down" | "top" | "bottom") => {
+    submit: async (targetId: string, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
         target: { tabId },
-        func: (dir: string) => (window as unknown as { __navigatorAgent?: { scroll: (d: any) => { ok: boolean; scrollY: number } } }).__navigatorAgent?.scroll(dir as any) ?? { ok: false, scrollY: 0 },
-        args: [direction],
+        func: (id: string, nm?: string) =>
+          (window as unknown as { __navigatorAgent?: { submit: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.submit(id, nm) ?? { ok: false, error: "no agent" },
+        args: [targetId, name ?? ""],
+      });
+      return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+    },
+    scroll: async (direction: "up" | "down" | "top" | "bottom", containerId?: string) => {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (dir: string, cid?: string) => (window as unknown as { __navigatorAgent?: { scroll: (d: any, c?: string) => { ok: boolean; scrollY: number } } }).__navigatorAgent?.scroll(dir as any, cid) ?? { ok: false, scrollY: 0 },
+        args: [direction, containerId ?? ""],
       });
       return (r?.result as { ok: boolean; scrollY: number }) ?? { ok: false, scrollY: 0 };
     },
   };
 }
 
-async function activeTab(): Promise<number | null> {
-  const currentWindowTabs = await chrome.tabs.query({ currentWindow: true });
-  // If there is an active web tab (not the console), use it
-  const webTabs = currentWindowTabs.filter(t => t.id !== undefined && !isBlockedUrl(t.url ?? "") && !t.url?.includes("localhost:5173"));
-  if (webTabs.length > 0) {
-    const activeWeb = webTabs.find(t => t.active);
-    if (activeWeb?.id !== undefined) return activeWeb.id;
-    return webTabs[webTabs.length - 1].id ?? null;
+const CONSOLE_PORTS = new Set(["5173", "4173"]);
+
+/** True for the NAVIGATOR console itself, which the agent must never drive. */
+export function isConsoleUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]")
+      && CONSOLE_PORTS.has(u.port || (u.protocol === "https:" ? "443" : "80"));
+  } catch {
+    return false;
   }
+}
+
+async function activeTab(): Promise<number | null> {
+  // Prefer the tab the user is actually looking at.
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (active?.id !== undefined && !isBlockedUrl(active.url ?? "")) return active.id;
-  const all = await chrome.tabs.query({ active: false });
+  if (active?.id !== undefined && !isBlockedUrl(active.url ?? "") && !isConsoleUrl(active.url ?? "")) {
+    return active.id;
+  }
+  // Otherwise fall back to the most recently used permitted tab.
+  const all = await chrome.tabs.query({});
   const candidates = all
-    .filter(t => t.id !== undefined && !isBlockedUrl(t.url ?? ""))
+    .filter(t => t.id !== undefined && !isBlockedUrl(t.url ?? "") && !isConsoleUrl(t.url ?? ""))
     .sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
   return candidates[0]?.id ?? null;
 }
@@ -109,10 +130,177 @@ async function currentUrl(tabId: number): Promise<string> {
   return tab?.url ?? "";
 }
 
-const BLOCKED_SCHEMES = ["chrome://", "chrome-extension://", "file://", "javascript:", "edge://", "about:"];
+const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+
+export interface PageSettlement {
+  ready: boolean;
+  interactiveCount: number;
+  isConnecting: boolean;
+}
+
+/**
+ * Decide whether the page has finished its interactive paint.
+ *
+ * - Three or more controls: usable immediately.
+ * - One/two controls: wait for two stable samples (~80ms).
+ * - Empty page: wait for five stable samples (~200ms) instead of the old
+ *   3.5s SPA penalty. Chat apps that report "Connecting…" keep waiting.
+ */
+export function isPageSettled(
+  status: PageSettlement,
+  previousInteractive = -1,
+  stableSamples = 0,
+): boolean {
+  if (!status.ready || status.isConnecting) return false;
+  if (status.interactiveCount >= 3) return true;
+  const required = status.interactiveCount === 0 ? 5 : 2;
+  return status.interactiveCount === previousInteractive && stableSamples >= required;
+}
+
+function samePageUrl(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    const norm = (p: string) => p.replace(/\/$/, "");
+    return ua.origin === ub.origin
+      && norm(ua.pathname) === norm(ub.pathname)
+      && ua.search === ub.search
+      && ua.hash === ub.hash;
+  } catch {
+    return false;
+  }
+}
+
+async function pageStatus(tabId: number): Promise<PageSettlement | null> {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const text = document.body?.innerText || "";
+        return {
+          ready: document.readyState !== "loading",
+          interactiveCount: document.querySelectorAll(
+            'button, input, textarea, a[href], [role="button"], [contenteditable], [data-testid], ytd-thumbnail'
+          ).length,
+          isConnecting: text.includes("Connecting to WhatsApp") || text.includes("Loading your chats"),
+        };
+      },
+    });
+    return (res?.result as PageSettlement) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve when DOM mutations have been quiet for `quietMs`, capped by `maxMs`.
+ * A navigation that destroys the execution context rejects the injected
+ * promise; callers then fall back to waitForStable().
+ */
+async function settleDom(tabId: number, quietMs = 120, maxMs = 700): Promise<void> {
+  const quiet = Math.max(30, quietMs);
+  const cap = Math.max(quiet, maxMs);
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (q: number, capMs: number) => {
+        await new Promise<void>(resolve => {
+          const root = document.documentElement;
+          let done = false;
+          let quietTimer: ReturnType<typeof setTimeout> | undefined;
+          let maxTimer: ReturnType<typeof setTimeout> | undefined;
+          let observer: MutationObserver | undefined;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            if (quietTimer !== undefined) clearTimeout(quietTimer);
+            if (maxTimer !== undefined) clearTimeout(maxTimer);
+            observer?.disconnect();
+            resolve();
+          };
+          if (!root) {
+            finish();
+            return;
+          }
+          maxTimer = setTimeout(finish, capMs);
+          try {
+            observer = new MutationObserver(() => {
+              if (quietTimer !== undefined) clearTimeout(quietTimer);
+              quietTimer = setTimeout(finish, q);
+            });
+            observer.observe(root, {
+              childList: true,
+              subtree: true,
+              characterData: true,
+            });
+          } catch {
+            // Observation unavailable: the quiet timer below still resolves.
+          }
+          quietTimer = setTimeout(finish, q);
+        });
+      },
+      args: [quiet, cap],
+    });
+  } catch {
+    // Navigation replaced the document mid-wait.
+  }
+}
+
+/**
+ * Post-action settle used by click/type-submit/press. Watches for a URL change,
+ * a loading tab, or a newly activated tab (target=_blank), otherwise waits for
+ * DOM quiescence. Returns the tab whose observation the next step should use.
+ * It never activates an element, so single-click/single-submit is unchanged.
+ */
+async function settleAfterAction(tabId: number, beforeUrl: string, timeoutMs: number): Promise<number> {
+  const cap = Math.max(150, Math.min(timeoutMs, 1200));
+  await settleDom(tabId, 120, cap);
+
+  // A click may have opened a new tab and made it active. Observe that tab,
+  // not the old one, so the returned observation matches the next action's
+  // active tab (and stays safe to cache).
+  const active = await activeTab();
+  if (active !== null && active !== tabId) {
+    await waitForStable(active, timeoutMs);
+    return active;
+  }
+
+  // A navigation can start just after the click's DOM churn settles.
+  for (let i = 0; i < 4; i++) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab?.status === "loading" || (tab?.url && tab.url !== beforeUrl)) {
+      await waitForStable(tabId, timeoutMs);
+      return tabId;
+    }
+    await sleep(30);
+  }
+  return tabId;
+}
+
+const BLOCKED_SCHEMES = [
+  "chrome://",
+  "chrome-extension://",
+  "chrome-search:",
+  "devtools:",
+  "view-source:",
+  "edge://",
+  "brave://",
+  "opera://",
+  "about:",
+  "file://",
+  "data:",
+  "blob:",
+  "javascript:",
+  "vbscript:",
+  "filesystem:",
+];
 
 export function isBlockedUrl(url: string): boolean {
-  const u = (url || "").toLowerCase();
+  const u = (url || "").trim().toLowerCase();
+  if (!u) return true;
+  // Anything without an http(s) origin is off-limits for task navigation.
+  if (!/^https?:\/\//.test(u)) return true;
   return BLOCKED_SCHEMES.some(s => u.startsWith(s));
 }
 
@@ -176,13 +364,13 @@ async function doNavigate(action: Extract<BrowserAction, { type: "navigate" }>):
     }
     const cur = await chrome.tabs.get(tabId).catch(() => null);
     let targetTabId = tabId;
-    if (cur?.url && cur.url.includes("localhost:5173")) {
+    if (cur?.url && isConsoleUrl(cur.url)) {
       const newTab = await chrome.tabs.create({ url: p.url, active: true });
       targetTabId = newTab.id!;
     } else {
       await chrome.tabs.update(tabId, { url: p.url });
     }
-    const url = await waitForStable(targetTabId, action.timeoutMs);
+    const url = await waitForStable(targetTabId, action.timeoutMs, p.url);
     return { ok: true, observation: await observe(targetTabId), evidence: url };
   } else {
     return err("NAVIGATION_FAILED", "navigate needs url or direction", false);
@@ -214,6 +402,7 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
     }
   }
 
+  let pressed = false;
   try {
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -229,7 +418,11 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
       clickCount: 1,
       pointerType: "mouse",
     });
-    await new Promise(r => setTimeout(r, 60));
+    // From here the page may already have received the activation. Report
+    // success even if the release fails so callers never fall back to a
+    // second in-page click.
+    pressed = true;
+    await new Promise(r => setTimeout(r, 20));
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseReleased",
       x: Math.round(x),
@@ -239,10 +432,10 @@ async function cdpClick(tabId: number, x: number, y: number): Promise<boolean> {
       clickCount: 1,
       pointerType: "mouse",
     });
-    await new Promise(r => setTimeout(r, 120));
+    await new Promise(r => setTimeout(r, 20));
     return true;
   } catch {
-    return false;
+    return pressed;
   } finally {
     try {
       await chrome.debugger.detach(target);
@@ -262,6 +455,7 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
     }
   }
 
+  let down = false;
   try {
     if (key === "Enter") {
       await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
@@ -273,7 +467,10 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
         text: "\r",
         unmodifiedText: "\r",
       });
-      await new Promise(r => setTimeout(r, 40));
+      // keyDown may already submit the form; treat a failed keyUp as a
+      // successful attempt so no second Enter is dispatched.
+      down = true;
+      await new Promise(r => setTimeout(r, 15));
       await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
         type: "keyUp",
         windowsVirtualKeyCode: 13,
@@ -285,7 +482,7 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
     }
     return false;
   } catch {
-    return false;
+    return down;
   } finally {
     try {
       await chrome.debugger.detach(target);
@@ -300,22 +497,29 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   const before = await currentUrl(tabId);
   const agent = await withAgent(tabId);
   const cands = await agent.list();
-  let target = findTarget(action.target, cands, "click");
+  const target = findTarget(action.target, cands, "click");
+
   if (!target && action.target.coords) {
-    await cdpClick(tabId, action.target.coords.x, action.target.coords.y);
-    const res = await agent.clickCoords(action.target.coords.x, action.target.coords.y);
-    if (res.ok) {
-      await new Promise(r => setTimeout(r, 600));
-      const after = await currentUrl(tabId);
-      void taskId;
-      return {
-        ok: true,
-        targetId: res.targetId,
-        observation: await observe(tabId),
-        evidence: after !== before ? `navigated ${before} → ${after}` : `clicked coords (${action.target.coords.x}, ${action.target.coords.y})`,
-      };
+    // Exactly one click: trusted CDP input, with a single in-page fallback.
+    const p = action.target.coords;
+    const clicked = await cdpClick(tabId, p.x, p.y);
+    const res = clicked
+      ? { ok: true, targetId: undefined as string | undefined, error: undefined as string | undefined }
+      : await agent.clickCoords(p.x, p.y);
+    if (!res.ok) {
+      return err("STALE_TARGET", res.error ?? "coordinate click failed", true);
     }
+    const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+    const after = await currentUrl(obsTab);
+    void taskId;
+    return {
+      ok: true,
+      targetId: res.targetId,
+      observation: await observe(obsTab),
+      evidence: after !== before ? `navigated ${before} → ${after}` : `clicked coords (${p.x}, ${p.y})`,
+    };
   }
+
   const targetId = target?.targetId || action.target.targetId || "";
   const targetName = target?.name || action.target.name || "";
 
@@ -323,26 +527,38 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   const coords = await agent.getCoords(targetId, targetName);
   let cdpSuccess = false;
   if (coords && coords.x > 0 && coords.y > 0) {
-    // 2. Dispatch hardware-level trusted click via Chrome DevTools Protocol
+    // 2. One trusted click via Chrome DevTools Protocol
     cdpSuccess = await cdpClick(tabId, coords.x, coords.y);
   }
 
-  // 3. Dispatch in-page pointer & DOM click only if CDP didn't succeed
+  // 3. In-page click only if CDP was unavailable — never both.
   if (!cdpSuccess) {
     const res = await agent.click(targetId, targetName);
     if (!res.ok) {
       return err("STALE_TARGET", res.error ?? `no matching element for ${JSON.stringify(action.target)}`, true);
     }
   }
-  await new Promise(r => setTimeout(r, 700));
-  const after = await currentUrl(tabId);
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+  const after = await currentUrl(obsTab);
   void taskId;
   return {
     ok: true,
     targetId: targetId,
-    observation: await observe(tabId),
+    observation: await observe(obsTab),
     evidence: after !== before ? `navigated ${before} → ${after}` : `clicked ${targetName || targetId}`,
   };
+}
+
+function findSubmitControl(cands: AgentElement[]): AgentElement | undefined {
+  return cands.find(c => {
+    if (!c.enabled || !c.visible) return false;
+    const n = c.name.toLowerCase();
+    if (n.includes("voice") || n.includes("ptt") || n.includes("microphone") || n.includes("record")) return false;
+    return n === "send"
+      || n.startsWith("send ")
+      || n.includes("send message")
+      || (c.role === "button" && n.includes("submit"));
+  });
 }
 
 async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: string): Promise<ActionResult> {
@@ -356,43 +572,57 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   const targetId = target?.targetId || action.target.targetId || "";
   const targetName = target?.name || action.target.name || "";
 
-  // 1. Ensure target element is focused via hardware click
+  // 1. Ensure target element is focused via a single trusted click.
   const coords = await agent.getCoords(targetId, targetName);
   if (coords && coords.x > 0 && coords.y > 0) {
     await cdpClick(tabId, coords.x, coords.y);
   }
 
-  const res = await agent.type(targetId, action.params.text, action.params.clear ?? true, action.params.submit ?? false, targetName);
+  // 2. Type only. Submission is a separate, single action below.
+  const res = await agent.type(targetId, action.params.text, action.params.clear ?? true, targetName);
   if (!res.ok) return err("STALE_TARGET", res.error ?? "type failed", true);
+
+  // Let a controlled input paint validation/autocomplete before this
+  // observation is cached for the next planning step.
+  await settleDom(tabId, 100, 300);
+
+  let submitted = false;
+  let obsTab = tabId;
   if (action.params.submit) {
-    // 2. Give React/DOM 120ms to update interactive buttons
-    await new Promise(r => setTimeout(r, 120));
-    // 3. Refresh candidates to locate onscreen genuine Send or Submit button (never voice note)
-    const freshCands = await agent.list();
-    const sendBtn = freshCands.find(c =>
-      c.enabled && c.visible && (
-        c.name.toLowerCase() === "send" ||
-        (c.name.toLowerCase().includes("send") && !c.name.toLowerCase().includes("voice") && !c.name.toLowerCase().includes("ptt")) ||
-        (c.role === "button" && c.name.toLowerCase().includes("submit") && !c.name.toLowerCase().includes("voice"))
-      )
-    );
+    // Poll for the Send button instead of sleeping a fixed 150ms: exit as soon
+    // as React/DOM exposes it, capped so a missing control still falls back.
+    const renderDeadline = Date.now() + 400;
+    let sendBtn = findSubmitControl(await agent.list());
+    while (!sendBtn && Date.now() < renderDeadline) {
+      await sleep(40);
+      sendBtn = findSubmitControl(await agent.list());
+    }
     if (sendBtn) {
       const sendCoords = await agent.getCoords(sendBtn.targetId, sendBtn.name);
       if (sendCoords && sendCoords.x > 0 && sendCoords.y > 0) {
-        await cdpClick(tabId, sendCoords.x, sendCoords.y);
+        submitted = await cdpClick(tabId, sendCoords.x, sendCoords.y);
       }
     }
-    // 4. Also send trusted hardware Enter key via Chrome DevTools Protocol
-    await cdpPressKey(tabId, "Enter");
-    await new Promise(r => setTimeout(r, 800));
+    // No button (or CDP unavailable): press Enter exactly once.
+    if (!submitted) {
+      submitted = await cdpPressKey(tabId, "Enter");
+    }
+    // Last resort: in-page Enter/form submit, still a single trigger.
+    if (!submitted) {
+      const fallback = await agent.submit(targetId, targetName);
+      submitted = fallback.ok;
+    }
+    obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
   }
-  const after = await currentUrl(tabId);
+  const after = await currentUrl(obsTab);
   void taskId;
   return {
     ok: true,
     targetId: targetId,
-    observation: await observe(tabId),
-    evidence: res.submitted ? (after !== before ? `searched (${after})` : "typed + submitted") : "typed",
+    observation: await observe(obsTab),
+    evidence: action.params.submit
+      ? (after !== before ? `submitted (${after})` : "typed + submitted")
+      : "typed",
   };
 }
 
@@ -400,21 +630,31 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>): Promi
   const tabId = await activeTab();
   if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
   await ensureTabActive(tabId);
+  const before = await currentUrl(tabId);
   const key = action.params.key;
+
   if (key === "Enter") {
-    await cdpPressKey(tabId, "Enter");
+    const trusted = await cdpPressKey(tabId, "Enter");
+    if (!trusted) {
+      const agent = await withAgent(tabId);
+      const fallback = await agent.submit("", "");
+      if (!fallback.ok) return err("UNKNOWN", fallback.error ?? "Enter dispatch failed", true);
+    }
+  } else {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (k: string) => {
+        const target = document.activeElement ?? document.body;
+        const opts = { key: k, bubbles: true, cancelable: true };
+        target.dispatchEvent(new KeyboardEvent("keydown", opts));
+        target.dispatchEvent(new KeyboardEvent("keypress", opts));
+        target.dispatchEvent(new KeyboardEvent("keyup", opts));
+      },
+      args: [key],
+    });
   }
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: (k: string) => {
-      const ev = new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true });
-      (document.activeElement ?? document.body).dispatchEvent(ev);
-      (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keyup", { key: k, bubbles: true }));
-    },
-    args: [key],
-  });
-  await new Promise(r => setTimeout(r, 400));
-  return { ok: true, observation: await observe(tabId), evidence: `pressed ${key}` };
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+  return { ok: true, observation: await observe(obsTab), evidence: `pressed ${key}` };
 }
 
 async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>): Promise<ActionResult> {
@@ -422,8 +662,16 @@ async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>): Pro
   if (tabId === null) return err("NAVIGATION_FAILED", "no active tab", false);
   await ensureTabActive(tabId);
   const agent = await withAgent(tabId);
-  const res = await agent.scroll(action.params.direction);
-  return { ok: true, observation: await observe(tabId), evidence: `scrollY=${res.scrollY}` };
+  const res = await agent.scroll(action.params.direction, action.params.containerId);
+  // Infinite/lazy lists render after the scroll event; give them one paint so
+  // the cached observation actually contains the newly revealed items.
+  if (res.ok) await settleDom(tabId, 80, 400);
+  return {
+    ok: res.ok,
+    observation: await observe(tabId),
+    evidence: res.ok ? `scrollY=${res.scrollY}` : "scroll target not found",
+    error: res.ok ? undefined : { code: "STALE_TARGET", message: "scroll container not found", recoverable: true },
+  };
 }
 
 async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>): Promise<ActionResult> {
@@ -444,45 +692,51 @@ async function doZoom(action: Extract<BrowserAction, { type: "zoom" }>): Promise
 async function doNewTab(action: Extract<BrowserAction, { type: "new_tab" }>): Promise<ActionResult> {
   if (isBlockedUrl(action.params.url)) return err("NAVIGATION_FAILED", `blocked scheme: ${action.params.url}`, false);
   const tab = await chrome.tabs.create({ url: action.params.url, active: true });
-  await waitForStable(tab.id!, action.timeoutMs);
+  await waitForStable(tab.id!, action.timeoutMs, action.params.url);
   return { ok: true, observation: await observe(tab.id!), evidence: `opened ${action.params.url}` };
 }
 
-/** Wait until tab status is complete and SPA DOM has interactive elements or settled. */
-async function waitForStable(tabId: number, timeoutMs: number): Promise<string> {
+/** Wait until the navigation completes and the DOM is interactive and quiet. */
+async function waitForStable(tabId: number, timeoutMs: number, expectedUrl?: string): Promise<string> {
   const start = Date.now();
-  // 1. Wait for tab network status complete
-  for (let i = 0; i < 40; i++) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab.status === "complete" && tab.url) break;
-    } catch {
-      // loading
-    }
-    if (Date.now() - start > timeoutMs) break;
-    await new Promise(r => setTimeout(r, 100));
+  const budget = Math.max(200, Math.min(timeoutMs, 8000));
+  const initial = await chrome.tabs.get(tabId).catch(() => null);
+  const initialUrl = initial?.url ?? "";
+
+  // 1. Wait for the navigation to actually begin. chrome.tabs.get can still
+  // report the previous document as "complete" right after tabs.update().
+  for (let i = 0; i < 12 && Date.now() - start < 600; i++) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) break;
+    if (tab.status === "loading") break;
+    if (expectedUrl ? samePageUrl(tab.url ?? "", expectedUrl) : tab.url !== initialUrl) break;
+    await sleep(50);
   }
 
-  // 2. Wait for SPA hydration / DOM elements to render (up to 3.5s)
-  const spaStart = Date.now();
-  while (Date.now() - spaStart < 3500) {
-    try {
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const ready = document.readyState === "complete" || document.readyState === "interactive";
-          const els = document.querySelectorAll('button, input, textarea, a[href], [role="button"], [contenteditable], [data-testid], ytd-thumbnail').length;
-          const text = document.body?.innerText || "";
-          const isConnecting = text.includes("Connecting to WhatsApp") || text.includes("Loading your chats");
-          return { ready, els, isConnecting };
-        },
-      });
-      const status = res?.result;
-      if (status?.ready && status.els >= 3 && !status.isConnecting) {
-        break;
+  // 2. Wait for the network load to complete.
+  while (Date.now() - start < budget) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab?.status === "complete" && tab.url) break;
+    await sleep(50);
+  }
+
+  // 3. Hydration: fast poll, exit as soon as the DOM is interactive and
+  // stable. Low-element pages no longer pay a fixed 3.5s penalty.
+  const hydrateDeadline = Math.min(Date.now() + 3500, start + budget);
+  let previousInteractive = -1;
+  let stableSamples = 0;
+  while (Date.now() < hydrateDeadline) {
+    const status = await pageStatus(tabId);
+    if (status) {
+      if (status.interactiveCount === previousInteractive) {
+        stableSamples++;
+      } else {
+        previousInteractive = status.interactiveCount;
+        stableSamples = 0;
       }
-    } catch {}
-    await new Promise(r => setTimeout(r, 300));
+      if (isPageSettled(status, previousInteractive, stableSamples)) break;
+    }
+    await sleep(40);
   }
 
   const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -507,10 +761,12 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
   const agent = await withAgent(tabId);
   let list = await agent.list();
 
-  // If list is empty, wait up to 2.5s polling for SPA elements before returning empty observation
+  // If the list is empty, poll briefly for SPA elements before returning an
+  // empty observation. 100ms polls replace the old 400ms cadence, so a page
+  // that hydrates in 60ms is observed immediately instead of after 400ms.
   if (list.length === 0) {
-    for (let i = 0; i < 6; i++) {
-      await new Promise(r => setTimeout(r, 400));
+    for (let i = 0; i < 10; i++) {
+      await sleep(100);
       list = await agent.list();
       if (list.length > 0) break;
     }
@@ -530,9 +786,12 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
       targetId: e.targetId,
       role: e.role,
       name: e.name,
-      tag: e.cssSelector.startsWith("#") ? "id-selected" : "el",
+      tag: e.tag || "el",
+      inputType: e.inputType,
       visible: e.visible,
       enabled: e.enabled,
+      // Values are never read at observation time; the privacy layer is only
+      // a second line of defense.
       value: undefined,
       bounds: e.bounds,
     })),
