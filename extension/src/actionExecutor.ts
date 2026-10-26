@@ -495,7 +495,7 @@ async function ensureTabActive(tabId: number): Promise<void> {
  * event; without it their keydown handlers treat the press as unknown.
  */
 const CDP_KEYS = {
-  Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+  Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: "\r", unmodifiedText: "\r" },
   Backspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
   A: { key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
 } as const;
@@ -520,13 +520,17 @@ export function cdpKeySequence(
     intent === "enter" ? CDP_KEYS.Enter
     : intent === "backspace" ? CDP_KEYS.Backspace
     : CDP_KEYS.A;
-  const base = {
+  const base: Record<string, unknown> = {
     modifiers,
     key: desc.key,
     code: desc.code,
     windowsVirtualKeyCode: desc.windowsVirtualKeyCode,
     nativeVirtualKeyCode: desc.nativeVirtualKeyCode,
   };
+  if ("text" in desc) {
+    base.text = desc.text;
+    base.unmodifiedText = desc.unmodifiedText;
+  }
   // rawKeyDown fires the page's keydown/default action; keyUp mirrors it so
   // editors never see a stuck modifier or a half-pressed key.
   return [{ type: "rawKeyDown", ...base }, { type: "keyUp", ...base }];
@@ -764,7 +768,10 @@ function findSubmitControl(cands: AgentElement[]): AgentElement | undefined {
     return n === "send"
       || n.startsWith("send ")
       || n.includes("send message")
-      || (c.role === "button" && n.includes("submit"));
+      || n === "search"
+      || n.startsWith("search ")
+      || n.includes("search for")
+      || (c.role === "button" && (n.includes("submit") || n.includes("search") || (c.tag === "button" && c.inputType === "submit")));
   });
 }
 
@@ -823,12 +830,16 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     if (!submitted) {
       submitted = await cdpPressKey(tabId, "Enter");
     }
-    // Last resort: in-page Enter/form submit, still a single trigger.
-    if (!submitted) {
+    // Settle after submission attempt
+    obsTab = await settleAfterAction(tabId, before, Math.min(action.timeoutMs, 2000));
+    // In-page fallback: if page hasn't navigated, trigger form submission directly
+    const interimUrl = await currentUrl(obsTab);
+    if (interimUrl === before) {
       const fallback = await agent.submit(targetId, targetName);
-      submitted = fallback.ok;
+      if (fallback.ok) {
+        obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+      }
     }
-    obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
   }
   const after = await currentUrl(obsTab);
   void taskId;

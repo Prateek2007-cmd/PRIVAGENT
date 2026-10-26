@@ -487,11 +487,32 @@ def _is_whatsapp_qr(raw_url: str, raw_obs: Any) -> bool:
     elements = getattr(raw_obs, "interactive", None)
     if elements is None and isinstance(raw_obs, dict):
         elements = raw_obs.get("interactive") or []
+
+    has_chats = False
+    has_qr_prompt = False
     for el in elements or []:
         name = str(getattr(el, "name", None) or (el.get("name") if isinstance(el, dict) else "")).lower()
-        if "qr" in name or "scan" in name:
-            return True
-    return False
+        role = str(getattr(el, "role", None) or (el.get("role") if isinstance(el, dict) else "")).lower()
+        if (
+            "search or start new chat" in name
+            or "type a message" in name
+            or role == "listitem"
+            or name in ("chats", "status", "channels", "communities")
+        ):
+            has_chats = True
+        if (
+            "scan this qr code" in name
+            or "use whatsapp on your computer" in name
+            or "link with phone number" in name
+            or "to use whatsapp on your computer" in name
+            or ("qr" in name and "code" in name and not has_chats)
+        ):
+            has_qr_prompt = True
+
+    # If chats or search input are visible, user is logged in — never block on QR gate
+    if has_chats:
+        return False
+    return has_qr_prompt
 
 
 HANDOFF_MESSAGE = "Please solve the CAPTCHA / sign in manually in your browser, then click Continue."

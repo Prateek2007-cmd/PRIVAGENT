@@ -111,8 +111,14 @@ class GroqProvider:
                         raise ValueError(f"PLAN_INVALID: Groq returned non-JSON: {exc}") from exc
 
                 err_text = resp.text or ""
-                if resp.status_code in _RETRYABLE_STATUS:
+                is_json_err = resp.status_code == 400 and (
+                    "json_validate_failed" in err_text or "Failed to validate JSON" in err_text
+                )
+                if resp.status_code in _RETRYABLE_STATUS or is_json_err:
                     last_exc = RuntimeError(f"Groq {resp.status_code}: {err_text}")
+                    if is_json_err:
+                        # Model failed JSON formatting constraint; try next model immediately
+                        continue
                     scope = _quota_scope(err_text)
                     retry_in = _parse_duration(err_text)
                     if scope == "day":
@@ -134,7 +140,10 @@ class GroqProvider:
                     time.sleep(min(pause, _MAX_PAUSE_S))
                     continue
 
-                raise RuntimeError(f"Groq API error {resp.status_code}: {err_text}")
+                last_exc = RuntimeError(f"Groq API error {resp.status_code}: {err_text}")
+                if not config.GEMINI_API_KEY:
+                    raise last_exc
+                break
 
         # Seamless fallback to Gemini if configured.
         if config.GEMINI_API_KEY:

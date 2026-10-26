@@ -88,7 +88,7 @@ CORE OPERATING PRINCIPLES:
      * NEVER type the message a second time.
      * NEVER click "Voice message" or microphone icons.
      * If a voice recording was accidentally triggered, click "Cancel Recording" to discard it.
-     * If QR code login is displayed, emit a wait action with risk="sensitive" so the user can scan it in their browser.
+     * If WhatsApp Web is NOT logged in and explicitly displays "Scan this QR code", emit a wait action with risk="sensitive". If already logged in (chats or search bar visible), NEVER emit a sensitive wait — proceed directly to select the chat.
 4. WEB BROWSING & RESEARCH:
    - If not on the target page, navigate to Google: {{"type": "navigate", "risk": "write", "params": {{"url": "https://www.google.com/search?q=<query>"}}}}.
    - Inspect search results, click relevant links, scroll down if needed, and summarize findings in "notes".
@@ -112,6 +112,7 @@ CORE OPERATING PRINCIPLES:
    - Claim success ONLY for effects you can actually see in the current page observation or in the action history.
    - Sending a message: success requires a successful `type` into an OPEN chat composer (with submit: true) and evidence the message left the composer. If the `type` action failed, if no chat is open, or if the right pane still shows a placeholder ("Download WhatsApp for Windows", "Keep your phone connected"), you MUST NOT claim the message was sent. Conclude with an honest failure in "answer" that names what blocked you.
    - Reading private data (attendance, marks, grades, fees, invoices, account details): you MUST NOT claim completion while the URL is still a login page (`/login`, `Default.aspx`, `msg=loginrequired`, `signin`) or while a login/validation error is visible (e.g. "Pls write the Htno", "invalid credentials", "required"). The task failed unless you reached the authenticated page and actually read the data.
+   - Searching on e-commerce/video sites (Flipkart, Amazon, YouTube): typing into a search box is NOT completion. You MUST NOT claim completion while the URL is still the root homepage (e.g. flipkart.com/, amazon.in/, youtube.com/) without search results displayed. You must submit the search and see search results before concluding.
    - Never describe an attempt as an achievement: "login attempted", "clicked Sign in", "credentials entered" are NOT success. If the requested data was not retrieved, say so.
    - If you ran out of useful steps, are blocked, or are unsure, conclude with steps: [] and put an honest failure in "answer": what you tried, what blocked you, and what the human must do next.
 10. LOGIN WALLS, CAPTCHAS & HUMAN HANDOFF:
@@ -626,6 +627,65 @@ def _honest_failure(goal: str, notes: Optional[str], reason: str) -> TaskPlan:
     )
 
 
+_SEARCH_INTENT_RE = re.compile(r"\b(search|find|buy|look for|specs|price|results)\b", re.IGNORECASE)
+_SEARCH_HOSTS = ("flipkart.com", "amazon.in", "amazon.com", "youtube.com", "google.com")
+
+
+def _uncompleted_search_recovery(
+    payload: Any, history: list[dict[str, Any]], instruction: str
+) -> Optional[PlannedStep]:
+    if not _SEARCH_INTENT_RE.search(instruction or ""):
+        return None
+    url = _payload_url(payload)
+    host = _host_of(url)
+    if not host or not any(host == h or host.endswith("." + h) for h in _SEARCH_HOSTS):
+        return None
+    try:
+        path = (urlsplit(url).path or "").rstrip("/").lower()
+    except ValueError:
+        path = ""
+    # If the URL already has a search/results path, results are loaded or loading
+    if any(seg in path for seg in ("/search", "results", "/s", "watch")):
+        return None
+    typed_in_history = any(
+        h.get("result_ok") and (h.get("action") or {}).get("type") == "type"
+        for h in history
+    )
+    if not typed_in_history:
+        return None
+
+    # Look for a search submit button on the page
+    for el in _payload_interactive(payload):
+        role = str(_el_field(el, "role", "") or "").lower()
+        name = str(_el_field(el, "name", "") or "").lower()
+        if _el_field(el, "visible", True) and _el_field(el, "enabled", True):
+            if (role in ("button", "submit") or _el_field(el, "tag", "") == "button") and (
+                "search" in name or name == "search"
+            ):
+                tid = _el_field(el, "targetId")
+                tname = _el_field(el, "name")
+                return PlannedStep(
+                    why=f"Submitting search form on {host} to load search results",
+                    action=BrowserAction(
+                        type="click",
+                        target={"targetId": tid, "name": tname},
+                        risk="write",
+                        verify="search results loaded",
+                        timeout_ms=10000,
+                    ),
+                )
+    return PlannedStep(
+        why=f"Submitting search on {host} via Enter to load search results",
+        action=BrowserAction(
+            type="press",
+            params={"key": "Enter"},
+            risk="write",
+            verify="search results loaded",
+            timeout_ms=10000,
+        ),
+    )
+
+
 def _detect_blocker(
     payload: Any, history: list[dict[str, Any]], instruction: str, answer: Optional[str]
 ) -> Optional[tuple[str, str]]:
@@ -662,6 +722,18 @@ def _guard_completion(
     """
     if plan.steps:
         return plan
+    search_recovery = _uncompleted_search_recovery(payload, history, instruction)
+    if search_recovery is not None:
+        recovery_attempts = sum(
+            1 for h in history[-2:]
+            if "Submitting search" in str((h.get("action") or {}).get("verify") or "")
+        )
+        if recovery_attempts < 2:
+            return TaskPlan(
+                goal=plan.goal,
+                notes=plan.notes,
+                steps=[search_recovery],
+            )
     blocker = _detect_blocker(payload, history, instruction, plan.answer)
     if blocker is None:
         return plan
