@@ -15,6 +15,9 @@
   <!-- Top App Bar -->
   <header class="agent-header">
     <div class="agent-header__left">
+      <button id="btnToggleSidebarHeader" class="btn btn--sm btn--ghost btn--icon" title="Toggle Missions Sidebar" aria-label="Toggle Missions Sidebar">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
       <a class="nav__brand" href="/">
         <span class="nav__logo" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
@@ -35,8 +38,33 @@
   </header>
 
   <!-- Workspace Split Grid -->
-  <main class="agent-workspace">
-    <!-- Left: Timeline & Chat Feed -->
+  <main class="agent-workspace" id="agentWorkspace">
+    <!-- Left: Collapsible Missions History Sidebar -->
+    <aside class="agent-chat-sidebar" id="chatSidebar" aria-label="Mission History Sidebar">
+      <div class="chat-sidebar__header">
+        <div class="chat-sidebar__heading">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span>MISSIONS</span>
+        </div>
+        <button id="btnCollapseSidebar" class="chat-sidebar__toggle-btn" title="Collapse sidebar" aria-label="Collapse sidebar">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+      </div>
+
+      <button id="btnNewMissionSidebar" class="btn btn--primary btn--new-mission">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        New Mission
+      </button>
+
+      <div class="chat-sidebar__section-label">RECENT MISSIONS</div>
+      <div class="chat-history-scroll">
+        <ul class="chat-history-list" id="chatHistoryList">
+          <li class="chat-history-empty">Loading missions...</li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Center: Timeline & Chat Feed -->
     <section class="agent-timeline">
       <!-- Input Panel -->
       <div class="agent-input-card">

@@ -22,6 +22,7 @@ MAX_RETAINED_TASKS = 200
 class TaskRecord:
     task_id: str
     instruction: str
+    chat_id: Optional[str] = None
     state: str = "planning"
     steps_done: int = 0
     message: str = ""
@@ -78,9 +79,9 @@ class Hub:
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
-    def new_task(self, instruction: str) -> TaskRecord:
+    def new_task(self, instruction: str, chat_id: Optional[str] = None) -> TaskRecord:
         self._prune_tasks()
-        task = TaskRecord(task_id=uuid.uuid4().hex, instruction=instruction)
+        task = TaskRecord(task_id=uuid.uuid4().hex, instruction=instruction, chat_id=chat_id)
         self.tasks[task.task_id] = task
         return task
 
@@ -147,6 +148,8 @@ class Hub:
             "taskId": task.task_id,
             "payload": {
                 "taskId": task.task_id,
+                "chatId": getattr(task, "chat_id", None),
+                "instruction": task.instruction,
                 "taskState": task.state,
                 "stepsDone": task.steps_done,
                 "message": task.message,

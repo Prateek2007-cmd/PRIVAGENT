@@ -17,11 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import config
+from . import config, db
 from .hub import hub
-from .schemas import TaskInput, ConfirmInput
+from .schemas import TaskInput, ConfirmInput, ChatCreateInput, ChatMessageInput
 
 logger = logging.getLogger("navigator.api")
+
+db.init_db()
 
 # Only local UIs and browser extensions may talk to this backend. Without
 # this, any website the user visits can create tasks and read page data from
@@ -40,7 +42,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[],
     allow_origin_regex=_ALLOWED_ORIGIN_PATTERN,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["content-type"],
     allow_credentials=False,
 )
@@ -67,6 +69,7 @@ async def origin_guard(request, call_next):
 
 class TaskCreated(BaseModel):
     task_id: str = Field(alias="taskId")
+    chat_id: Optional[str] = Field(default=None, alias="chatId")
     model_config = {"populate_by_name": True}
 
 
@@ -80,12 +83,65 @@ async def health() -> dict[str, Any]:
     }
 
 
-@app.post("/api/task", response_model=TaskCreated)
-async def create_task(body: TaskInput) -> TaskCreated:
-    task = hub.new_task(body.instruction)
+@app.get("/api/chats")
+async def get_chats() -> list[dict[str, Any]]:
+    return db.list_chats()
+
+
+@app.post("/api/chat")
+async def create_chat_session(body: Optional[ChatCreateInput] = None) -> dict[str, Any]:
+    title = body.title if body else None
+    chat = db.create_chat(title=title)
+    return {
+        "chatId": chat["id"],
+        "chat_id": chat["id"],
+        "title": chat["title"],
+        "status": chat["status"],
+    }
+
+
+@app.get("/api/chat/{chat_id}")
+async def get_chat_session(chat_id: str) -> dict[str, Any]:
+    chat = db.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="chat not found")
+    return chat
+
+
+@app.post("/api/chat/{chat_id}/message")
+async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, Any]:
+    chat = db.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="chat not found")
+    task = hub.new_task(body.text, chat_id=chat_id)
     task.state = "planning"
     _spawn(_run_task_later(task.task_id))
-    return TaskCreated(taskId=task.task_id)
+    return {
+        "taskId": task.task_id,
+        "task_id": task.task_id,
+        "chatId": chat_id,
+        "chat_id": chat_id,
+    }
+
+
+@app.delete("/api/chat/{chat_id}")
+async def delete_chat_session(chat_id: str) -> dict[str, bool]:
+    ok = db.delete_chat(chat_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="chat not found")
+    return {"ok": True}
+
+
+@app.post("/api/task", response_model=TaskCreated)
+async def create_task(body: TaskInput) -> TaskCreated:
+    chat_id = body.chat_id
+    if not chat_id:
+        chat = db.create_chat(title=body.instruction[:48].strip() or "New Mission")
+        chat_id = chat["id"]
+    task = hub.new_task(body.instruction, chat_id=chat_id)
+    task.state = "planning"
+    _spawn(_run_task_later(task.task_id))
+    return TaskCreated(taskId=task.task_id, chatId=chat_id)
 
 
 def _spawn(coro) -> "asyncio.Task[Any]":

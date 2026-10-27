@@ -77,7 +77,7 @@ _AUTH_PATH_TOKENS = {
     "signin", "sign-in", "login", "log-in", "logon", "log-on", "signup",
     "sign-up", "auth", "authenticate", "authorize", "oauth", "oauth2",
     "otp", "verify", "verification", "mfa", "2fa", "password", "passwd",
-    "checkout", "payment", "pay", "billing", "purchase",
+    "checkout", "payment", "pay-now", "makepayment", "billing", "purchase",
 }
 
 
@@ -189,6 +189,7 @@ async def run_with_injection(
     confirm_gate: Optional[Any] = None,
     confirm_timeout_s: float = 120.0,
     on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
+    initial_memory: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Test entrypoint mirroring run_task's flow with injectable parts."""
     try:
@@ -202,6 +203,7 @@ async def run_with_injection(
             confirm_gate=confirm_gate,
             confirm_timeout_s=confirm_timeout_s,
             on_metrics=on_metrics,
+            initial_memory=initial_memory,
         )
     finally:
         # Never leak cancellation markers: task ids are unique, but a stale
@@ -220,10 +222,11 @@ async def _run_loop(
     confirm_gate: Optional[Any],
     confirm_timeout_s: float,
     on_metrics: Optional[Callable[[dict[str, Any]], None]] = None,
+    initial_memory: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
     penalties: list[str] = []
-    working_memory: dict[str, Any] = {}
+    working_memory: dict[str, Any] = dict(initial_memory or {})
     steps_done = 0
     invalid_plans = 0
     start = time.monotonic()
@@ -653,6 +656,32 @@ def _to_obs(raw: dict[str, Any]):
 async def run_task(task_id: str) -> None:
     """Production entrypoint — wires real hub, real planner, live observation."""
     record: TaskRecord = real_hub.tasks[task_id]
+    chat_id = record.chat_id
+
+    initial_memory: dict[str, Any] = {}
+    if chat_id:
+        try:
+            from . import db
+            db.init_db()
+            raw_msgs = db.get_messages(chat_id, limit=6)
+            if raw_msgs:
+                initial_memory["conversation_history"] = [
+                    {"role": m["role"], "content": m["content"]} for m in raw_msgs
+                ]
+            chat_mem = db.get_chat_memory(chat_id)
+            if chat_mem:
+                initial_memory["session_memory"] = chat_mem
+
+            db.add_message(chat_id, "user", record.instruction)
+
+            chat_info = db.get_chat(chat_id)
+            if chat_info and chat_info.get("title") in ("New Mission", "New Chat", ""):
+                trunc_title = record.instruction[:36].strip()
+                if len(record.instruction) > 36:
+                    trunc_title += "..."
+                db.update_chat_title(chat_id, trunc_title)
+        except Exception:
+            pass
 
     def on_step_progress(steps: int = 0, msg: str = "", screenshot: Optional[str] = None) -> None:
         record.steps_done = steps
@@ -687,6 +716,7 @@ async def run_task(task_id: str) -> None:
             on_progress=on_step_progress,
             confirm_gate=_ConfirmGate(record),
             on_metrics=on_metrics,
+            initial_memory=initial_memory,
         )
         final_state = {"completed": "completed", "failed": "failed", "cancelled": "cancelled",
                        "budget_exceeded": "failed"}.get(state["final"], "failed")
@@ -695,11 +725,31 @@ async def run_task(task_id: str) -> None:
         record.state = final_state  # type: ignore[assignment]
         record.message = state.get("summary") or ""
         await real_hub.broadcast_progress(record)
+
+        if chat_id:
+            try:
+                from . import db
+                summary = state.get("summary") or "Mission finished."
+                evidence_info = f"{final_state} ({state.get('steps', record.steps_done)} steps)"
+                db.add_message(chat_id, "agent", summary, evidence=evidence_info)
+                if final_state == "completed":
+                    db.set_chat_memory(chat_id, "last_result", summary[:240])
+                db.touch_chat(chat_id)
+            except Exception:
+                pass
     except Exception as exc:
         cancelled = record.cancelled or is_cancelled(task_id)
         record.state = "cancelled" if cancelled else "failed"  # type: ignore[assignment]
         record.message = "" if cancelled else f"loop error: {exc}"
         await real_hub.broadcast_progress(record)
+
+        if chat_id:
+            try:
+                from . import db
+                db.add_message(chat_id, "agent", f"Error: {exc}", evidence="failed")
+                db.touch_chat(chat_id)
+            except Exception:
+                pass
     finally:
         record.pending_confirmation = None
 

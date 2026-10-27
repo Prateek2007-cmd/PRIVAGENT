@@ -167,13 +167,26 @@ def _clean_history_for_prompt(history: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def build_prompt(instruction: str, payload: PrivacyFilteredPayload, history: list[dict[str, Any]], working_memory: Optional[dict[str, Any]] = None) -> str:
-    mem_str = ""
+    mem_blocks = []
     if working_memory and any(working_memory.values()):
-        mem_str = (
-            "<working-memory untrusted=\"true\">\n"
-            f"{json.dumps(working_memory, indent=2)}\n"
-            "</working-memory>\n\n"
-        )
+        conv_hist = working_memory.get("conversation_history")
+        sess_mem = working_memory.get("session_memory")
+        other_mem = {k: v for k, v in working_memory.items() if k not in ("conversation_history", "session_memory")}
+
+        if conv_hist:
+            mem_blocks.append(
+                f"<conversation-history untrusted=\"true\">\n{json.dumps(conv_hist, indent=2)}\n</conversation-history>\n"
+            )
+        if sess_mem:
+            mem_blocks.append(
+                f"<session-memory untrusted=\"true\">\n{json.dumps(sess_mem, indent=2)}\n</session-memory>\n"
+            )
+        if other_mem and any(other_mem.values()):
+            mem_blocks.append(
+                f"<working-memory untrusted=\"true\">\n{json.dumps(other_mem, indent=2)}\n</working-memory>\n"
+            )
+
+    mem_str = "\n".join(mem_blocks) + ("\n" if mem_blocks else "")
     hist_cleaned = _clean_history_for_prompt(history)
     return (
         f"USER INSTRUCTION (trusted): {instruction}\n\n"

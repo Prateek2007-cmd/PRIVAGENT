@@ -27,13 +27,22 @@ MAX_URL_LEN = 2048
 REDACTED = "[REDACTED]"
 
 SENSITIVE_INPUT_TYPES = {"password", "hidden"}
-SENSITIVE_NAME_TOKENS = (
-    "password", "passwd", "pwd", "token", "secret", "api key", "apikey",
-    "credit card", "creditcard", "card number", "cvv", "cvc", "ssn", "social security",
-    "pin", "auth", "bearer", "private key", "otp", "one-time", "session id",
-    "cookie", "authorization", "security code", "routing number", "iban",
-    "bank account", "upi id",
+SENSITIVE_NAME_PATTERNS = re.compile(
+    r"\b("
+    r"password|passwd|pwd|token|secret|api[_\s]?key|apikey|"
+    r"credit[_\s]?card|creditcard|card[_\s]?number|cvv|cvc|ssn|social[_\s]?security|"
+    r"pin|pincode|auth|authentication|bearer|private[_\s]?key|otp|one[_\s-]?time|session[_\s]?id|"
+    r"cookie|authorization|security[_\s]?code|routing[_\s]?number|iban|"
+    r"bank[_\s]?account|upi[_\s]?id"
+    r")\b",
+    re.IGNORECASE,
 )
+
+
+def _is_sensitive_name(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    return bool(SENSITIVE_NAME_PATTERNS.search(name))
 
 # Query-string keys whose values must never leave the host.
 SENSITIVE_QUERY_KEYS = re.compile(
@@ -168,8 +177,7 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
     value: Optional[str] = el.value
     if el.input_type in SENSITIVE_INPUT_TYPES:
         value = None
-    name_l = (el.name or "").lower()
-    if any(tok in name_l for tok in SENSITIVE_NAME_TOKENS):
+    if _is_sensitive_name(el.name):
         value = None
     if value is not None:
         if _has_sensitive_value(value):
@@ -213,6 +221,8 @@ class PrivacyFilteredPayload:
                 return 0
             if e.role in ("listitem", "row") and e.name:
                 return 1
+            if e.role == "link" and e.name and len(e.name) > 10:
+                return 1
             if e.role in ("textbox", "input", "button", "ad-skip"):
                 return 2
             if e.name:
@@ -220,7 +230,7 @@ class PrivacyFilteredPayload:
             return 4
 
         sorted_els = sorted(self.interactive, key=_pri)
-        for el in sorted_els[:35]:
+        for el in sorted_els[:65]:
             bits = [f"id={el.target_id}", el.role, f'name="{el.name}"', "disabled" if not el.enabled else ""]
             if el.bounds:
                 bits.append(f'bounds=[{int(el.bounds.get("x", 0))},{int(el.bounds.get("y", 0))},{int(el.bounds.get("width", 0))}x{int(el.bounds.get("height", 0))}]')
@@ -238,7 +248,7 @@ def classify_and_redact(
         redacted = [_redact_element(e) for e in obs.interactive]
         # Fail-closed privacy: if any element on page is sensitive (password/auth/card), omit screenshot
         has_sensitive_element = any(
-            e.input_type in SENSITIVE_INPUT_TYPES or any(tok in (e.name or "").lower() for tok in SENSITIVE_NAME_TOKENS)
+            e.input_type in SENSITIVE_INPUT_TYPES or _is_sensitive_name(e.name)
             for e in obs.interactive
         )
         safe_screenshot = None
