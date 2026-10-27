@@ -582,6 +582,10 @@ btnStartMission?.addEventListener("click", async () => {
         if (t.screenshot) {
           updateVisualFrame(t.screenshot, t.message || "", t.taskState);
         }
+        if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+          renderCompletion(t.taskState, t.message || "");
+          loadChatList();
+        }
       }
     }
   } catch (err) {

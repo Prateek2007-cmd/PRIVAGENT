@@ -408,8 +408,14 @@ async def _run_loop(
                 err_msg = (result.get("error") or {}).get("message", "failed")
                 evidence = err_msg
         raw_screenshot = raw_obs.get("screenshot") if isinstance(raw_obs, dict) else getattr(raw_obs, "screenshot", None)
+        fresh_shot = (
+            getattr(cached_obs, "screenshot", None)
+            if cached_obs
+            else (result.get("observation") or {}).get("screenshot")
+        )
+        step_screenshot = fresh_shot or raw_screenshot
         safe_evidence: Any = redact_text_urls(evidence) if isinstance(evidence, str) else evidence
-        progress(f"Step {steps_done}: {action.get('type')} -> {safe_evidence}", screenshot=raw_screenshot)
+        progress(f"Step {steps_done}: {action.get('type')} -> {safe_evidence}", screenshot=step_screenshot)
 
         entry = {"action": action, "result_ok": result.get("ok"), "evidence": safe_evidence}
         if not result.get("ok"):
