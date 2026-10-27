@@ -169,10 +169,15 @@ def _clean_history_for_prompt(history: list[dict[str, Any]]) -> list[dict[str, A
 def build_prompt(instruction: str, payload: PrivacyFilteredPayload, history: list[dict[str, Any]], working_memory: Optional[dict[str, Any]] = None) -> str:
     mem_blocks = []
     if working_memory and any(working_memory.values()):
+        user_prefs = working_memory.get("user_preferences")
         conv_hist = working_memory.get("conversation_history")
         sess_mem = working_memory.get("session_memory")
-        other_mem = {k: v for k, v in working_memory.items() if k not in ("conversation_history", "session_memory")}
+        other_mem = {k: v for k, v in working_memory.items() if k not in ("conversation_history", "session_memory", "user_preferences")}
 
+        if user_prefs and isinstance(user_prefs, dict) and any(user_prefs.values()):
+            mem_blocks.append(
+                f"<user-preferences (trusted default profile)>\n{json.dumps(user_prefs, indent=2)}\n</user-preferences>\n"
+            )
         if conv_hist:
             mem_blocks.append(
                 f"<conversation-history untrusted=\"true\">\n{json.dumps(conv_hist, indent=2)}\n</conversation-history>\n"

@@ -73,3 +73,29 @@ def test_chat_memory_and_isolation(temp_db):
 
     assert mem2["selected_product"] == "Yellow Dress"
     assert "price" not in mem2
+
+
+def test_user_preferences_vault(temp_db):
+    db.set_user_preference("pincode", "500081", db_path=temp_db)
+    db.set_user_preference("currency", "INR", db_path=temp_db)
+    prefs = db.get_user_preferences(db_path=temp_db)
+    assert prefs["pincode"] == "500081"
+    assert prefs["currency"] == "INR"
+
+    deleted = db.delete_user_preference("currency", db_path=temp_db)
+    assert deleted is True
+    prefs_after = db.get_user_preferences(db_path=temp_db)
+    assert "currency" not in prefs_after
+    assert prefs_after["pincode"] == "500081"
+
+
+def test_extract_mission_facts():
+    from app.agentLoop import extract_mission_facts
+    instruction = "Find Realme 15 Pro on Amazon under 25000 to checkout"
+    summary = "Found Realme 15 Pro at ₹24,999 on https://www.amazon.in/dp/B0XYZ"
+    facts = extract_mission_facts(instruction, summary)
+
+    assert facts["extracted_price"] == "₹24,999"
+    assert facts["canonical_url"] == "https://www.amazon.in/dp/B0XYZ"
+    assert "Realme 15 Pro" in facts["target_item"]
+    assert "under 25000" in facts["core_constraint"]

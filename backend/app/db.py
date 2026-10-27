@@ -74,6 +74,12 @@ def init_db(db_path: Optional[str] = None) -> None:
                 FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
             CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);
             """
@@ -210,3 +216,29 @@ def delete_chat_memory(chat_id: str, key: str, db_path: Optional[str] = None) ->
             "DELETE FROM chat_memory WHERE chat_id = ? AND key = ?",
             (chat_id, key),
         )
+
+
+def get_user_preferences(db_path: Optional[str] = None) -> dict[str, str]:
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT key, value FROM user_preferences ORDER BY key ASC;").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+
+def set_user_preference(key: str, value: str, db_path: Optional[str] = None) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_preferences (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (key.strip().lower(), str(value).strip()),
+        )
+        conn.commit()
+
+
+def delete_user_preference(key: str, db_path: Optional[str] = None) -> bool:
+    with get_connection(db_path) as conn:
+        cur = conn.execute("DELETE FROM user_preferences WHERE key = ?;", (key.strip().lower(),))
+        conn.commit()
+        return cur.rowcount > 0

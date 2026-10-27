@@ -132,6 +132,25 @@ async def delete_chat_session(chat_id: str) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/api/preferences")
+async def get_preferences() -> dict[str, str]:
+    return db.get_user_preferences()
+
+
+@app.post("/api/preferences")
+async def set_preferences(body: dict[str, Any]) -> dict[str, str]:
+    for k, v in body.items():
+        if k and v is not None:
+            db.set_user_preference(str(k), str(v))
+    return db.get_user_preferences()
+
+
+@app.delete("/api/preferences/{key}")
+async def delete_preference(key: str) -> dict[str, bool]:
+    ok = db.delete_user_preference(key)
+    return {"ok": ok}
+
+
 @app.post("/api/task", response_model=TaskCreated)
 async def create_task(body: TaskInput) -> TaskCreated:
     chat_id = body.chat_id

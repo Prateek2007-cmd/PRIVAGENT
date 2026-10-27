@@ -653,16 +653,68 @@ def _to_obs(raw: dict[str, Any]):
     return BrowserObservation.model_validate(raw)
 
 
+def extract_mission_facts(instruction: str, summary: str, history: Optional[list[dict[str, Any]]] = None) -> dict[str, str]:
+    """Extract structured key-value entities from mission execution for persistent chat_memory."""
+    facts: dict[str, str] = {}
+    full_text = f"{instruction} | {summary}"
+
+    # 1. Price extraction
+    price_match = re.search(r"(?:₹|Rs\.?|INR|\$)\s?[\d,]+(?:\.\d+)?", full_text, re.IGNORECASE)
+    if price_match:
+        facts["extracted_price"] = price_match.group(0).strip()
+
+    # 2. Canonical URL extraction from summary or history evidence
+    url_match = re.search(r"https?://[^\s\"'<>)]+", summary)
+    if not url_match and history:
+        for h in reversed(history):
+            ev = str(h.get("evidence") or "")
+            u_match = re.search(r"https?://[^\s\"'<>)]+", ev)
+            if u_match:
+                url_match = u_match
+                break
+    if url_match:
+        facts["canonical_url"] = url_match.group(0).strip()
+
+    # 3. Product / Subject Target
+    cleaned_target = re.sub(
+        r"(?i)\b(find|search|buy|check|compare|look for|me|the|a|an|on amazon|on flipkart|on google|specs|price|and|for)\b",
+        " ",
+        instruction,
+    )
+    cleaned_target = re.sub(r"\s+", " ", cleaned_target).strip()
+    if cleaned_target and len(cleaned_target) > 2:
+        facts["target_item"] = cleaned_target[:60]
+
+    # 4. Core constraints
+    constraint_match = re.search(r"(?i)\b(under\s+[\d,]+|below\s+[\d,]+|budget\s+[\d,]+|size\s+[a-z0-9]+|to checkout)\b", instruction)
+    if constraint_match:
+        facts["core_constraint"] = constraint_match.group(0).strip()
+
+    # 5. Last result summary snippet
+    if summary:
+        facts["last_result"] = summary[:240].strip()
+
+    return facts
+
+
 async def run_task(task_id: str) -> None:
     """Production entrypoint — wires real hub, real planner, live observation."""
     record: TaskRecord = real_hub.tasks[task_id]
     chat_id = record.chat_id
 
     initial_memory: dict[str, Any] = {}
+    try:
+        from . import db
+        db.init_db()
+        user_prefs = db.get_user_preferences()
+        if user_prefs:
+            initial_memory["user_preferences"] = user_prefs
+    except Exception:
+        pass
+
     if chat_id:
         try:
             from . import db
-            db.init_db()
             raw_msgs = db.get_messages(chat_id, limit=6)
             if raw_msgs:
                 initial_memory["conversation_history"] = [
@@ -733,7 +785,9 @@ async def run_task(task_id: str) -> None:
                 evidence_info = f"{final_state} ({state.get('steps', record.steps_done)} steps)"
                 db.add_message(chat_id, "agent", summary, evidence=evidence_info)
                 if final_state == "completed":
-                    db.set_chat_memory(chat_id, "last_result", summary[:240])
+                    facts = extract_mission_facts(record.instruction, summary, state.get("history") or [])
+                    for k, v in facts.items():
+                        db.set_chat_memory(chat_id, k, v)
                 db.touch_chat(chat_id)
             except Exception:
                 pass
