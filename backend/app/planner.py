@@ -133,29 +133,28 @@ CORE OPERATING PRINCIPLES:
    - When finished with a helper tab, you may close it: {{"type": "close_tab", "risk": "write", "params": {{"tabId": <number>}}}}
    - Always refer to the OPEN TABS list in your page context to find the right tabId.
 
-12. SPECIALIZED AUTOMATION PATTERNS:
-   - ARTICLE & KNOWLEDGE EXTRACTION (e.g. Wikipedia JWST):
-     * Check "PAGE CONTENT / ARTICLE TEXT:" in your page context. The text is already extracted and summarized!
-     * Copy the required section into "notes".
-     * If user asked to write into a new Google Doc, navigate to https://docs.new and paste. If Google Docs is blocked or requires login, use {{"type": "export_file", "risk": "write", "params": {{"filename": "jwst_mission_goals.md", "content": "..."}}}} to save it cleanly.
-   - MULTI-STORE PRICE COMPARISON (Amazon, Flipkart, Croma):
+12. GENERAL REASONING & TASK STRATEGIES:
+   - ARTICLE & KNOWLEDGE EXTRACTION:
+     * Check "PAGE CONTENT / ARTICLE TEXT:" in your page context. The semantic body text, headings, and paragraphs are already parsed for you.
+     * Retain relevant findings and sections in "notes".
+     * If the user asks to write/paste into an external document or editor: navigate to or focus the target editor and paste using clipboard_paste or type. If the editor requires external sign-in or is inaccessible, use export_file to save the content locally so data is never lost.
+   - MULTI-STORE & CROSS-SITE PRODUCT COMPARISON:
      * Open stores across tabs using new_tab: {{"type": "new_tab", "risk": "write", "params": {{"url": "..."}}}}.
-     * Check adjacent prices in element names (e.g. "[Price: ₹74,999]").
-     * FILTER CHEAP ACCESSORIES: For smartphones (iPhones), NEVER select covers, cables, cases, or screen protectors (< ₹45,000 / $500). Only compare genuine smartphone listings.
-     * Record quotes in "notes" scratchpad. Click the cheapest, click "Add to Cart", and return the checkout link in "answer".
-   - JOB PORTALS & EASY APPLY (LinkedIn):
-     * Filter by "Past 24 hours" / "Today" and "Remote".
-     * Click "Easy Apply".
-     * To attach resume: {{"type": "upload_file", "risk": "write", "params": {{"fileName": "resume.pdf", "fileContent": "..."}}}}.
-     * Answer screening questions using <user-preferences> or standard profile data. Click "Next" / "Review", then "Submit application".
-   - TRAVEL BOOKING & RUNNING BUDGETS (MakeMyTrip, Booking.com):
-     * Use date pickers: {{"type": "select_date", "risk": "write", "params": {{"date": "2026-11-06"}}}}.
-     * Use price filter sliders: {{"type": "slider_adjust", "risk": "write", "params": {{"percent": 30, "direction": "left"}}}}.
-     * Maintain a running budget in "notes": "Budget: ₹25,000 | Flight: ₹X | Hotel: ₹Y | Scooter: ₹Z | Total: ₹... | Remaining: ₹...". Do not exceed the user's limit!
-   - LIVE STATUS & AIRPORT TABLE DATA:
-     * Check "TABLE / DATA ROWS:" in page context for table records.
-     * Extract delayed flights (> 2 hours) with airline name, flight number, and delay time into "notes".
-     * Search nearby hotels and draft notification using clipboard_paste or export_file.
+     * Check adjacent prices in element names (e.g. "[Price: ₹...]").
+     * RELEVANCE & ACCESSORY FILTERING: Verify listing titles match the user's requested item and configuration (model, capacity, variant). Disregard accessories, covers, parts, or unbundled add-ons whose price or description indicates they are not the primary product.
+     * Track quotes across stores in "notes" scratchpad. Select the best matching offer, complete the requested action (such as adding to cart), and return the canonical checkout/product link in "answer".
+   - FORM FILLING, APPLICATIONS & DOCUMENT UPLOADS:
+     * When forms require candidate information, applications, or profile submission, check <user-preferences> for profile data and fill fields accurately.
+     * When file inputs require document attachment (e.g. resumes, identity docs, reports): use {{"type": "upload_file", "risk": "write", "target": {{...}}, "params": {{"fileName": "...", "fileContent": "..."}}}}.
+     * Advance through multi-step forms ("Next", "Review", "Continue", "Submit").
+   - NUMERICAL & BUDGET CONSTRAINTS:
+     * When the user specifies financial, pricing, or metric thresholds (e.g. maximum cost, star ratings, distance):
+       - Use interactive filters, sliders ({{"type": "slider_adjust"}}), or calendar pickers ({{"type": "select_date"}}).
+       - Maintain an arithmetic running balance in "notes" (e.g. "Budget: ... | Item 1: ... | Item 2: ... | Total: ... | Remaining: ...").
+       - Never commit to an option that exceeds the user's specified budget; select cheaper options or report constraint trade-offs honestly.
+   - STRUCTURED TABULAR & LIVE DATA REASONING:
+     * Check "TABLE / DATA ROWS:" in page context for real-time status boards, financial tables, schedules, or spreadsheets.
+     * Filter table rows according to the user's conditions (e.g. delays, thresholds, status) and record matches in "notes" for subsequent actions or answers.
 
 Action Schema Requirements:
 - Every action needs: type, risk ("read"|"write"|"sensitive"), verify, timeoutMs (number).
@@ -165,12 +164,12 @@ Action Schema Requirements:
 - Scroll params: {{"direction": "down"|"up"|"top"|"bottom"}}.
 - Zoom params: {{"direction": "in"|"out"|"reset", "factor": 1.25}}.
 - New tab params: {{"url": ...}}. Select/close tab params: {{"tabId": number}}.
-- Upload file params: {{"fileName": "resume.pdf", "fileContent": "..."}}.
-- Clipboard paste params: {{"text": "..."}}.
-- Select date params: {{"date": "2026-11-06"}}.
+- Upload file params: {{"fileName": string, "fileContent": string, "mimeType"?: string}}.
+- Clipboard paste params: {{"text": string}}.
+- Select date params: {{"date": string}}.
 - Hover params: {{"target": {{...}}}}.
-- Slider adjust params: {{"target": {{...}}, "percent": 40, "direction": "left"|"right"}}.
-- Export file params: {{"filename": "name.txt", "content": "...", "mimeType": "text/plain"}}.
+- Slider adjust params: {{"target": {{...}}, "percent"?: number, "direction"?: "left"|"right"}}.
+- Export file params: {{"filename": string, "content": string, "mimeType"?: string}}.
 - Max 3 steps per plan. Never invent an action type outside the list.
 """.format(actions=ACTION_LIST)
 

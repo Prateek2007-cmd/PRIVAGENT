@@ -341,14 +341,14 @@ function rowFor(el: HTMLElement): HTMLElement | null {
 
 function extractArticleContent(): string {
   try {
-    const mainEl = document.querySelector("#mw-content-text, article, main, [role='main'], .article-body, #content");
+    const mainEl = document.querySelector("article, main, [role='main'], section.content, .content, .article, .post, .article-body, #content");
     const container = (mainEl as HTMLElement) || document.body;
     if (!container) return "";
 
     const blocks: string[] = [];
     const elements = Array.from(container.querySelectorAll("h1, h2, h3, h4, p, li"));
     for (const el of elements) {
-      if (el.closest("nav, footer, header, .nav, .menu, #toc, .toc, .vector-toc, .mw-editsection")) continue;
+      if (el.closest("nav, footer, header, aside, [role='navigation'], [role='banner'], [role='contentinfo'], .nav, .menu, .toc, .table-of-contents, .sidebar")) continue;
       const tag = el.tagName.toLowerCase();
       const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
       if (!txt || txt.length < 15) continue;
@@ -700,9 +700,22 @@ window.__navigatorAgent = {
     if (!fileInput) return { ok: false, error: "file input not found" };
 
     try {
-      const fName = fileName || "resume.pdf";
-      const mime = mimeType || (fName.endsWith(".pdf") ? "application/pdf" : "text/plain");
-      const blob = new Blob([fileContent || "Sample Document"], { type: mime });
+      const accept = fileInput.getAttribute("accept") || "";
+      let defaultExt = ".pdf";
+      let defaultMime = "application/pdf";
+      if (accept.includes("image")) {
+        defaultExt = ".png";
+        defaultMime = "image/png";
+      } else if (accept.includes("csv")) {
+        defaultExt = ".csv";
+        defaultMime = "text/csv";
+      } else if (accept.includes("text") || accept.includes("txt")) {
+        defaultExt = ".txt";
+        defaultMime = "text/plain";
+      }
+      const fName = fileName || `document${defaultExt}`;
+      const mime = mimeType || (fName.endsWith(".pdf") ? "application/pdf" : defaultMime);
+      const blob = new Blob([fileContent || "Document content"], { type: mime });
       const file = new File([blob], fName, { type: mime });
       const dataTransfer = new DataTransfer();
       dataTransfer.items.add(file);
