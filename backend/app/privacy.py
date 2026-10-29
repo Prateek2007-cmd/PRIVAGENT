@@ -203,6 +203,8 @@ class PrivacyFilteredPayload:
     elements_sent: int
     screenshot: Optional[str] = None
     tabs: list[dict[str, Any]] = field(default_factory=list)
+    article_content: Optional[str] = None
+    table_rows: list[str] = field(default_factory=list)
 
     def to_context_block(self) -> str:
         """Render as an UNTRUSTED-DATA block for the planner prompt."""
@@ -215,6 +217,16 @@ class PrivacyFilteredPayload:
                 ttitle = t.get("title") or ""
                 is_act = " (active)" if tid == self.tab_id or t.get("active") else ""
                 lines.append(f"  - [Tab {tid}]{is_act} {turl} — {ttitle}")
+
+        if self.article_content:
+            lines.append("\nPAGE CONTENT / ARTICLE TEXT:")
+            lines.append(self.article_content[:3500])
+
+        if self.table_rows:
+            lines.append("\nTABLE / DATA ROWS:")
+            for r in self.table_rows[:25]:
+                lines.append(f"  {r}")
+
         def _pri(e: InteractiveElement) -> int:
             nm = (e.name or "").lower()
             if any(k in nm for k in ("search", "type a message", "send", "skip", "close", "submit", "groups", "group", "cancel search")):
@@ -230,6 +242,7 @@ class PrivacyFilteredPayload:
             return 4
 
         sorted_els = sorted(self.interactive, key=_pri)
+        lines.append("\nINTERACTIVE CONTROLS:")
         for el in sorted_els[:65]:
             bits = [f"id={el.target_id}", el.role, f'name="{el.name}"', "disabled" if not el.enabled else ""]
             if el.bounds:
@@ -268,6 +281,12 @@ def classify_and_redact(
                 "title": _redact_text(t.get("title") or "", MAX_TITLE_LEN),
                 "active": bool(t.get("active")),
             })
+        raw_article = getattr(obs, "article_content", None)
+        safe_article = redact_text_urls(raw_article) if isinstance(raw_article, str) else None
+
+        raw_tables = getattr(obs, "table_rows", None) or []
+        safe_tables = [redact_text_urls(t) for t in raw_tables if isinstance(t, str)]
+
         payload = PrivacyFilteredPayload(
             tab_id=obs.tab_id,
             url=redact_url(obs.url),
@@ -279,6 +298,8 @@ def classify_and_redact(
             elements_sent=len(redacted),
             screenshot=safe_screenshot,
             tabs=scrubbed_tabs,
+            article_content=safe_article,
+            table_rows=safe_tables,
         )
         decision = PrivacyDecision(send=True, reason="redaction succeeded", violations=[])
         return payload, decision

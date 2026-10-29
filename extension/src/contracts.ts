@@ -15,6 +15,12 @@ export const ACTION_TYPES = [
   "select_tab",
   "new_tab",
   "close_tab",
+  "upload_file",
+  "clipboard_paste",
+  "select_date",
+  "hover",
+  "slider_adjust",
+  "export_file",
 ] as const;
 
 export type ActionType = (typeof ACTION_TYPES)[number];
@@ -37,6 +43,12 @@ export const TYPE_ACTION_RISK_FLOOR: Record<ActionType, RiskClass> = {
   select_tab: "read",
   new_tab: "write",
   close_tab: "write",
+  upload_file: "write",
+  clipboard_paste: "write",
+  select_date: "write",
+  hover: "read",
+  slider_adjust: "write",
+  export_file: "write",
 };
 
 export interface ElementTarget {
@@ -111,6 +123,40 @@ export interface CloseTabAction extends ActionBase {
   params: { tabId: number };
 }
 
+export interface UploadFileAction extends ActionBase {
+  type: "upload_file";
+  target?: ElementTarget;
+  params?: { files?: string[]; fileName?: string; fileContent?: string; mimeType?: string };
+}
+
+export interface ClipboardPasteAction extends ActionBase {
+  type: "clipboard_paste";
+  target?: ElementTarget;
+  params: { text: string };
+}
+
+export interface SelectDateAction extends ActionBase {
+  type: "select_date";
+  target?: ElementTarget;
+  params: { date: string };
+}
+
+export interface HoverAction extends ActionBase {
+  type: "hover";
+  target: ElementTarget;
+}
+
+export interface SliderAdjustAction extends ActionBase {
+  type: "slider_adjust";
+  target: ElementTarget;
+  params?: { value?: number; percent?: number; direction?: "left" | "right" };
+}
+
+export interface ExportFileAction extends ActionBase {
+  type: "export_file";
+  params: { filename: string; content: string; mimeType?: string };
+}
+
 export type BrowserAction =
   | NavigateAction
   | ClickAction
@@ -122,7 +168,13 @@ export type BrowserAction =
   | ObserveAction
   | SelectTabAction
   | NewTabAction
-  | CloseTabAction;
+  | CloseTabAction
+  | UploadFileAction
+  | ClipboardPasteAction
+  | SelectDateAction
+  | HoverAction
+  | SliderAdjustAction
+  | ExportFileAction;
 
 export interface InteractiveElement {
   targetId: string;
@@ -153,6 +205,8 @@ export interface BrowserObservation {
   dpr: number;
   screenshot?: string;
   tabs?: TabInfo[];
+  articleContent?: string;
+  tableRows?: string[];
 }
 
 export interface ActionResult {
@@ -345,6 +399,29 @@ export function validateAction(
     case "new_tab":
       if (!params || !isSafeHttpUrl(String(params.url ?? ""))) {
         return { ok: false, error: "new_tab requires a safe http(s) url" };
+      }
+      break;
+    case "upload_file":
+      break;
+    case "clipboard_paste":
+      if (!params || typeof params.text !== "string") {
+        return { ok: false, error: "clipboard_paste requires params.text" };
+      }
+      break;
+    case "select_date":
+      if (!params || typeof params.date !== "string") {
+        return { ok: false, error: "select_date requires params.date" };
+      }
+      break;
+    case "hover":
+      if (!hasTarget) return { ok: false, error: "hover requires a target" };
+      break;
+    case "slider_adjust":
+      if (!hasTarget) return { ok: false, error: "slider_adjust requires a target" };
+      break;
+    case "export_file":
+      if (!params || typeof params.filename !== "string" || typeof params.content !== "string") {
+        return { ok: false, error: "export_file requires params.filename and params.content" };
       }
       break;
     case "wait":

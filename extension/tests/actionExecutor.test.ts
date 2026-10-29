@@ -243,4 +243,29 @@ describe("observation on unscriptable tabs", () => {
     expect(result.observation?.url).toBe("about:blank");
     expect(result.observation?.interactive).toEqual([]);
   });
+
+  it("executes export_file and returns evidence", async () => {
+    vi.stubGlobal("chrome", {
+      tabs: {
+        query: vi.fn(async () => [{ id: 12, active: true, url: "about:blank" }]),
+        get: vi.fn(async (id: number) => ({ id, url: "about:blank", title: "", windowId: 1 })),
+        update: vi.fn(async () => ({})),
+      },
+      scripting: {
+        executeScript: vi.fn(async () => [{ result: { ok: true } }]),
+      },
+    });
+
+    const action = {
+      type: "export_file",
+      risk: "write",
+      verify: "file saved",
+      timeoutMs: 5000,
+      params: { filename: "report.txt", content: "Flight AI101 Delayed 2h" },
+    } as BrowserAction;
+
+    const result = await executeAction(action, "task-export");
+    expect(result.ok).toBe(true);
+    expect(result.evidence).toContain("exported file report.txt");
+  });
 });

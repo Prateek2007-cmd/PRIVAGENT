@@ -239,3 +239,81 @@ def test_role_only_target_resolves_when_the_page_has_one_match():
     plan = _validate_plan(raw, payload=payload)
     assert plan.steps[0].action.target["name"] == "Search"
 
+
+def test_valid_new_actions_pass_plan_validation():
+    raw = {
+        "goal": "multi-modal execution",
+        "steps": [
+            {
+                "why": "upload resume",
+                "action": {
+                    "type": "upload_file",
+                    "risk": "write",
+                    "verify": "resume attached",
+                    "timeoutMs": 5000,
+                    "target": {"name": "Upload Resume"},
+                    "params": {"fileName": "resume.pdf", "fileContent": "sample"},
+                },
+            },
+            {
+                "why": "paste content",
+                "action": {
+                    "type": "clipboard_paste",
+                    "risk": "write",
+                    "verify": "pasted text",
+                    "timeoutMs": 5000,
+                    "params": {"text": "Mission goals of JWST"},
+                },
+            },
+            {
+                "why": "select calendar date",
+                "action": {
+                    "type": "select_date",
+                    "risk": "write",
+                    "verify": "date picked",
+                    "timeoutMs": 5000,
+                    "params": {"date": "2026-11-06"},
+                },
+            },
+        ],
+    }
+    plan = _validate_plan(raw)
+    assert len(plan.steps) == 3
+    assert plan.steps[0].action.type == "upload_file"
+    assert plan.steps[1].action.type == "clipboard_paste"
+    assert plan.steps[2].action.type == "select_date"
+
+
+def test_export_file_and_slider_actions():
+    raw = {
+        "goal": "save data and adjust filters",
+        "steps": [
+            {
+                "why": "export extracted flights",
+                "action": {
+                    "type": "export_file",
+                    "risk": "write",
+                    "verify": "file saved",
+                    "timeoutMs": 5000,
+                    "params": {"filename": "delhi_flights.txt", "content": "| AI101 | Delayed 2h |"},
+                },
+            },
+            {
+                "why": "adjust price filter slider",
+                "action": {
+                    "type": "slider_adjust",
+                    "risk": "write",
+                    "verify": "slider changed",
+                    "timeoutMs": 5000,
+                    "target": {"name": "Price Slider"},
+                    "params": {"percent": 30, "direction": "left"},
+                },
+            },
+        ],
+    }
+    plan = _validate_plan(raw)
+    assert len(plan.steps) == 2
+    assert plan.steps[0].action.type == "export_file"
+    assert plan.steps[1].action.type == "slider_adjust"
+
+

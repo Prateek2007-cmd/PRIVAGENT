@@ -133,14 +133,44 @@ CORE OPERATING PRINCIPLES:
    - When finished with a helper tab, you may close it: {{"type": "close_tab", "risk": "write", "params": {{"tabId": <number>}}}}
    - Always refer to the OPEN TABS list in your page context to find the right tabId.
 
+12. SPECIALIZED AUTOMATION PATTERNS:
+   - ARTICLE & KNOWLEDGE EXTRACTION (e.g. Wikipedia JWST):
+     * Check "PAGE CONTENT / ARTICLE TEXT:" in your page context. The text is already extracted and summarized!
+     * Copy the required section into "notes".
+     * If user asked to write into a new Google Doc, navigate to https://docs.new and paste. If Google Docs is blocked or requires login, use {{"type": "export_file", "risk": "write", "params": {{"filename": "jwst_mission_goals.md", "content": "..."}}}} to save it cleanly.
+   - MULTI-STORE PRICE COMPARISON (Amazon, Flipkart, Croma):
+     * Open stores across tabs using new_tab: {{"type": "new_tab", "risk": "write", "params": {{"url": "..."}}}}.
+     * Check adjacent prices in element names (e.g. "[Price: ₹74,999]").
+     * FILTER CHEAP ACCESSORIES: For smartphones (iPhones), NEVER select covers, cables, cases, or screen protectors (< ₹45,000 / $500). Only compare genuine smartphone listings.
+     * Record quotes in "notes" scratchpad. Click the cheapest, click "Add to Cart", and return the checkout link in "answer".
+   - JOB PORTALS & EASY APPLY (LinkedIn):
+     * Filter by "Past 24 hours" / "Today" and "Remote".
+     * Click "Easy Apply".
+     * To attach resume: {{"type": "upload_file", "risk": "write", "params": {{"fileName": "resume.pdf", "fileContent": "..."}}}}.
+     * Answer screening questions using <user-preferences> or standard profile data. Click "Next" / "Review", then "Submit application".
+   - TRAVEL BOOKING & RUNNING BUDGETS (MakeMyTrip, Booking.com):
+     * Use date pickers: {{"type": "select_date", "risk": "write", "params": {{"date": "2026-11-06"}}}}.
+     * Use price filter sliders: {{"type": "slider_adjust", "risk": "write", "params": {{"percent": 30, "direction": "left"}}}}.
+     * Maintain a running budget in "notes": "Budget: ₹25,000 | Flight: ₹X | Hotel: ₹Y | Scooter: ₹Z | Total: ₹... | Remaining: ₹...". Do not exceed the user's limit!
+   - LIVE STATUS & AIRPORT TABLE DATA:
+     * Check "TABLE / DATA ROWS:" in page context for table records.
+     * Extract delayed flights (> 2 hours) with airline name, flight number, and delay time into "notes".
+     * Search nearby hotels and draft notification using clipboard_paste or export_file.
+
 Action Schema Requirements:
 - Every action needs: type, risk ("read"|"write"|"sensitive"), verify, timeoutMs (number).
-- Click/type MUST carry a target: {{"target": {{"targetId": "<targetId from page-context>"}}}} or {{"target": {{"name": "<visible label>"}}}}. A target with only a role (e.g. {{"role": "link"}}) is rejected as underspecified: name the exact element (for a video result, its title).
+- Click/type/hover/slider_adjust MUST carry a target: {{"target": {{"targetId": "<targetId>"}}}} or {{"target": {{"name": "<visible label>"}}}}.
 - Type params: {{"text": ..., "clear": true, "submit": true|false}}.
 - Navigate params: {{"url": ...}}. Press params: {{"key": ...}}.
 - Scroll params: {{"direction": "down"|"up"|"top"|"bottom"}}.
 - Zoom params: {{"direction": "in"|"out"|"reset", "factor": 1.25}}.
 - New tab params: {{"url": ...}}. Select/close tab params: {{"tabId": number}}.
+- Upload file params: {{"fileName": "resume.pdf", "fileContent": "..."}}.
+- Clipboard paste params: {{"text": "..."}}.
+- Select date params: {{"date": "2026-11-06"}}.
+- Hover params: {{"target": {{...}}}}.
+- Slider adjust params: {{"target": {{...}}, "percent": 40, "direction": "left"|"right"}}.
+- Export file params: {{"filename": "name.txt", "content": "...", "mimeType": "text/plain"}}.
 - Max 3 steps per plan. Never invent an action type outside the list.
 """.format(actions=ACTION_LIST)
 
@@ -247,12 +277,16 @@ def _normalize_raw_plan(raw: dict[str, Any]) -> dict[str, Any]:
             act = dict(action)
             atype = act.get("type")
             risk = act.get("risk", "read")
-            if atype in {"type", "click", "navigate", "press", "new_tab", "close_tab"} and risk == "read":
+            if atype in {"type", "click", "navigate", "press", "new_tab", "close_tab", "upload_file", "clipboard_paste", "select_date", "slider_adjust", "export_file"} and risk == "read":
                 act["risk"] = "write"
 
             # 1. Extract params
             params = dict(act.get("params", {})) if isinstance(act.get("params"), dict) else {}
-            for field in ("url", "direction", "text", "clear", "submit", "key", "containerId", "tabId", "factor"):
+            for field in (
+                "url", "direction", "text", "clear", "submit", "key", "containerId",
+                "tabId", "factor", "files", "fileName", "fileContent", "mimeType",
+                "date", "percent", "filename", "content",
+            ):
                 if field in act and field not in params:
                     params[field] = act.pop(field)
 
@@ -768,7 +802,10 @@ def _validate_step(step: PlannedStep) -> None:
     a = step.action
     if a.type not in ACTION_TYPES:
         raise ValueError(f"PLAN_INVALID: action type {a.type!r} outside whitelist")
-    if a.risk == "read" and a.type in {"type", "click", "navigate", "press", "new_tab", "close_tab"}:
+    if a.risk == "read" and a.type in {
+        "type", "click", "navigate", "press", "new_tab", "close_tab",
+        "upload_file", "clipboard_paste", "select_date", "slider_adjust", "export_file",
+    }:
         # floor breach: these change page/task state at minimum
         raise ValueError(f"PLAN_INVALID: action {a.type} cannot be risk=read")
     if not (MIN_TIMEOUT_MS <= a.timeout_ms <= MAX_TIMEOUT_MS):
@@ -809,6 +846,17 @@ def _validate_step(step: PlannedStep) -> None:
     elif a.type == "new_tab":
         if p is None or not _safe_nav_url(p.url):
             raise ValueError(f"PLAN_INVALID: unsafe new_tab url {getattr(p, 'url', None)!r}")
+    elif a.type == "clipboard_paste":
+        if p is None or p.text is None:
+            raise ValueError("PLAN_INVALID: clipboard_paste requires params.text")
+    elif a.type == "select_date":
+        if p is None or not (p.date or "").strip():
+            raise ValueError("PLAN_INVALID: select_date requires params.date")
+    elif a.type in {"hover", "slider_adjust"}:
+        _require_target(a)
+    elif a.type == "export_file":
+        if p is None or not (p.filename or "").strip() or p.content is None:
+            raise ValueError("PLAN_INVALID: export_file requires params.filename and params.content")
 
 
 def _validate_plan(

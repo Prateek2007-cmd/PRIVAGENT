@@ -24,6 +24,8 @@ interface AgentElement {
 
 interface AgentApi {
   list: () => Promise<AgentElement[]>;
+  getArticleContent: () => Promise<string>;
+  getTableRows: () => Promise<string[]>;
   click: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   clickCoords: (x: number, y: number) => Promise<{ ok: boolean; targetId?: string; error?: string }>;
   getCoords: (targetId: string, name?: string) => Promise<{ x: number; y: number; width: number; height: number } | null>;
@@ -31,6 +33,10 @@ interface AgentApi {
   type: (targetId: string, text: string, clear: boolean, name?: string) => Promise<{ ok: boolean; error?: string }>;
   submit: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
   scroll: (d: "up" | "down" | "top" | "bottom", containerId?: string) => Promise<{ ok: boolean; scrollY: number }>;
+  uploadFile: (targetId: string, name?: string, fileName?: string, fileContent?: string, mimeType?: string) => Promise<{ ok: boolean; error?: string }>;
+  selectDate: (dateStr: string, targetId?: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  hover: (targetId: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  sliderAdjust: (targetId: string, name?: string, percent?: number, direction?: "left" | "right") => Promise<{ ok: boolean; error?: string }>;
 }
 
 async function withAgent(tabId: number): Promise<AgentApi> {
@@ -61,6 +67,28 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         func: () => (window as unknown as { __navigatorAgent?: { list: () => AgentElement[] } }).__navigatorAgent?.list() ?? [],
       });
       return (r?.result as AgentElement[]) ?? [];
+    },
+    getArticleContent: async () => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => (window as unknown as { __navigatorAgent?: { getArticleContent?: () => string } }).__navigatorAgent?.getArticleContent?.() ?? "",
+        });
+        return (r?.result as string) ?? "";
+      } catch {
+        return "";
+      }
+    },
+    getTableRows: async () => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => (window as unknown as { __navigatorAgent?: { getTableRows?: () => string[] } }).__navigatorAgent?.getTableRows?.() ?? [],
+        });
+        return (r?.result as string[]) ?? [];
+      } catch {
+        return [];
+      }
     },
     getCoords: async (targetId: string, name?: string) => {
       const [r] = await chrome.scripting.executeScript({
@@ -121,6 +149,58 @@ async function withAgent(tabId: number): Promise<AgentApi> {
         args: [direction, containerId ?? ""],
       });
       return (r?.result as { ok: boolean; scrollY: number }) ?? { ok: false, scrollY: 0 };
+    },
+    uploadFile: async (targetId: string, name?: string, fileName?: string, fileContent?: string, mimeType?: string) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (id: string, nm?: string, fn?: string, fc?: string, mt?: string) =>
+            (window as unknown as { __navigatorAgent?: { uploadFile?: (i: string, n?: string, fn?: string, fc?: string, mt?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.uploadFile?.(id, nm, fn, fc, mt) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? "", fileName ?? "", fileContent ?? "", mimeType ?? ""],
+        });
+        return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
+    selectDate: async (dateStr: string, targetId?: string, name?: string) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (ds: string, id?: string, nm?: string) =>
+            (window as unknown as { __navigatorAgent?: { selectDate?: (d: string, i?: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.selectDate?.(ds, id, nm) ?? { ok: false, error: "no agent" },
+          args: [dateStr, targetId ?? "", name ?? ""],
+        });
+        return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
+    hover: async (targetId: string, name?: string) => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (id: string, nm?: string) =>
+            (window as unknown as { __navigatorAgent?: { hover?: (i: string, n?: string) => { ok: boolean; error?: string } } }).__navigatorAgent?.hover?.(id, nm) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? ""],
+        });
+        return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
+    sliderAdjust: async (targetId: string, name?: string, percent?: number, direction?: "left" | "right") => {
+      try {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (id: string, nm?: string, pct?: number, dir?: string) =>
+            (window as unknown as { __navigatorAgent?: { sliderAdjust?: (i: string, n?: string, p?: number, d?: any) => { ok: boolean; error?: string } } }).__navigatorAgent?.sliderAdjust?.(id, nm, pct, dir as any) ?? { ok: false, error: "no agent" },
+          args: [targetId, name ?? "", percent ?? 50, direction ?? "right"],
+        });
+        return (r?.result as { ok: boolean; error?: string }) ?? { ok: false, error: "execution failed" };
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) };
+      }
     },
   };
 }
@@ -401,6 +481,12 @@ export async function executeAction(action: BrowserAction, taskId: string): Prom
           evidence: `tab ${action.params.tabId} closed`,
         };
       }
+      case "upload_file": return await doUploadFile(action, taskId);
+      case "clipboard_paste": return await doClipboardPaste(action, taskId);
+      case "select_date": return await doSelectDate(action, taskId);
+      case "hover": return await doHover(action, taskId);
+      case "slider_adjust": return await doSliderAdjust(action, taskId);
+      case "export_file": return await doExportFile(action);
       case "wait": {
         const tabId = await activeTab();
         if (tabId !== null) await ensureTabActive(tabId);
@@ -701,6 +787,48 @@ async function cdpPressKey(tabId: number, key: string): Promise<boolean> {
   }
 }
 
+async function cdpMouseMove(tabId: number, x: number, y: number): Promise<boolean> {
+  if (typeof chrome === "undefined" || !chrome.debugger) return false;
+  await ensureTabActive(tabId);
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+  } catch (e: any) {
+    if (!e?.message?.includes("already attached")) return false;
+  }
+  try {
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: Math.round(x),
+      y: Math.round(y),
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { await chrome.debugger.detach(target); } catch {}
+  }
+}
+
+async function cdpInsertText(tabId: number, text: string): Promise<boolean> {
+  if (typeof chrome === "undefined" || !chrome.debugger) return false;
+  await ensureTabActive(tabId);
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+  } catch (e: any) {
+    if (!e?.message?.includes("already attached")) return false;
+  }
+  try {
+    await chrome.debugger.sendCommand(target, "Input.insertText", { text });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { await chrome.debugger.detach(target); } catch {}
+  }
+}
+
 async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId: string): Promise<ActionResult> {
   const tabId = await getOrCreateActiveTab();
   await ensureTabActive(tabId);
@@ -920,6 +1048,171 @@ async function doNewTab(action: Extract<BrowserAction, { type: "new_tab" }>): Pr
   return { ok: true, observation: await observe(tab.id!), evidence: `opened ${action.params.url}` };
 }
 
+async function doUploadFile(action: Extract<BrowserAction, { type: "upload_file" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const before = await currentUrl(tabId);
+  const agent = await withAgent(tabId);
+  const targetId = action.target?.targetId || "";
+  const targetName = action.target?.name || "";
+  const p = action.params || {};
+
+  const res = await agent.uploadFile(targetId, targetName, p.fileName, p.fileContent, p.mimeType);
+  if (!res.ok) {
+    return err("STALE_TARGET", res.error || "upload_file failed", true);
+  }
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+  void taskId;
+  return {
+    ok: true,
+    targetId: targetId || undefined,
+    observation: await observe(obsTab),
+    evidence: `uploaded file ${p.fileName || "document"}`,
+  };
+}
+
+async function doClipboardPaste(action: Extract<BrowserAction, { type: "clipboard_paste" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const before = await currentUrl(tabId);
+  const agent = await withAgent(tabId);
+
+  if (action.target) {
+    const cands = await agent.list();
+    const target = findTarget(action.target, cands, "type");
+    const targetId = target?.targetId || action.target.targetId || "";
+    const targetName = target?.name || action.target.name || "";
+    const coords = await agent.clickPoint(targetId, targetName);
+    if (coords && coords.x > 0 && coords.y > 0) {
+      await cdpClick(tabId, coords.x, coords.y);
+    } else {
+      await agent.click(targetId, targetName);
+    }
+  }
+
+  const cdpOk = await cdpInsertText(tabId, action.params.text);
+  if (!cdpOk) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (txt: string) => {
+        try {
+          document.execCommand("insertText", false, txt);
+        } catch {}
+      },
+      args: [action.params.text],
+    });
+  }
+
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+  void taskId;
+  return {
+    ok: true,
+    observation: await observe(obsTab),
+    evidence: `pasted text (${action.params.text.slice(0, 30)}...)`,
+  };
+}
+
+async function doSelectDate(action: Extract<BrowserAction, { type: "select_date" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const before = await currentUrl(tabId);
+  const agent = await withAgent(tabId);
+  const targetId = action.target?.targetId;
+  const targetName = action.target?.name;
+
+  const res = await agent.selectDate(action.params.date, targetId, targetName);
+  if (!res.ok) {
+    return err("STALE_TARGET", res.error || `could not select date ${action.params.date}`, true);
+  }
+  const obsTab = await settleAfterAction(tabId, before, action.timeoutMs);
+  void taskId;
+  return {
+    ok: true,
+    observation: await observe(obsTab),
+    evidence: `selected date ${action.params.date}`,
+  };
+}
+
+async function doHover(action: Extract<BrowserAction, { type: "hover" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const agent = await withAgent(tabId);
+  const cands = await agent.list();
+  const target = findTarget(action.target, cands, "click");
+  const targetId = target?.targetId || action.target.targetId || "";
+  const targetName = target?.name || action.target.name || "";
+
+  let cdpSuccess = false;
+  const coords = await agent.clickPoint(targetId, targetName);
+  if (coords && coords.x > 0 && coords.y > 0) {
+    cdpSuccess = await cdpMouseMove(tabId, coords.x, coords.y);
+  }
+  if (!cdpSuccess) {
+    await agent.hover(targetId, targetName);
+  }
+  await settleDom(tabId, 80, 400);
+  void taskId;
+  return {
+    ok: true,
+    observation: await observe(tabId),
+    evidence: `hovered ${targetName || targetId}`,
+  };
+}
+
+async function doSliderAdjust(action: Extract<BrowserAction, { type: "slider_adjust" }>, taskId: string): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+  const agent = await withAgent(tabId);
+  const cands = await agent.list();
+  const target = findTarget(action.target, cands, "click");
+  const targetId = target?.targetId || action.target.targetId || "";
+  const targetName = target?.name || action.target.name || "";
+
+  const res = await agent.sliderAdjust(targetId, targetName, action.params?.percent, action.params?.direction);
+  await settleDom(tabId, 100, 500);
+  void taskId;
+  return {
+    ok: res.ok,
+    observation: await observe(tabId),
+    evidence: res.ok ? `adjusted slider ${targetName || targetId}` : "slider adjustment failed",
+    error: res.ok ? undefined : { code: "STALE_TARGET", message: res.error || "slider failed", recoverable: true },
+  };
+}
+
+async function doExportFile(action: Extract<BrowserAction, { type: "export_file" }>): Promise<ActionResult> {
+  const tabId = await getOrCreateActiveTab();
+  await ensureTabActive(tabId);
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (fn: string, content: string, mime: string) => {
+      try {
+        const blob = new Blob([content], { type: mime || "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fn;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        return { ok: true };
+      } catch (e: any) {
+        return { ok: false, error: String(e) };
+      }
+    },
+    args: [action.params.filename, action.params.content, action.params.mimeType || "text/plain"],
+  });
+
+  const exportRes = res?.result as { ok: boolean; error?: string } | undefined;
+  return {
+    ok: exportRes?.ok ?? true,
+    observation: await observe(tabId),
+    evidence: `exported file ${action.params.filename}`,
+    error: exportRes?.ok === false ? { code: "UNKNOWN", message: exportRes.error || "export failed", recoverable: true } : undefined,
+  };
+}
+
 /** Wait until the navigation completes and the DOM is interactive and quiet. */
 async function waitForStable(tabId: number, timeoutMs: number, expectedUrl?: string): Promise<string> {
   const start = Date.now();
@@ -1016,6 +1309,8 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
   }
 
   let list: AgentElement[] = [];
+  let articleContent = "";
+  let tableRows: string[] = [];
   let meta = { y: 0, w: 0, h: 0, dpr: 1 };
   try {
     const agent = await withAgent(tabId);
@@ -1031,6 +1326,9 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
         if (list.length > 0) break;
       }
     }
+
+    articleContent = await agent.getArticleContent().catch(() => "");
+    tableRows = await agent.getTableRows().catch(() => []);
 
     const [m] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -1076,6 +1374,8 @@ export async function observe(tabId: number): Promise<BrowserObservation> {
       value: undefined,
       bounds: e.bounds,
     })),
+    articleContent: articleContent || undefined,
+    tableRows: tableRows && tableRows.length > 0 ? tableRows : undefined,
     scroll: { y: meta.y, viewport: { w: meta.w, h: meta.h } },
     dpr: meta.dpr,
     screenshot,
