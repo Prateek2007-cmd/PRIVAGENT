@@ -19,8 +19,6 @@ interface AgentElement {
 
 interface NavigatorAgent {
   list: () => AgentElement[];
-  getArticleContent?: () => string;
-  getTableRows?: () => string[];
   click: (targetId: string, name?: string) => { ok: boolean; error?: string };
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
@@ -28,10 +26,6 @@ interface NavigatorAgent {
   type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string };
   submit: (targetId: string, name?: string) => { ok: boolean; error?: string };
   scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
-  uploadFile?: (targetId: string, name?: string, fileName?: string, fileContent?: string, mimeType?: string) => { ok: boolean; error?: string };
-  selectDate?: (dateStr: string, targetId?: string, name?: string) => { ok: boolean; error?: string };
-  hover?: (targetId: string, name?: string) => { ok: boolean; error?: string };
-  sliderAdjust?: (targetId: string, name?: string, percent?: number, direction?: "left" | "right") => { ok: boolean; error?: string };
 }
 
 declare global {
@@ -162,38 +156,6 @@ function candidates(): AgentElement[] {
     if (isWaCancelSearch) name = "Cancel search";
     if (isWaSearch && !name) name = "Search or start new chat";
     if (isWaChatRow && waChatTitle) name = waChatTitle;
-
-    // Adjacent pricing enrichment for product links and cards (Amazon, Flipkart, Croma)
-    if (el.tagName === "A" || el.getAttribute("role") === "link" || el.getAttribute("role") === "button") {
-      try {
-        const card = el.closest('[data-component-type*="product"], [class*="product"], [class*="item"], [class*="card"], li, article') || el.parentElement;
-        if (card) {
-          const cardText = (card as HTMLElement).innerText || card.textContent || "";
-          const priceMatch = cardText.match(/(?:₹|Rs\.?|\$|EUR)\s*[\d,]+(?:\.\d+)?/i);
-          if (priceMatch && !name.includes(priceMatch[0])) {
-            name = `${name} [Price: ${priceMatch[0]}]`.slice(0, 140);
-          }
-        }
-      } catch {}
-    }
-
-    // Form label & placeholder enrichment for inputs, textareas, and selects
-    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {
-      try {
-        let labelText = "";
-        if (el.id) {
-          const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-          if (lbl) labelText = lbl.textContent?.trim() || "";
-        }
-        if (!labelText) {
-          const parentLbl = el.closest("label");
-          if (parentLbl) labelText = parentLbl.textContent?.trim() || "";
-        }
-        if (labelText && !name.includes(labelText)) {
-          name = `${labelText}: ${name}`.slice(0, 140);
-        }
-      } catch {}
-    }
 
     const role = isAdSkip ? "ad-skip" :
                  isOverlayClose ? "close-button" :
@@ -339,57 +301,11 @@ function rowFor(el: HTMLElement): HTMLElement | null {
   return row;
 }
 
-function extractArticleContent(): string {
-  try {
-    const mainEl = document.querySelector("article, main, [role='main'], section.content, .content, .article, .post, .article-body, #content");
-    const container = (mainEl as HTMLElement) || document.body;
-    if (!container) return "";
-
-    const blocks: string[] = [];
-    const elements = Array.from(container.querySelectorAll("h1, h2, h3, h4, p, li"));
-    for (const el of elements) {
-      if (el.closest("nav, footer, header, aside, [role='navigation'], [role='banner'], [role='contentinfo'], .nav, .menu, .toc, .table-of-contents, .sidebar")) continue;
-      const tag = el.tagName.toLowerCase();
-      const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
-      if (!txt || txt.length < 15) continue;
-      if (tag.startsWith("h")) {
-        blocks.push(`\n### ${txt}\n`);
-      } else {
-        blocks.push(txt);
-      }
-      if (blocks.join("\n").length >= 3500) break;
-    }
-    return blocks.join("\n").slice(0, 3500);
-  } catch {
-    return "";
-  }
-}
-
-function extractTableRows(): string[] {
-  try {
-    const rows: string[] = [];
-    const tableRows = Array.from(document.querySelectorAll("table tr, [role='row']"));
-    for (const r of tableRows.slice(0, 25)) {
-      const cells = Array.from(r.querySelectorAll("th, td, [role='cell'], [role='columnheader']"))
-        .map(c => (c.textContent || "").replace(/\s+/g, " ").trim())
-        .filter(Boolean);
-      if (cells.length >= 2) {
-        rows.push(`| ${cells.join(" | ")} |`);
-      }
-    }
-    return rows;
-  } catch {
-    return [];
-  }
-}
-
 window.__navigatorAgent = {
   list: () => {
     registry.clear();
     return candidates();
   },
-  getArticleContent: () => extractArticleContent(),
-  getTableRows: () => extractTableRows(),
   getCoords: (targetId, name) => {
     const el = elementFor(targetId, name);
     if (!el) return null;
@@ -685,126 +601,5 @@ window.__navigatorAgent = {
       ok: true,
       scrollY: Math.round(container ? container.scrollTop : (window.scrollY || document.scrollingElement?.scrollTop || 0)),
     };
-  },
-  uploadFile: (targetId, name, fileName, fileContent, mimeType) => {
-    let el = elementFor(targetId, name);
-    let fileInput: HTMLInputElement | null = null;
-    if (el instanceof HTMLInputElement && el.type === "file") {
-      fileInput = el;
-    } else if (el) {
-      fileInput = el.querySelector('input[type="file"]') || el.closest("form, div, section")?.querySelector('input[type="file"]') || null;
-    }
-    if (!fileInput) {
-      fileInput = document.querySelector('input[type="file"]');
-    }
-    if (!fileInput) return { ok: false, error: "file input not found" };
-
-    try {
-      const accept = fileInput.getAttribute("accept") || "";
-      let defaultExt = ".pdf";
-      let defaultMime = "application/pdf";
-      if (accept.includes("image")) {
-        defaultExt = ".png";
-        defaultMime = "image/png";
-      } else if (accept.includes("csv")) {
-        defaultExt = ".csv";
-        defaultMime = "text/csv";
-      } else if (accept.includes("text") || accept.includes("txt")) {
-        defaultExt = ".txt";
-        defaultMime = "text/plain";
-      }
-      const fName = fileName || `document${defaultExt}`;
-      const mime = mimeType || (fName.endsWith(".pdf") ? "application/pdf" : defaultMime);
-      const blob = new Blob([fileContent || "Document content"], { type: mime });
-      const file = new File([blob], fName, { type: mime });
-      const dataTransfer = new DataTransfer();
-      dataTransfer.items.add(file);
-      fileInput.files = dataTransfer.files;
-      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-      fileInput.dispatchEvent(new Event("input", { bubbles: true }));
-      return { ok: true };
-    } catch (e: any) {
-      return { ok: false, error: `file upload failed: ${e?.message || e}` };
-    }
-  },
-  selectDate: (dateStr, targetId, name) => {
-    if (!dateStr) return { ok: false, error: "missing date parameter" };
-    const clean = dateStr.trim().toLowerCase();
-    const selectors = [
-      `[data-date="${dateStr}"]`,
-      `[data-date*="${dateStr}"]`,
-      `[aria-label*="${dateStr}" i]`,
-      `[data-testid*="date" i][data-testid*="${clean}"]`,
-      `[data-day="${clean}"]`,
-    ];
-    for (const sel of selectors) {
-      try {
-        const el = document.querySelector(sel);
-        if (el instanceof HTMLElement) {
-          el.click();
-          return { ok: true };
-        }
-      } catch {}
-    }
-    const cells = Array.from(document.querySelectorAll('[role="gridcell"], td, button, div.calendar-day, span.day'));
-    for (const cell of cells) {
-      if (cell instanceof HTMLElement) {
-        const text = cell.innerText?.trim().toLowerCase() || "";
-        const aria = cell.getAttribute("aria-label")?.toLowerCase() || "";
-        if (text === clean || aria.includes(clean)) {
-          cell.click();
-          return { ok: true };
-        }
-      }
-    }
-    if (targetId) {
-      const el = elementFor(targetId, name);
-      if (el) {
-        el.click();
-        return { ok: true };
-      }
-    }
-    return { ok: false, error: `could not find date element for "${dateStr}"` };
-  },
-  hover: (targetId, name) => {
-    const el = elementFor(targetId, name);
-    if (!el) return { ok: false, error: "STALE_TARGET" };
-    const rect = el.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window };
-    el.dispatchEvent(new MouseEvent("mouseenter", opts));
-    el.dispatchEvent(new MouseEvent("mouseover", opts));
-    el.dispatchEvent(new MouseEvent("mousemove", opts));
-    return { ok: true };
-  },
-  sliderAdjust: (targetId, name, percent, direction) => {
-    const el = elementFor(targetId, name);
-    if (!el) return { ok: false, error: "STALE_TARGET" };
-    if (el instanceof HTMLInputElement && el.type === "range") {
-      const min = parseFloat(el.min || "0");
-      const max = parseFloat(el.max || "100");
-      const step = parseFloat(el.step || "1");
-      let newVal: number;
-      if (typeof percent === "number") {
-        newVal = min + (max - min) * (percent / 100);
-      } else if (direction === "left") {
-        newVal = parseFloat(el.value) - step * 5;
-      } else {
-        newVal = parseFloat(el.value) + step * 5;
-      }
-      el.value = String(Math.max(min, Math.min(max, newVal)));
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { ok: true };
-    }
-    const rect = el.getBoundingClientRect();
-    const startX = rect.left + rect.width / 2;
-    const startY = rect.top + rect.height / 2;
-    const deltaX = direction === "left" ? -50 : 50;
-    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: startX, clientY: startY }));
-    window.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: startX + deltaX, clientY: startY }));
-    window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: startX + deltaX, clientY: startY }));
-    return { ok: true };
   },
 };

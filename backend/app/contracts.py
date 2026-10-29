@@ -13,8 +13,6 @@ from pydantic import BaseModel, Field
 ACTION_TYPES = [
     "navigate", "click", "type", "press", "scroll", "zoom",
     "wait", "observe", "select_tab", "new_tab", "close_tab",
-    "upload_file", "clipboard_paste", "select_date", "hover",
-    "slider_adjust", "export_file",
 ]
 RISK_CLASSES = ["read", "write", "sensitive"]
 TASK_STATES = [
@@ -44,14 +42,6 @@ class ActionParams(BaseModel):
     container_id: Optional[str] = Field(default=None, alias="containerId")
     tab_id: Optional[int] = Field(default=None, alias="tabId")
     factor: Optional[float] = None
-    files: Optional[list[str]] = None
-    file_name: Optional[str] = Field(default=None, alias="fileName")
-    file_content: Optional[str] = Field(default=None, alias="fileContent")
-    mime_type: Optional[str] = Field(default=None, alias="mimeType")
-    date: Optional[str] = None
-    percent: Optional[float] = None
-    filename: Optional[str] = None
-    content: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -94,8 +84,6 @@ class BrowserObservation(BaseModel):
     dpr: float = 1.0
     screenshot: Optional[str] = None
     tabs: Optional[list[dict[str, Any]]] = None
-    article_content: Optional[str] = Field(default=None, alias="articleContent")
-    table_rows: Optional[list[str]] = Field(default=None, alias="tableRows")
 
     model_config = {"populate_by_name": True}
 

@@ -21,12 +21,6 @@ describe("contracts", () => {
       "select_tab",
       "new_tab",
       "close_tab",
-      "upload_file",
-      "clipboard_paste",
-      "select_date",
-      "hover",
-      "slider_adjust",
-      "export_file",
     ]);
   });
 

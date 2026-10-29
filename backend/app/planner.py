@@ -133,43 +133,14 @@ CORE OPERATING PRINCIPLES:
    - When finished with a helper tab, you may close it: {{"type": "close_tab", "risk": "write", "params": {{"tabId": <number>}}}}
    - Always refer to the OPEN TABS list in your page context to find the right tabId.
 
-12. GENERAL REASONING & TASK STRATEGIES:
-   - ARTICLE & KNOWLEDGE EXTRACTION:
-     * Check "PAGE CONTENT / ARTICLE TEXT:" in your page context. The semantic body text, headings, and paragraphs are already parsed for you.
-     * Retain relevant findings and sections in "notes".
-     * If the user asks to write/paste into an external document or editor: navigate to or focus the target editor and paste using clipboard_paste or type. If the editor requires external sign-in or is inaccessible, use export_file to save the content locally so data is never lost.
-   - MULTI-STORE & CROSS-SITE PRODUCT COMPARISON:
-     * Open stores across tabs using new_tab: {{"type": "new_tab", "risk": "write", "params": {{"url": "..."}}}}.
-     * Check adjacent prices in element names (e.g. "[Price: ₹...]").
-     * RELEVANCE & ACCESSORY FILTERING: Verify listing titles match the user's requested item and configuration (model, capacity, variant). Disregard accessories, covers, parts, or unbundled add-ons whose price or description indicates they are not the primary product.
-     * Track quotes across stores in "notes" scratchpad. Select the best matching offer, complete the requested action (such as adding to cart), and return the canonical checkout/product link in "answer".
-   - FORM FILLING, APPLICATIONS & DOCUMENT UPLOADS:
-     * When forms require candidate information, applications, or profile submission, check <user-preferences> for profile data and fill fields accurately.
-     * When file inputs require document attachment (e.g. resumes, identity docs, reports): use {{"type": "upload_file", "risk": "write", "target": {{...}}, "params": {{"fileName": "...", "fileContent": "..."}}}}.
-     * Advance through multi-step forms ("Next", "Review", "Continue", "Submit").
-   - NUMERICAL & BUDGET CONSTRAINTS:
-     * When the user specifies financial, pricing, or metric thresholds (e.g. maximum cost, star ratings, distance):
-       - Use interactive filters, sliders ({{"type": "slider_adjust"}}), or calendar pickers ({{"type": "select_date"}}).
-       - Maintain an arithmetic running balance in "notes" (e.g. "Budget: ... | Item 1: ... | Item 2: ... | Total: ... | Remaining: ...").
-       - Never commit to an option that exceeds the user's specified budget; select cheaper options or report constraint trade-offs honestly.
-   - STRUCTURED TABULAR & LIVE DATA REASONING:
-     * Check "TABLE / DATA ROWS:" in page context for real-time status boards, financial tables, schedules, or spreadsheets.
-     * Filter table rows according to the user's conditions (e.g. delays, thresholds, status) and record matches in "notes" for subsequent actions or answers.
-
 Action Schema Requirements:
 - Every action needs: type, risk ("read"|"write"|"sensitive"), verify, timeoutMs (number).
-- Click/type/hover/slider_adjust MUST carry a target: {{"target": {{"targetId": "<targetId>"}}}} or {{"target": {{"name": "<visible label>"}}}}.
+- Click/type MUST carry a target: {{"target": {{"targetId": "<targetId from page-context>"}}}} or {{"target": {{"name": "<visible label>"}}}}. A target with only a role (e.g. {{"role": "link"}}) is rejected as underspecified: name the exact element (for a video result, its title).
 - Type params: {{"text": ..., "clear": true, "submit": true|false}}.
 - Navigate params: {{"url": ...}}. Press params: {{"key": ...}}.
 - Scroll params: {{"direction": "down"|"up"|"top"|"bottom"}}.
 - Zoom params: {{"direction": "in"|"out"|"reset", "factor": 1.25}}.
 - New tab params: {{"url": ...}}. Select/close tab params: {{"tabId": number}}.
-- Upload file params: {{"fileName": string, "fileContent": string, "mimeType"?: string}}.
-- Clipboard paste params: {{"text": string}}.
-- Select date params: {{"date": string}}.
-- Hover params: {{"target": {{...}}}}.
-- Slider adjust params: {{"target": {{...}}, "percent"?: number, "direction"?: "left"|"right"}}.
-- Export file params: {{"filename": string, "content": string, "mimeType"?: string}}.
 - Max 3 steps per plan. Never invent an action type outside the list.
 """.format(actions=ACTION_LIST)
 
@@ -276,16 +247,12 @@ def _normalize_raw_plan(raw: dict[str, Any]) -> dict[str, Any]:
             act = dict(action)
             atype = act.get("type")
             risk = act.get("risk", "read")
-            if atype in {"type", "click", "navigate", "press", "new_tab", "close_tab", "upload_file", "clipboard_paste", "select_date", "slider_adjust", "export_file"} and risk == "read":
+            if atype in {"type", "click", "navigate", "press", "new_tab", "close_tab"} and risk == "read":
                 act["risk"] = "write"
 
             # 1. Extract params
             params = dict(act.get("params", {})) if isinstance(act.get("params"), dict) else {}
-            for field in (
-                "url", "direction", "text", "clear", "submit", "key", "containerId",
-                "tabId", "factor", "files", "fileName", "fileContent", "mimeType",
-                "date", "percent", "filename", "content",
-            ):
+            for field in ("url", "direction", "text", "clear", "submit", "key", "containerId", "tabId", "factor"):
                 if field in act and field not in params:
                     params[field] = act.pop(field)
 
@@ -801,10 +768,7 @@ def _validate_step(step: PlannedStep) -> None:
     a = step.action
     if a.type not in ACTION_TYPES:
         raise ValueError(f"PLAN_INVALID: action type {a.type!r} outside whitelist")
-    if a.risk == "read" and a.type in {
-        "type", "click", "navigate", "press", "new_tab", "close_tab",
-        "upload_file", "clipboard_paste", "select_date", "slider_adjust", "export_file",
-    }:
+    if a.risk == "read" and a.type in {"type", "click", "navigate", "press", "new_tab", "close_tab"}:
         # floor breach: these change page/task state at minimum
         raise ValueError(f"PLAN_INVALID: action {a.type} cannot be risk=read")
     if not (MIN_TIMEOUT_MS <= a.timeout_ms <= MAX_TIMEOUT_MS):
@@ -845,17 +809,6 @@ def _validate_step(step: PlannedStep) -> None:
     elif a.type == "new_tab":
         if p is None or not _safe_nav_url(p.url):
             raise ValueError(f"PLAN_INVALID: unsafe new_tab url {getattr(p, 'url', None)!r}")
-    elif a.type == "clipboard_paste":
-        if p is None or p.text is None:
-            raise ValueError("PLAN_INVALID: clipboard_paste requires params.text")
-    elif a.type == "select_date":
-        if p is None or not (p.date or "").strip():
-            raise ValueError("PLAN_INVALID: select_date requires params.date")
-    elif a.type in {"hover", "slider_adjust"}:
-        _require_target(a)
-    elif a.type == "export_file":
-        if p is None or not (p.filename or "").strip() or p.content is None:
-            raise ValueError("PLAN_INVALID: export_file requires params.filename and params.content")
 
 
 def _validate_plan(

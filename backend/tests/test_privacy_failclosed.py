@@ -74,25 +74,3 @@ def test_payload_counts_provenance():
     payload, _ = classify_and_redact(obs, instruction="look around")
     assert payload.elements_sent == 2
     assert payload.elements_original == 2
-
-
-def test_article_content_and_tables_included_in_context_block():
-    obs = BrowserObservation.model_validate({
-        "tabId": 1,
-        "url": "https://en.wikipedia.org/wiki/James_Webb_Space_Telescope",
-        "title": "JWST",
-        "interactive": [],
-        "scroll": {"y": 0, "viewport": {"w": 900, "h": 600}},
-        "articleContent": "### Mission goals\nThe JWST has four key scientific goals.",
-        "tableRows": ["| AI-102 | Air India | Delayed 2h 40m |"],
-    })
-    payload, decision = classify_and_redact(obs, instruction="extract key goals")
-    assert decision.send is True
-    assert payload.article_content and "Mission goals" in payload.article_content
-    assert payload.table_rows and "AI-102" in payload.table_rows[0]
-
-    ctx = payload.to_context_block()
-    assert "PAGE CONTENT / ARTICLE TEXT:" in ctx
-    assert "Mission goals" in ctx
-    assert "TABLE / DATA ROWS:" in ctx
-    assert "AI-102" in ctx
