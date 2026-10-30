@@ -1,5 +1,6 @@
 import { Relay } from "./relay";
 import { executeAction } from "./actionExecutor";
+import type { ActionResult } from "./contracts";
 
 const BACKEND_WS = "ws://localhost:8000/ws/extension";
 const RECONNECT_MS = 2000;
@@ -22,7 +23,8 @@ function connect() {
       isConnecting = false;
     });
     ws.addEventListener("close", () => {
-      socket = null;
+      relay.detach(ws);
+      if (socket === ws) socket = null;
       isConnecting = false;
       setTimeout(connect, RECONNECT_MS);
     });
@@ -37,18 +39,52 @@ function connect() {
   }
 }
 
-relay.onMessage(async m => {
+function timeoutError(ms: number): ActionResult {
+  return {
+    ok: false,
+    error: { code: "TIMEOUT", message: `action exceeded ${ms}ms`, recoverable: true },
+  };
+}
+
+/** Run one action under a hard deadline so a stuck tab cannot block the
+ * relay (and the backend's 45s slot) forever. */
+async function withDeadline(promise: Promise<ActionResult>, ms: number): Promise<ActionResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<ActionResult>(resolve => {
+    timer = setTimeout(() => resolve(timeoutError(ms)), ms);
+  });
   try {
-    const action = m.payload as Parameters<typeof executeAction>[0];
-    const result = await executeAction(action, m.taskId);
-    relay.send({ type: "RESULT", taskId: m.taskId, payload: result });
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function handleMessage(taskId: string, raw: unknown): Promise<void> {
+  const action = raw as { timeoutMs?: number } | null;
+  const actionMs = typeof action?.timeoutMs === "number" && action.timeoutMs > 0
+    ? Math.min(action.timeoutMs, 60_000)
+    : 10_000;
+  try {
+    const result = await withDeadline(
+      executeAction(action as Parameters<typeof executeAction>[0], taskId),
+      actionMs + 5_000,
+    );
+    relay.send({ type: "RESULT", taskId, payload: result });
   } catch (e) {
     relay.send({
       type: "RESULT",
-      taskId: m.taskId,
+      taskId,
       payload: { ok: false, error: { code: "UNKNOWN", message: String(e), recoverable: true } },
     });
   }
+}
+
+// Serialize actions: two EXECUTE_ACTION frames must never interleave clicks
+// in the same tab.
+let queue: Promise<void> = Promise.resolve();
+relay.onMessage(m => {
+  queue = queue.then(() => handleMessage(m.taskId, m.payload)).catch(() => { /* handled */ });
 });
 
 // Alarm heartbeat keeps service worker connected to the backend
@@ -60,4 +96,3 @@ chrome.alarms?.onAlarm.addListener(alarm => {
 });
 
 connect();
-

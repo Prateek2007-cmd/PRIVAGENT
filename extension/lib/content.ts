@@ -9,6 +9,8 @@ interface AgentElement {
   targetId: string;
   role: string;
   name: string;
+  tag: string;
+  inputType?: string;
   cssSelector: string;
   enabled: boolean;
   visible: boolean;
@@ -20,8 +22,10 @@ interface NavigatorAgent {
   click: (targetId: string, name?: string) => { ok: boolean; error?: string };
   clickCoords: (x: number, y: number) => { ok: boolean; targetId?: string; error?: string };
   getCoords: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
-  type: (targetId: string, text: string, clear: boolean, submit: boolean, name?: string) => { ok: boolean; error?: string; submitted?: boolean };
-  scroll: (direction: "up" | "down" | "top" | "bottom") => { ok: boolean; scrollY: number };
+  getClickPoint: (targetId: string, name?: string) => { x: number; y: number; width: number; height: number } | null;
+  type: (targetId: string, text: string, clear: boolean, name?: string) => { ok: boolean; error?: string };
+  submit: (targetId: string, name?: string) => { ok: boolean; error?: string };
+  scroll: (direction: "up" | "down" | "top" | "bottom", containerId?: string) => { ok: boolean; scrollY: number };
 }
 
 declare global {
@@ -165,6 +169,8 @@ function candidates(): AgentElement[] {
       targetId,
       role,
       name,
+      tag: el.tagName.toLowerCase(),
+      inputType: el.tagName.toLowerCase() === "input" ? input.type : undefined,
       cssSelector,
       enabled: !(input as HTMLButtonElement).disabled && !el.hasAttribute("aria-disabled"),
       visible: true,
@@ -202,9 +208,11 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
   }
 
   // 3. Search within open Shadow Roots
-  const shadowNodes = queryAllWithShadow(document, `[data-navigator-id="${CSS.escape(cid)}"], #${CSS.escape(cid)}`);
-  if (shadowNodes.length > 0 && (shadowNodes[0] as HTMLElement).isConnected) {
-    return shadowNodes[0] as HTMLElement;
+  if (cid) {
+    const shadowNodes = queryAllWithShadow(document, `[data-navigator-id="${CSS.escape(cid)}"], #${CSS.escape(cid)}`);
+    if (shadowNodes.length > 0 && (shadowNodes[0] as HTMLElement).isConnected) {
+      return shadowNodes[0] as HTMLElement;
+    }
   }
 
   // 4. Refresh candidates if registry was empty
@@ -265,6 +273,34 @@ function elementFor(targetId: string, name?: string): HTMLElement | null {
   return null;
 }
 
+/**
+ * Chat rows / list items. WhatsApp renders a chat row as a container whose
+ * inner text labels are what name-matching usually resolves, but the selection
+ * handler lives on the row. Clicking the label's own centre can therefore hit
+ * a non-activating child.
+ */
+const CHAT_ROW_SELECTOR =
+  '[role="listitem"], [role="row"], div[tabindex="-1"], ' +
+  '[data-testid*="cell-frame"], [data-testid*="list-item"], [data-testid*="chat-list-item"]';
+
+const EXPLICIT_CONTROL_SELECTOR =
+  'button, a[href], input, textarea, select, [role="button"], [role="link"], ' +
+  '[role="checkbox"], [role="radio"], [contenteditable="true"]';
+
+/** Nearest activatable row for a text label, or null for real controls. */
+function rowFor(el: HTMLElement): HTMLElement | null {
+  // A control keeps its own activation point: promoting it to the row would
+  // click empty space instead of the button.
+  if (el.matches(EXPLICIT_CONTROL_SELECTOR)) return null;
+  const row = el.closest(CHAT_ROW_SELECTOR) as HTMLElement | null;
+  if (!row || row === el) return null;
+  const r = row.getBoundingClientRect();
+  // Guard against `div[tabindex="-1"]` scroll containers: a real row is
+  // small, not most of the viewport.
+  if (r.height > Math.max(240, (window.innerHeight || 800) * 0.5)) return null;
+  return row;
+}
+
 window.__navigatorAgent = {
   list: () => {
     registry.clear();
@@ -284,8 +320,28 @@ window.__navigatorAgent = {
       height: Math.round(r.height),
     };
   },
+  /**
+   * Activation point for a click: the resolved element, promoted to its chat
+   * row when the planner matched an inner label. Always the true centre.
+   */
+  getClickPoint: (targetId, name) => {
+    const el = elementFor(targetId, name);
+    if (!el) return null;
+    const target = rowFor(el) || el;
+    try {
+      target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    } catch {}
+    const r = target.getBoundingClientRect();
+    return {
+      x: Math.round(r.left + Math.max(1, r.width / 2)),
+      y: Math.round(r.top + Math.max(1, r.height / 2)),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
+  },
   click: (targetId, name) => {
-    // Specialized WhatsApp handling: clear search filter before clicking Groups or a chat
+    // Specialized WhatsApp handling: clear a stale search filter before
+    // clicking Groups or a chat row.
     if (window.location.hostname.includes("whatsapp.com")) {
       const nm = (name || "").toLowerCase();
       if (nm === "groups" || nm === "group" || nm.includes("group") || nm.includes("chat")) {
@@ -295,19 +351,24 @@ window.__navigatorAgent = {
         }
       }
     }
-    let el = elementFor(targetId, name);
+    const el = elementFor(targetId, name);
     if (!el) return { ok: false, error: "STALE_TARGET" };
     try {
       el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     } catch {}
 
-    try { (el as HTMLElement).focus?.(); } catch {}
+    // Activate exactly ONE element: the control itself, or its nearest
+    // interactive ancestor. Dispatching on the leaf, target, and container
+    // (plus anchor click) fired the same action several times.
+    const clickable = (
+      el.closest('button, [role="button"], a[href], [role="row"], [role="listitem"], [role="gridcell"], [data-testid*="cell-frame"], [data-testid*="list-item"]') as HTMLElement | null
+    ) || el;
+    try { clickable.focus?.(); } catch {}
 
-    const r = el.getBoundingClientRect();
+    const r = clickable.getBoundingClientRect();
     const cx = Math.round(r.left + Math.max(1, r.width / 2));
     const cy = Math.round(r.top + Math.max(1, r.height / 2));
-
-    const downMouse: MouseEventInit = {
+    const base: PointerEventInit = {
       bubbles: true,
       cancelable: true,
       composed: true,
@@ -317,72 +378,25 @@ window.__navigatorAgent = {
       screenX: cx,
       screenY: cy + 100,
       button: 0,
-      buttons: 1,
-    };
-    const downPointer: PointerEventInit = {
-      ...downMouse,
       pointerId: 1,
       pointerType: "mouse",
       isPrimary: true,
-      width: 1,
-      height: 1,
     };
 
-    const upMouse: MouseEventInit = {
-      ...downMouse,
-      buttons: 0,
-    };
-    const upPointer: PointerEventInit = {
-      ...downPointer,
-      buttons: 0,
-    };
-    const clickOpts: MouseEventInit = {
-      ...upMouse,
-      detail: 1,
-    };
+    clickable.dispatchEvent(new PointerEvent("pointerover", base));
+    clickable.dispatchEvent(new PointerEvent("pointerenter", base));
+    clickable.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
+    clickable.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+    clickable.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
+    clickable.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
 
-    // Innermost leaf element at coordinates (where user's finger/mouse actually touches)
-    const leafEl = (document.elementFromPoint(cx, cy) as HTMLElement) || el;
-    try { leafEl.focus?.(); } catch {}
-
-    // 1. Dispatch full sequence on the leaf element so it bubbles up naturally to React / framework listeners
-    leafEl.dispatchEvent(new PointerEvent("pointerover", downPointer));
-    leafEl.dispatchEvent(new PointerEvent("pointerenter", downPointer));
-    leafEl.dispatchEvent(new PointerEvent("pointerdown", downPointer));
-    leafEl.dispatchEvent(new MouseEvent("mousedown", downMouse));
-    leafEl.dispatchEvent(new PointerEvent("pointerup", upPointer));
-    leafEl.dispatchEvent(new MouseEvent("mouseup", upMouse));
-    leafEl.dispatchEvent(new MouseEvent("click", clickOpts));
-    try { leafEl.click(); } catch {}
-
-    // 2. Also dispatch on the target element if distinct from leaf
-    if (el !== leafEl) {
-      el.dispatchEvent(new PointerEvent("pointerdown", downPointer));
-      el.dispatchEvent(new MouseEvent("mousedown", downMouse));
-      el.dispatchEvent(new PointerEvent("pointerup", upPointer));
-      el.dispatchEvent(new MouseEvent("mouseup", upMouse));
-      el.dispatchEvent(new MouseEvent("click", clickOpts));
-      try { el.click(); } catch {}
+    // One activation click. Native .click() dispatches exactly one click and
+    // performs default actions (link navigation, form controls).
+    try {
+      clickable.click();
+    } catch {
+      clickable.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
     }
-
-    // 3. If element is wrapped inside a button, link, or clickable row, also trigger the container
-    const interactiveContainer = el.closest('button, [role="button"], a[href], [role="row"], [role="listitem"], [role="gridcell"], [data-testid*="cell-frame"], [data-testid*="list-item"]') as HTMLElement | null;
-    if (interactiveContainer && interactiveContainer !== el && interactiveContainer !== leafEl) {
-      interactiveContainer.dispatchEvent(new MouseEvent("click", clickOpts));
-      try { interactiveContainer.click(); } catch {}
-    }
-
-    // 4. Anchor navigation follow-through (YouTube, standard links)
-    const anchor = (leafEl.tagName.toLowerCase() === "a" ? leafEl :
-                   (el.tagName.toLowerCase() === "a" ? el :
-                   (leafEl.closest("a") || el.closest("a") || leafEl.querySelector("a") || el.querySelector("a")))) as HTMLAnchorElement | null;
-    if (anchor && anchor.href && !anchor.href.startsWith("javascript:")) {
-      try { anchor.click(); } catch {}
-      if (window.location.hostname.includes("youtube.com") && anchor.pathname.includes("/watch")) {
-        window.location.href = anchor.href;
-      }
-    }
-
     return { ok: true };
   },
   clickCoords: (x, y) => {
@@ -395,7 +409,7 @@ window.__navigatorAgent = {
     const cx = Math.round(x);
     const cy = Math.round(y);
 
-    const downMouse: MouseEventInit = {
+    const base: PointerEventInit = {
       bubbles: true,
       cancelable: true,
       composed: true,
@@ -405,175 +419,187 @@ window.__navigatorAgent = {
       screenX: cx,
       screenY: cy + 100,
       button: 0,
-      buttons: 1,
-    };
-    const downPointer: PointerEventInit = {
-      ...downMouse,
       pointerId: 1,
       pointerType: "mouse",
       isPrimary: true,
     };
-    const upMouse: MouseEventInit = { ...downMouse, buttons: 0 };
-    const upPointer: PointerEventInit = { ...downPointer, buttons: 0 };
-    const clickOpts: MouseEventInit = { ...upMouse, detail: 1 };
 
-    el.dispatchEvent(new PointerEvent("pointerdown", downPointer));
-    el.dispatchEvent(new MouseEvent("mousedown", downMouse));
-    el.dispatchEvent(new PointerEvent("pointerup", upPointer));
-    el.dispatchEvent(new MouseEvent("mouseup", upMouse));
-    el.dispatchEvent(new MouseEvent("click", clickOpts));
-    try { el.click(); } catch {}
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
+    el.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+    el.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+    try {
+      el.click();
+    } catch {
+      el.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
+    }
     return { ok: true, targetId: el.id || undefined };
   },
-  type: (targetId, text, clear, submit, name) => {
-    let el = elementFor(targetId, name);
-    const nm = (name || "").toLowerCase();
+  type: (targetId, text, clear, name) => {
+    // Framework-owned nodes (React containers, Lexical editors) can throw from
+    // inside property setters and selection APIs. Never let that escape as an
+    // unhandled exception: report it so the executor can surface STALE_TARGET.
+    try {
+      let el = elementFor(targetId, name);
+      const nm = (name || "").toLowerCase();
 
-    // Specialized WhatsApp Web element resolution:
-    if (window.location.hostname.includes("whatsapp.com")) {
-      // Discard any active accidental voice note immediately
-      const cancelVoice = document.querySelector('[data-icon="cancel"], [data-testid="btn-cancel"], [data-icon="delete-clip"]') as HTMLElement | null;
-      if (cancelVoice) {
-        try { (cancelVoice.closest("button") || cancelVoice).click(); } catch {}
-      }
-
-      if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
-        const waComposer = document.querySelector('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"]') as HTMLElement | null;
-        if (waComposer) el = waComposer;
-      } else if (nm.includes("search") || nm.includes("find")) {
-        const waSearch = document.querySelector('div[data-tab="3"], [data-testid="chat-list-search"], [aria-label="Search input textbox"]') as HTMLElement | null;
-        if (waSearch) el = waSearch;
-        if (clear || !text) {
-          const cancelSearch = document.querySelector('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], [data-icon="back"], button[aria-label*="cancel search" i]') as HTMLElement | null;
-          if (cancelSearch) {
-            try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
+      // Specialized WhatsApp Web element resolution:
+      if (window.location.hostname.includes("whatsapp.com")) {
+        if (nm.includes("type") || nm.includes("message") || nm.includes("composer") || !el) {
+          const waComposer = document.querySelector('footer [contenteditable="true"], [data-tab="10"], [data-testid="conversation-compose-box-input"]') as HTMLElement | null;
+          if (waComposer) el = waComposer;
+        } else if (nm.includes("search") || nm.includes("find")) {
+          const waSearch = document.querySelector('div[data-tab="3"], [data-testid="chat-list-search"], [aria-label="Search input textbox"]') as HTMLElement | null;
+          if (waSearch) el = waSearch;
+          if (clear || !text) {
+            const cancelSearch = document.querySelector('[data-testid="chat-list-search-esc-button"], [data-icon="x-alt"], [data-icon="back"], button[aria-label*="cancel search" i]') as HTMLElement | null;
+            if (cancelSearch) {
+              try { (cancelSearch.closest("button") || cancelSearch).click(); } catch {}
+            }
           }
         }
       }
-    }
 
-    if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable)) {
-      const inner = el.querySelector("input, textarea, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
-      if (inner) el = inner;
-    }
-    if (!el) {
-      if (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement || (document.activeElement as HTMLElement)?.isContentEditable) {
-        el = document.activeElement as HTMLElement;
+      if (el && !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable)) {
+        const inner = el.querySelector("input, textarea, [contenteditable='true'], [contenteditable]") as HTMLElement | null;
+        if (inner) el = inner;
       }
+      if (!el) {
+        const active = document.activeElement as HTMLElement | null;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active?.isContentEditable) {
+          el = active;
+        }
+      }
+      // A rich-text editor often keeps the caret in a child node while the
+      // planner targeted the wrapper: trust the focused editable.
+      if (!el) return { ok: false, error: "STALE_TARGET" };
+      const active = document.activeElement as HTMLElement | null;
+      const editable =
+        el.isContentEditable
+        || el.getAttribute("contenteditable") === "true"
+        || active?.isContentEditable === true;
+      if (
+        editable
+        && !(el instanceof HTMLInputElement)
+        && !(el instanceof HTMLTextAreaElement)
+        && active?.isContentEditable
+        && !el.isContentEditable
+      ) {
+        el = active;
+      }
+
+      if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+        el.focus();
+        try {
+          const sel = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          if (clear) {
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+            document.execCommand("delete", false);
+          } else {
+            // Caret at the end so existing text is preserved.
+            range.selectNodeContents(el);
+            range.collapse(false);
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+          }
+        } catch {}
+
+        let inserted = false;
+        try {
+          inserted = document.execCommand("insertText", false, text);
+        } catch {}
+        if (!inserted || !el.textContent?.includes(text)) {
+          // Last resort: write the text and emit the same InputEvent real
+          // typing produces, so framework listeners still update state.
+          el.textContent = (clear ? "" : el.textContent || "") + text;
+          try {
+            el.dispatchEvent(new InputEvent("beforeinput", {
+              bubbles: true, cancelable: true, inputType: "insertText", data: text,
+            }));
+          } catch {}
+          el.dispatchEvent(new InputEvent("input", {
+            bubbles: true, cancelable: true, inputType: "insertText", data: text,
+          }));
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        const input = el as HTMLInputElement | HTMLTextAreaElement;
+        input.focus();
+        if (clear) input.value = "";
+        const val = (clear ? "" : input.value) + text;
+        const proto = input instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        try {
+          if (setter) setter.call(input, val);
+          else input.value = val;
+        } catch {
+          // Some input types reject direct assignment; the native setter is
+          // the last attempt before reporting failure.
+          input.value = val;
+        }
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      // Submission is intentionally NOT done here. The executor performs one
+      // and only one send/submit trigger, avoiding double-sent messages.
+      return { ok: true };
+    } catch (e) {
+      // Bounded: a framework error can echo the value it rejected, and this
+      // string travels back to the backend.
+      const detail = String((e as Error)?.message ?? e).slice(0, 120);
+      return { ok: false, error: `type failed: ${detail}` };
     }
+  },
+  submit: (targetId, name) => {
+    const el = elementFor(targetId, name) ||
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     if (!el) return { ok: false, error: "STALE_TARGET" };
 
-    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
-      el.focus();
+    // 1. A real form is the safest single-submit path.
+    const input = el as HTMLInputElement;
+    if (input.form) {
       try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        if (clear) {
-          sel?.removeAllRanges();
-          sel?.addRange(range);
-          document.execCommand("delete", false);
-        } else {
-          range.collapse(false);
-          sel?.removeAllRanges();
-          sel?.addRange(range);
-        }
-      } catch {}
-
-      let inserted = false;
-      try {
-        inserted = document.execCommand("insertText", false, text);
-      } catch {}
-      if (!inserted || !el.textContent?.includes(text)) {
-        el.textContent = (clear ? "" : el.textContent || "") + text;
-        el.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
-      }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    } else {
-      const input = el as HTMLInputElement | HTMLTextAreaElement;
-      input.focus();
-      if (clear) input.value = "";
-      const val = (clear ? "" : input.value) + text;
-      const proto = input instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) {
-        setter.call(input, val);
-      } else {
-        input.value = val;
-      }
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-
-    if (submit) {
-      const keyOpts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
-      el.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
-      el.dispatchEvent(new KeyboardEvent("keypress", keyOpts));
-      el.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
-
-      const clickSend = () => {
-        // Discard accidental voice recording if active
-        const cancelVoice = document.querySelector('[data-icon="cancel"], [data-testid="btn-cancel"], [data-icon="delete-clip"]') as HTMLElement | null;
-        if (cancelVoice) {
-          try { (cancelVoice.closest("button") || cancelVoice).click(); } catch {}
-          return;
-        }
-
-        const sendEl = document.querySelector('[data-testid="compose-btn-send"], [data-icon="send"], span[data-icon="send"], button[aria-label="Send" i], button[aria-label*="Send message" i]') as HTMLElement | null;
-        if (sendEl && !sendEl.closest('[data-icon="ptt"], [aria-label*="voice" i], [aria-label*="audio" i]')) {
-          const clickable = (sendEl.closest("button") || sendEl) as HTMLElement;
-          const r = clickable.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) {
-            const pOpts: PointerEventInit = {
-              bubbles: true,
-              cancelable: true,
-              view: window,
-              clientX: Math.round(r.left + r.width / 2),
-              clientY: Math.round(r.top + r.height / 2),
-              pointerId: 1,
-              pointerType: "mouse",
-              isPrimary: true,
-            };
-            clickable.focus();
-            clickable.dispatchEvent(new PointerEvent("pointerdown", pOpts));
-            clickable.dispatchEvent(new MouseEvent("mousedown", pOpts));
-            clickable.dispatchEvent(new PointerEvent("pointerup", pOpts));
-            clickable.dispatchEvent(new MouseEvent("mouseup", pOpts));
-            clickable.click();
-          }
-        }
-      };
-
-      clickSend();
-      setTimeout(clickSend, 120);
-
-      // Standard form submit
-      const input = el as HTMLInputElement;
-      if (input.form) {
-        try {
+        if (typeof input.form.requestSubmit === "function") {
           input.form.requestSubmit();
-        } catch {
-          try { input.form.submit(); } catch {}
+        } else {
+          input.form.submit();
         }
+        return { ok: true };
+      } catch {
+        // fall through to a single Enter dispatch
       }
-
-      // YouTube / General submit buttons
-      const submitBtn = (input.form?.querySelector('button[type="submit"], input[type="submit"]') ||
-                         document.querySelector('#nav-search-submit-button, #search-icon-legacy, input[name="btnK"], button[type="submit"]')) as HTMLElement | null;
-      if (submitBtn) {
-        try { submitBtn.click(); } catch {}
-      }
-
-      return { ok: true, submitted: true };
     }
+
+    // 2. Otherwise dispatch exactly one Enter sequence.
+    try { el.focus?.(); } catch {}
+    const opts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    el.dispatchEvent(new KeyboardEvent("keydown", opts));
+    el.dispatchEvent(new KeyboardEvent("keypress", opts));
+    el.dispatchEvent(new KeyboardEvent("keyup", opts));
     return { ok: true };
   },
-  scroll: direction => {
-    const px = Math.round(innerHeight * 0.8);
-    if (direction === "top") scrollTo({ top: 0 });
-    else if (direction === "bottom") scrollTo({ top: document.body.scrollHeight });
-    else scrollBy({ top: direction === "down" ? px : -px });
-    return { ok: true, scrollY: scrollY };
+  scroll: (direction, containerId) => {
+    const container = containerId ? elementFor(containerId) : null;
+    const px = Math.round((container ? container.clientHeight : innerHeight) * 0.8);
+    if (direction === "top") {
+      if (container) container.scrollTop = 0;
+      else scrollTo({ top: 0 });
+    } else if (direction === "bottom") {
+      if (container) container.scrollTop = container.scrollHeight;
+      else scrollTo({ top: document.body.scrollHeight });
+    } else if (container) {
+      container.scrollTop += direction === "down" ? px : -px;
+    } else {
+      scrollBy({ top: direction === "down" ? px : -px });
+    }
+    return {
+      ok: true,
+      scrollY: Math.round(container ? container.scrollTop : (window.scrollY || document.scrollingElement?.scrollTop || 0)),
+    };
   },
 };

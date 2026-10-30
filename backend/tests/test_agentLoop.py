@@ -113,3 +113,135 @@ def test_summary_contains_evidence():
     ))
     assert state["final"] == "completed"
     assert "google.com" in (state["summary"] or "")
+
+
+def _youtube_obs():
+    return {"tabId": 1, "url": "https://www.youtube.com/", "title": "YouTube",
+            "interactive": [], "scroll": {}, "dpr": 1}
+
+
+class _RawProvider:
+    """Provider double that always returns one scripted raw plan."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def plan_call(self, instruction, payload, history, working_memory=None):
+        return self.raw
+
+
+def _validating_planner(provider):
+    """Production-shaped planner: validation happens inside plan_from_observation."""
+    from app.planner import plan_from_observation
+    from app.privacy import PrivacyFilteredPayload
+
+    def planner(instruction, payload, history, working_memory=None):
+        pf = PrivacyFilteredPayload(**payload) if isinstance(payload, dict) else payload
+        return plan_from_observation(
+            instruction=instruction, payload=pf, provider=provider,
+            history=history, working_memory=working_memory,
+        ).model_dump(by_alias=True, exclude_none=True)
+
+    return planner
+
+
+_UNDERSPECIFIED_CLICK = {
+    "goal": "play",
+    "steps": [{"why": "click the first video", "action": {
+        "type": "click", "risk": "write", "verify": "video opened", "timeoutMs": 1000,
+        "target": {"role": "link"},
+    }}],
+}
+
+
+def test_invalid_plan_replans_instead_of_killing_the_mission():
+    """One malformed plan produced "loop error: PLAN_INVALID" after 1 step."""
+    calls = {"n": 0}
+    seen_histories: list[list[dict]] = []
+
+    class Provider:
+        def plan_call(self, instruction, payload, history, working_memory=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _UNDERSPECIFIED_CLICK
+            return {"goal": "play", "steps": [], "answer": "Opened the first video"}
+
+    def planner(instruction, payload, history, working_memory=None):
+        seen_histories.append(history)
+        from app.planner import plan_from_observation
+        from app.privacy import PrivacyFilteredPayload
+        pf = PrivacyFilteredPayload(**payload) if isinstance(payload, dict) else payload
+        return plan_from_observation(
+            instruction=instruction, payload=pf, provider=Provider(),
+            history=history, working_memory=working_memory,
+        ).model_dump(by_alias=True, exclude_none=True)
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        FakeHub({}), planner=planner, obs_factory=_youtube_obs,
+    ))
+
+    assert state["final"] == "completed"
+    assert calls["n"] == 2
+    assert any("invalid plan" in str(h.get("penalty", "")) for h in seen_histories[1])
+
+
+def test_persistently_invalid_plans_fail_honestly():
+    calls = {"n": 0}
+
+    class Provider:
+        def plan_call(self, instruction, payload, history, working_memory=None):
+            calls["n"] += 1
+            return _UNDERSPECIFIED_CLICK
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        FakeHub({}), planner=_validating_planner(Provider()), obs_factory=_youtube_obs,
+    ))
+
+    assert state["final"] == "failed"
+    assert calls["n"] == agentLoop.MAX_INVALID_PLANS
+    summary = (state["summary"] or "").lower()
+    assert "incomplete" in summary
+    assert "valid action" in summary
+
+
+def test_provider_outage_fails_fast_without_consuming_a_step():
+    """A daily-quota 429 must be reported, not retried into a 40s stall."""
+    from app.providers.errors import ProviderUnavailable
+
+    def planner(instruction, payload, history, working_memory=None):
+        raise ProviderUnavailable("Groq quota exhausted; retry in about 23m.")
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        FakeHub({}), planner=planner, obs_factory=_youtube_obs,
+    ))
+
+    assert state["final"] == "failed"
+    assert state["steps"] == 0
+    summary = state["summary"] or ""
+    assert summary.startswith("Planner unavailable:")
+    assert "23m" in summary
+
+
+def test_loop_reports_phase_metrics():
+    seen: list[dict] = []
+    hub = FakeHub({"navigate": [{"ok": True, "evidence": "https://www.google.com/"}]})
+    calls = {"n": 0}
+
+    class Planner:
+        def __call__(self, i, p, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"goal": "go", "steps": [{"why": "go", "action": {
+                    "type": "navigate", "risk": "write", "verify": "url", "timeoutMs": 1000,
+                    "params": {"url": "https://www.google.com/"}}}]}
+            return {"goal": "go", "steps": [], "answer": "done"}
+
+    state = asyncio.run(agentLoop.run_with_injection(
+        hub, planner=Planner(), obs_factory=_youtube_obs, on_metrics=seen.append,
+    ))
+
+    assert state["final"] == "completed"
+    phases = [m["phase"] for m in seen]
+    assert "plan" in phases
+    assert "act" in phases
+    assert all(isinstance(m["ms"], int) and m["ms"] >= 0 for m in seen)

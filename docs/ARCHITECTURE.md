@@ -25,7 +25,7 @@ NAVIGATOR is a privacy-first AI browser agent designed for the Smart India Hacka
 │                                           │  - Agent Control Loop  │   │
 │                                           │  - Local Privacy Filter│   │
 │                                           │  - Schema Validation   │   │
-│                                           │  - Gemini Provider     │   │
+│                                           │  - Gemini/Groq/Mock    │   │
 │                                           └───────────┬────────────┘   │
 │                                                       │                │
 │                                                       │ WebSocket      │
@@ -50,38 +50,52 @@ NAVIGATOR is a privacy-first AI browser agent designed for the Smart India Hacka
 - **Python Pydantic Mirror**: `backend/app/contracts.py`
 - **Contract Parity Test**: `backend/tests/test_contracts.py` guarantees zero drift across language boundaries.
 - **Allowed Action Types (`ACTION_TYPES`)**:
-  - `navigate`: Open URL, go back/forward, reload. Privileged schemes (`chrome://`, `file://`, `javascript:`) strictly blocked.
-  - `click`: Semantic targeting by accessible name/role with fallback to screenshot-grounded coordinates.
-  - `type`: Input text with auto-clear and optional form submission.
+  - `navigate`: Open URL, go back/forward, reload. Only credential-free `http(s)` URLs; `javascript:`, `data:`, `file:`, `blob:`, `chrome:`, `view-source:`, and CR/LF/backslash injection are rejected.
+  - `click`: Semantic targeting by accessible name/role with fallback to coordinates. Exactly one activation is dispatched (trusted CDP click, or a single in-page click — never both).
+  - `type`: Input text with auto-clear. Submission is a separate single trigger (Send button, otherwise one Enter, otherwise one form submit).
   - `press`: Dispatch keyboard events (Enter, Escape, Tab, arrow keys).
-  - `scroll`: Incremental container and viewport scrolling (up, down, top, bottom).
-  - `zoom`: Native browser zoom adjustments (`in`, `out`, `reset`, explicit factor).
+  - `scroll`: Incremental container (`containerId`) and viewport scrolling (up, down, top, bottom).
+  - `zoom`: Native browser zoom adjustments (`in`, `out`, `reset`, explicit factor 0.25–3).
   - `wait`: Pause for DOM changes or content stability.
-  - `observe`: Inspect live interactive elements, scroll offsets, DPR, viewport, and screenshot.
+  - `observe`: Inspect live interactive elements, scroll offsets, DPR, and viewport.
   - `new_tab`, `select_tab`, `close_tab`: Tab management and multi-tab workflows.
+- **Validation**: every action is checked for its required target/params, risk floor, and a `timeoutMs` clamped to 100–60,000 ms. The planner additionally caps a plan at 3 steps.
+- **Retry safety**: only idempotent actions (`observe`, `scroll`, `wait`, `zoom`, `select_tab`) retry after a TIMEOUT. The backend waits ~10 s longer than the extension's own action deadline, so a late click is not resent as a duplicate.
 
 ### B. Visual Perception & Spatial Grounding
-- **DOM & Accessibility Extraction**: Scans visible buttons, links, inputs, and comboboxes.
+- **DOM & Accessibility Extraction**: Scans visible buttons, links, inputs, and comboboxes. Elements carry their real `tag` and `inputType`; values are not read during observation.
 - **Bounding Boxes**: Populates `{ x, y, width, height }` in CSS pixels for every element.
 - **Coordinate Grounding**:
   - Screenshots captured via Chrome debugger/tabs API normalize physical device pixels using devicePixelRatio (DPR).
-  - Hit-testing resolves coordinates to candidate DOM elements with `elementFromPoint(x, y)` fallback.
+  - Hit-testing resolves coordinates to candidate DOM elements with a pre-click `elementFromPoint` recheck.
+- **Screenshot Policy**: Screenshots stay local by default (`ALLOW_SCREENSHOTS=false`). Remote vision is opt-in and is suppressed whenever a sensitive field is present; the provider additionally enforces raster MIME types and a 4 MB cap.
 
 ### C. Local Privacy Layer & Prompt Injection Defense
 - **Local-First Sanitization**: `backend/app/privacy.py` executes on the local host before any payload is dispatched to remote AI models.
 - **Zero-Exposure Credential Policy**:
   - Input fields of type `password` or `hidden` have values stripped (`None`).
   - Fields containing tokens like `pwd`, `secret`, `token`, `api key`, `credit card`, `ssn` are wiped.
-  - Regex detection for credit cards, SSNs, and API keys automatically masks matching strings.
+  - Regex detection for credit cards, SSNs, emails, and API keys masks matching strings in titles, names, and values.
+  - URLs are stripped of userinfo and have sensitive query/fragment values masked.
 - **Fail-Closed Guarantee**: Any error during redaction immediately triggers `PrivacyViolation` and stops task execution. No partial or unvalidated payloads are transmitted.
-- **Prompt Injection Defense**: Untrusted page content is isolated within `<page-context untrusted="true">` blocks. Planner instructions frame page content as inert text, and hard schema validation discards model hallucinations or unapproved actions.
+- **Prompt Injection Defense**: Untrusted page content is isolated within `<page-context>`, `<working-memory>`, and `<history>` wrappers marked untrusted. Planner instructions frame page content as inert data, and hard schema validation discards model hallucinations or unapproved actions.
 
 ### D. Action Risk Classification & User Confirmation
 - **Risk Classes**:
   - `read` (automatic): `scroll`, `zoom`, `wait`, `observe`, `select_tab`.
   - `write` (monitored): `navigate`, `click`, `type`, `press`, `new_tab`, `close_tab`.
   - `sensitive` (confirmation required): Purchases, payments, irreversible form submissions, account changes.
-- **Human-in-the-Loop Gate**: When an action is classified as sensitive or user-defined high-risk, the agent halts, sets `awaiting_confirmation`, broadcasts the action payload to the frontend, and waits for explicit human approval.
+- **Human-in-the-Loop Gate**: The agent halts and sets `awaiting_confirmation` when the action is `sensitive`, the URL is a credential/payment surface (whole path segments such as `/login`, `/sign-in`, `/checkout`, `/billing`), or a WhatsApp QR login is required. Cancelling the task wakes the gate with a rejection so no approval can land afterwards.
+
+### E. Origin Isolation & Cancellation
+- **HTTP origin guard**: browser requests with a non-loopback, non-extension `Origin` are rejected with 403 before routing. CORS allows only `localhost`/`127.0.0.1` and `chrome-extension://`/`moz-extension://`.
+- **WebSocket guard**: `/ws/client` and `/ws/extension` close with policy code 1008 when the `Origin` is not allowlisted.
+- **Cancellation propagation**: `POST /api/task/{id}/cancel` sets a loop-level marker, wakes a pending confirmation, aborts any in-flight action result slot, and the loop checks the marker before planning, after confirmation, and after each execution. Terminal tasks are never rewritten. The UI replays a cancel that races task creation once the task id exists.
+
+### F. Bounded Agent Loop & Latency
+- **Observation reuse**: a successful action's post-action observation is validated with Pydantic and reused for the next plan, removing one observe round trip per step. It is still re-run through `classify_and_redact()` every iteration, and is discarded after a failed action, a malformed payload, `select_tab`, or `close_tab`.
+- **Cycle**: observe → plan → validate → confirm (if sensitive) → act → verify, capped at 25 steps, 3 retries, and 3 plan steps.
+- **Extension settling**: fixed post-action sleeps are replaced by a DOM-quiet `MutationObserver` settle, navigation-aware tab-status polling at 50 ms, hydration polling at 40 ms, and early exit once the page is interactive. A click that opens a new tab follows it so the cached observation matches the next active surface.
 
 ---
 
@@ -104,11 +118,33 @@ All 8 canonical SIH tasks are verified through automated regression suites (`bac
 
 ## 4. Benchmark Evaluation Metrics
 
-Executed via `backend/scripts/benchmark_eval.py`:
+Executed via `backend/scripts/benchmark_eval.py` against the deterministic mock harness:
+
 - **Task Completion Rate**: 100.0% (8/8)
 - **Correct Action Rate**: 100.0%
 - **Target-Selection Errors**: 0
 - **Recovery Success Rate**: 100.0% (1/1)
-- **Average Scenario Duration**: 45.2 ms
-- **Privacy Policy Violations**: 0 (Zero Leaks)
+- **Average Scenario Duration**: ~45–55 ms (in-process orchestration; varies by run)
+- **Privacy Policy Violations**: 0
 - **Unsupported Action Attempts**: 0
+
+---
+
+## 5. Verification & Provider Configuration
+
+| Suite | Command | Current result |
+|-------|---------|----------------|
+| Frontend | `npm test` | 25 checks (10 structure, 8 console, 7 sanitization) |
+| Extension | `cd extension && npm test` | 35 Vitest tests, 5 files |
+| Extension types | `cd extension && npx tsc --noEmit` | clean |
+| Backend | `cd backend && venv\Scripts\python.exe -m pytest tests -q` | 81 tests |
+| Benchmark | `backend\venv\Scripts\python.exe backend/scripts/benchmark_eval.py` | 8/8 |
+
+Provider selection (`NAVIGATOR_PROVIDER`, else auto-detected from keys, else `mock`):
+
+- **Gemini**: default `gemini-3.8-flash` (low thinking), fallbacks `gemini-3.6-flash`, `gemini-3.5-flash-lite`. Gemini 2.0 Flash is shut down and 2.5 Flash is unavailable to new callers.
+- **Groq**: default `openai/gpt-oss-120b`, fallbacks `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`. Groq's Llama 3.3/3.1 models are Enterprise-only and are not used as silent defaults.
+- **Mock**: deterministic offline plans for tests and demos.
+- `GEMINI_MODEL` / `GROQ_MODEL` optionally override the primary model without editing code.
+
+API keys are read from `backend/.env` or the environment and are never logged or returned by an endpoint.

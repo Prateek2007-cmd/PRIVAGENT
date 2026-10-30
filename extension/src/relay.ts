@@ -29,18 +29,38 @@ export class Relay {
       }
       if (typeof msg !== "object" || msg === null) return;
       const m = msg as { type?: string; taskId?: string; payload?: unknown };
-      if (!m.type || !INBOUND_TYPES.has(m.type) || typeof m.taskId !== "string") return;
+      if (!m.type || !INBOUND_TYPES.has(m.type) || typeof m.taskId !== "string" || !m.taskId) return;
       for (const h of this.handlers) {
-        h({ type: m.type as "EXECUTE_ACTION", taskId: m.taskId, payload: m.payload ?? {} });
+        try {
+          h({ type: m.type as "EXECUTE_ACTION", taskId: m.taskId, payload: m.payload ?? {} });
+        } catch {
+          // A handler bug must not tear down the socket listener.
+        }
       }
     });
+  }
+
+  /** Detach a socket that is closing so later sends cannot target it. */
+  detach(socket: WebSocket): void {
+    if (this.socket === socket) this.socket = null;
   }
 
   onMessage(cb: (m: InboundMessage) => void): void {
     this.handlers.push(cb);
   }
 
-  send(msg: RelayMessage): void {
-    this.socket?.send(JSON.stringify(msg));
+  /** Returns false (instead of throwing) when the relay is offline. */
+  send(msg: RelayMessage): boolean {
+    const ws = this.socket as (WebSocket & { readyState?: number }) | null;
+    if (!ws) return false;
+    const open = typeof WebSocket !== "undefined" ? WebSocket.OPEN : 1;
+    // Sockets without readyState (test doubles) are treated as open.
+    if (ws.readyState !== undefined && ws.readyState !== open) return false;
+    try {
+      ws.send(JSON.stringify(msg));
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

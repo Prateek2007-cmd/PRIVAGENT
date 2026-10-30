@@ -7,6 +7,7 @@ class FakeSocket {
   sent: string[] = [];
   handlers: Handler[] = [];
   open = true;
+  readyState = 1;
   send(data: string) {
     this.sent.push(data);
   }
@@ -52,5 +53,22 @@ describe("Relay", () => {
   it("sends no-op when unattached", () => {
     const relay = new Relay();
     expect(() => relay.send({ type: "PROGRESS", taskId: "x", payload: null })).not.toThrow();
+  });
+
+  it("does not throw or send on a closed socket", () => {
+    const sock = new FakeSocket();
+    const relay = new Relay();
+    relay.attach(sock as unknown as WebSocket);
+    sock.readyState = 3;
+    expect(relay.send({ type: "RESULT", taskId: "x", payload: {} })).toBe(false);
+    expect(sock.sent).toEqual([]);
+  });
+
+  it("stops sending after detach", () => {
+    const sock = new FakeSocket();
+    const relay = new Relay();
+    relay.attach(sock as unknown as WebSocket);
+    relay.detach(sock as unknown as WebSocket);
+    expect(relay.send({ type: "RESULT", taskId: "x", payload: {} })).toBe(false);
   });
 });

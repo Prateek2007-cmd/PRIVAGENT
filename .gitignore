@@ -28,3 +28,10 @@ backend/*.env
 Thumbs.db
 .vscode/
 .idea/
+
+# Local SQLite databases
+backend/data/*.db*
+*.db
+*.db-wal
+*.db-shm
+

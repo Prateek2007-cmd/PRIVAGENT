@@ -83,6 +83,7 @@ class BrowserObservation(BaseModel):
     scroll: dict[str, Any]
     dpr: float = 1.0
     screenshot: Optional[str] = None
+    tabs: Optional[list[dict[str, Any]]] = None
 
     model_config = {"populate_by_name": True}
 
@@ -113,6 +114,9 @@ class TaskPlan(BaseModel):
     steps: list[PlannedStep]
     answer: Optional[str] = None
     notes: Optional[str] = None
+    # Set by the planner guard when the run is honestly reported as incomplete.
+    # The loop turns this into a failed task instead of "Mission Completed".
+    blocked: bool = False
 
 
 class UserTask(BaseModel):
