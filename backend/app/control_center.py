@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from . import db
 from . import secrets as secrets_store
@@ -33,6 +33,64 @@ class MonitorInput(BaseModel):
     interval_seconds: int = Field(default=300, ge=60, le=604800)
     condition_type: Literal["price_drop", "below_price", "text_change", "regex", "element"] = "text_change"
     condition_params: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("condition_params")
+    @classmethod
+    def _coerce_condition_numerics_field(cls, v: Any) -> dict[str, Any]:
+        # Stream 3 (S2 Failure E durable fix): the write boundary
+        # coerces the known numeric condition keys, so a JSON string
+        # can never be stored and crash a downstream `:g` format.
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            return v
+        return _coerce_condition_numerics(v)
+
+
+# Stream 3 (S2 Failure E — durable fix; S2 hardened the read sites
+# with _as_float, this stops new string numerics at the write path):
+# the missions API stored condition_params verbatim, so
+# POST /api/control/missions with {"threshold": "5000"} stored the
+# STRING "5000" — and every downstream `:g` format ("alerting below
+# ₹{threshold:g}") crashed on it, while the same-settings comparison
+# ("5000" != 5000.0) misfired. The known numeric condition keys are
+# coerced to float here, at the model boundary, so the stored JSON
+# only ever carries numbers for them. A non-numeric value for one is
+# a 422, not a stored time bomb; other keys (target, pattern, ...)
+# pass through untouched, and an explicit null drops the key.
+_NUMERIC_CONDITION_PARAMS = ("threshold", "min_percent")
+
+
+def _coerce_condition_numerics(params: dict[str, Any]) -> dict[str, Any]:
+    """Coerce threshold/min_percent to float in a copy of *params*.
+
+    Numeric strings ("5000") become floats; ints/floats become floats;
+    an explicit null drops the key. A bool or any other non-numeric
+    value for a numeric key raises ValueError (the endpoint turns it
+    into a 422).
+    """
+    coerced = dict(params or {})
+    for key in _NUMERIC_CONDITION_PARAMS:
+        if key not in coerced:
+            continue
+        value = coerced[key]
+        if value is None:
+            del coerced[key]
+            continue
+        if isinstance(value, bool):
+            raise ValueError(f"condition {key!r} must be a number, not a boolean")
+        if isinstance(value, (int, float)):
+            coerced[key] = float(value)
+            continue
+        if isinstance(value, str):
+            try:
+                coerced[key] = float(value.strip())
+            except ValueError:
+                raise ValueError(
+                    f"condition {key!r} must be a number, got {value!r}") from None
+            continue
+        raise ValueError(f"condition {key!r} must be a number, got {value!r}")
+    return coerced
 
 
 class MissionUpdate(BaseModel):

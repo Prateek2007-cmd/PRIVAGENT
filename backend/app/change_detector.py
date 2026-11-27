@@ -27,6 +27,17 @@ _PRICE_CONTEXT_RES = [
 ]
 
 
+# A currency amount next to "Min"/"Max" is a price-filter bound
+# ("Price … Min ₹10000 ₹15000 …" in a search-page sidebar), never
+# the watched price. The old code returned the first contextual
+# match unconditionally, so a Flipkart search page baselined at
+# the ₹10,000 filter minimum while the real listings were ₹89,100
+# — and a 10%-drop condition then evaluated against a fabricated
+# ₹10,000. Filter-bound candidates are skipped; when nothing
+# survives, the price is honestly unknown (None), never a guess.
+_FILTER_BOUND_RE = re.compile(r"\b(?:min|max)\b", re.I)
+
+
 def _extract_price(observation: dict[str, Any], text: str) -> tuple[float | None, str | None]:
     """The watched price for an observation — structured first,
     contextual second, unambiguous-single-amount last.
@@ -35,7 +46,8 @@ def _extract_price(observation: dict[str, Any], text: str) -> tuple[float | None
        monitor_check: JSON-LD / microdata / meta / JSON product
        API), already validated there.
     2. A currency amount adjacent to a price word ("selling price
-       ₹4,199", "Price: ₹4,199").
+       ₹4,199", "Price: ₹4,199") — EXCEPT a filter bound ("Price …
+       Min ₹10,000" on a search page), which is skipped.
     3. The ONLY currency amount in the whole text (unambiguous —
        a one-line browser observation such as "₹100").
     4. None — several competing amounts and no structure means the
@@ -46,14 +58,23 @@ def _extract_price(observation: dict[str, Any], text: str) -> tuple[float | None
     if isinstance(structured, (int, float)) and structured > 0:
         return float(structured), (observation.get("price_info") or {}).get("source") if isinstance(observation.get("price_info"), dict) else None
     for pattern in _PRICE_CONTEXT_RES:
-        match = pattern.search(text)
-        if match:
+        for match in pattern.finditer(text):
             try:
                 value = float(match.group(1).replace(",", ""))
             except (ValueError, IndexError):
                 continue
-            if 0 < value <= 10_000_000:
-                return value, "contextual"
+            if not 0 < value <= 10_000_000:
+                continue
+            # The span from the price word to the amount must not
+            # carry filter language: "Price … Min ₹10000" is the
+            # filter sidebar, not a product price. The check covers
+            # a few characters before the match too — the third
+            # pattern starts AT the amount, so its "Min" sits just
+            # outside the span.
+            window = text[max(0, match.start() - 12):match.end()]
+            if _FILTER_BOUND_RE.search(window):
+                continue
+            return value, "contextual"
     amounts = _PRICE.findall(text)
     if len(amounts) == 1:
         try:

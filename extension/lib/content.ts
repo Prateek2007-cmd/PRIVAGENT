@@ -1151,8 +1151,18 @@ function extractReadableText(maxLen = 4000): string {
     // Task 8: readable-text elements are generic (headings, paragraphs,
     // tables, list items, labelled data) — no per-retailer price/title
     // classes or hashed class names.
+    // Stream 4 (form-result grounding): `li` and `article` are
+    // readable-text containers too. Search/booking results are
+    // commonly rendered as plain <li> rows (service + fare + times)
+    // or <article> cards (product name + price) with no heading or
+    // <p> inside — without them the observation's page text showed
+    // the results heading and the action buttons but NONE of the
+    // result content, so the planner re-filled the search form
+    // forever believing the search had produced nothing (live
+    // YatraDemo run: 50 steps, no price ever reported). `div` stays
+    // out: it is too broad and would flood the 4000-char budget.
     const elements = root.querySelectorAll(
-      'h1, h2, h3, h4, p, table, [data-feature-name], ' +
+      'h1, h2, h3, h4, p, table, li, article, [data-feature-name], ' +
       '[role="listitem"], ' +
       '[class*="text-label-"], [class*="text-sd-"], [class*="ranking"], [class*="rating"], [data-difficulty], [class*="badge"], [class*="stat"]'
     );

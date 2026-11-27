@@ -219,6 +219,32 @@ def _finalize_research_artifacts(
         if not pkg_data:
             return None
 
+        # Stream 3 (S5 F1 / B5 — no artifact may be marked completed
+        # with 0 sources): refuse to render a deliverable from an
+        # empty research package. A package with no sources, evidence
+        # or tables has nothing verified to report; rendering it
+        # produced an empty Technical_Analysis.pdf (0 sources, 0
+        # claims) that the caller marked "completed". Returning None
+        # makes the caller fail honestly instead. This mirrors the
+        # guard already in _finalize_research_summary below — the
+        # direct _finalize_research_artifacts callers in agentLoop
+        # bypassed that summary guard.
+        if isinstance(pkg_data, dict):
+            _pkg_evidence = (pkg_data.get("sources") or pkg_data.get("evidence")
+                             or pkg_data.get("tables"))
+        else:
+            _pkg_evidence = (getattr(pkg_data, "sources", None)
+                             or getattr(pkg_data, "evidence", None)
+                             or getattr(pkg_data, "tables", None))
+        if not _pkg_evidence:
+            errors = working_memory.setdefault("research_artifact_errors", [])
+            errors.append({
+                "format": working_memory.get("requested_format") or "report",
+                "error": "research package has no verified sources, "
+                         "evidence or tables — nothing to render",
+            })
+            return None
+
         pkg = ResearchKnowledgePackage.from_dict(pkg_data) if isinstance(pkg_data, dict) else pkg_data
 
         # Enrich package with planner synthesis if available

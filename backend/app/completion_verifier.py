@@ -9,6 +9,7 @@ Enforces strict verification rules:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import urllib.parse
@@ -250,6 +251,30 @@ def classify_instruction_type(instruction: str) -> str:
     ):
         return "CONVERSATIONAL"
 
+    # Stream 3 (CONTRACTS4 §3 — the price-watch wart): a monitoring
+    # instruction ("watch the price of X ... below ₹5000") is NOT a
+    # research product. Without this, the word "price" in the research
+    # regex below labels every price-watch ask RESEARCH, and Rule 6
+    # then prepends "Research incomplete: No substantive research
+    # sources were examined" to a watch confirmation that never asked
+    # for research — the NL task ends "failed" while the watch itself
+    # works (FINAL_DELIVERY §4.3). Only a genuine monitor directive
+    # is carved out (MONITORING_DIRECTIVE_PATTERN / watch control),
+    # never the broad companion detector — that detector also matches
+    # schedule/job-control instructions, which keep their own paths.
+    # A compound find-now + track ask stays research: it asks for
+    # findings first, and the track is a follow-up.
+    from .continuous_monitoring_companion import (
+        MONITORING_DIRECTIVE_PATTERN,
+        _WATCH_CONTROL_RE,
+        _is_compound_find_and_track,
+    )
+    if not _is_compound_find_and_track(instruction) and (
+        MONITORING_DIRECTIVE_PATTERN.search(instruction)
+        or _WATCH_CONTROL_RE.search(instruction)
+    ):
+        return "CONVERSATIONAL"
+
     # Research patterns
     research_pattern = re.compile(
         r"\b(?:price|search\s+for|find|look\s+up|extract|check\s+price|specs|compare)\b",
@@ -328,6 +353,748 @@ def verify_navigation_destination(
     return False, "No navigation action was executed or observed."
 
 
+# ---------------------------------------------------------------------------
+# Stream 3 (CONTRACTS4 §3): ONE objective-type completion verifier.
+#
+# Decision (documented per CONTRACTS4 §3): the single canonical
+# verifier is THIS module — ``backend/app/completion_verifier.py`` —
+# already called by agentLoop at its three completion sites.
+# ``backend/app/completion.py`` is a thin alias that re-exports it;
+# there is no second implementation. Every objective type below is
+# checked against the evidence CONTRACTS4 §3 names, by re-reading the
+# persisted row / file / receipt — never by trusting a reply sentence.
+# ---------------------------------------------------------------------------
+
+# Machine-readable watch marker the monitoring companion appends to
+# creation / update / already-running confirmations.
+_WATCH_MARKER_RE = re.compile(r"privagent-watch:\s*([0-9a-fA-F-]{8,})")
+
+# Task states (CONTRACTS4 §4). The backend record is the only source
+# of truth; the frontend derives its display from it (see
+# src/agentApp.ts — no frontend-side completion inference).
+TASK_STATES = ("running", "awaiting_input", "awaiting_approval",
+               "completed", "partially_completed", "blocked", "failed",
+               "cancelled")
+
+
+def suggest_next_actions(reason: str, intent: str = "") -> list[str]:
+    """Next actions generated from the ACTUAL failure reason.
+
+    CONTRACTS4 §3: after a failure the suggested actions must come
+    from the failure reason, not from a static list. Each branch
+    quotes the specific missing piece the reason names; the fallback
+    carries the reason verbatim so the user can act on it.
+    """
+    reason = reason or "unknown failure"
+    low = reason.lower()
+    if "no product" in low or "don't have a product" in low or "which product" in low:
+        return ["Tell me the product name, or paste its product page link."]
+    if "can't watch" in low or "url refused" in low or "disallowed scheme" in low:
+        return ["Give me a public http(s) product page URL for the product."]
+    if "does not resolve" in low or "dns" in low:
+        return ["Check the link is spelled right, then ask me to watch it again — "
+                "a page that does not resolve yet is retried on schedule."]
+    if "identity mismatch" in low or "not the product" in low:
+        return ["Check the link is the right product page, or correct the product name."]
+    if "no active email" in low:
+        return ["Set up email monitoring first, e.g. 'scan my mails and notify me for important mails'."]
+    if "no scheduled job" in low or "no watch" in low or "couldn't find a watch" in low:
+        return ["List the current watches/jobs to see their names or IDs, then retry by ID."]
+    if "no substantive research sources" in low or "no comparison results" in low:
+        return ["Ask me to search for it, naming the sites or sources to check."]
+    if "deliverable" in low and ("not generated" in low or "does not exist" in low):
+        return ["Ask me to generate the file again, naming the format (PDF, Excel, Word)."]
+    if "no verified browser observation" in low or "i'll search" in low:
+        return ["Make sure the browser extension is connected, then retry the task."]
+    if "baseline pending" in low:
+        return ["Wait for the first scheduled check — it records the baseline automatically.",
+                "Or say 'check it now' to take the baseline immediately."]
+    if "receipt" in low:
+        return ["Retry the action — it did not produce an execution receipt, so nothing was written."]
+    return [f"Retry with more detail — the failure was: {reason}",
+            "If it keeps failing, tell me what you expected to happen."]
+
+
+def _extract_watch_id(message: str) -> str | None:
+    m = _WATCH_MARKER_RE.search(message or "")
+    return m.group(1) if m else None
+
+
+def _is_monitor_completion_case(instruction: str, message: str) -> bool:
+    """True when this turn is a monitoring outcome to verify against
+    the watch table — a confirmation carrying the watch marker, a
+    genuine monitor directive, or a watch-control ask. Schedule/job
+    instructions and compound find-now + track asks are excluded:
+    they have their own verification paths."""
+    if _extract_watch_id(message or ""):
+        return True
+    try:
+        from .continuous_monitoring_companion import (
+            MONITORING_DIRECTIVE_PATTERN,
+            _WATCH_CONTROL_RE,
+            _is_compound_find_and_track,
+        )
+    except Exception:
+        return False
+    if _is_compound_find_and_track(instruction or ""):
+        return False
+    return bool(MONITORING_DIRECTIVE_PATTERN.search(instruction or "")
+                or _WATCH_CONTROL_RE.search(instruction or ""))
+
+
+def _read_watch_row(mission_id: str, db_path: str | None) -> dict | None:
+    from . import db
+
+    db.init_db(db_path)
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# Stream 3 (S5 F6): only a price taken from a structured product
+# field counts as a VERIFIED baseline price. A "contextual" price is
+# _extract_price's guess from prose near a price word on a
+# multi-listing page (e.g. ₹10,000 read off a Flipkart search page
+# whose real listings were ₹89,100+); "single-amount" is the only
+# amount anywhere in the text. Either may be stored as the row's
+# observed price, but neither may be PRESENTED as the verified
+# baseline price — the completion message must say so honestly.
+_STRUCTURED_PRICE_SOURCES = {"json-ld", "microdata", "meta", "price-element", "json-api"}
+
+
+def _baseline_price(row: dict | None) -> tuple[Any, str | None, bool]:
+    """(price, source, verified) for a monitor row's stored baseline."""
+    if not row:
+        return None, None, False
+    try:
+        state = json.loads(row.get("last_state_json") or "{}")
+    except Exception:
+        state = {}
+    price = state.get("price")
+    source = state.get("price_source")
+    verified = price is not None and source in _STRUCTURED_PRICE_SOURCES
+    return price, source, verified
+
+
+def _unverified_price_note(row: dict | None) -> str:
+    """Honest note when the stored baseline price is unverified, else ''."""
+    price, source, verified = _baseline_price(row)
+    if price is None or verified:
+        return ""
+    return (f" Note: the recorded baseline price (₹{price:g}) is unverified — "
+            f"it was read from page text ({source}), not from structured "
+            f"product data. The first structured check will confirm it.")
+
+
+_PRICE_CONDITIONS = ("price_drop", "below_price", "daily_price")
+
+
+def _no_baseline_price_note(row: dict | None) -> str:
+    """Honest note when a price-based watch has a baseline but no
+    price could be read from the page: the %-drop / below-price
+    condition can never evaluate, so the message must say so
+    instead of leaving the user assuming a price was recorded.
+    A text-change watch has no price to record, so it gets no note."""
+    if not row:
+        return ""
+    if str(row.get("condition_type") or "") not in _PRICE_CONDITIONS:
+        return ""
+    price, _source, _verified = _baseline_price(row)
+    if price is not None:
+        return ""
+    return (" Note: no baseline price could be read from the page, so "
+            "price alerts stay off until a real price is recorded — "
+            "the next scheduled check will try again.")
+
+
+def _stated_interval_seconds(text: str, *, last: bool = False) -> int | None:
+    """Seconds of the (first|last) 'every N minutes/hours' phrase in
+    *text*, or None when it states no absolute interval. Unlike
+    ``_parse_interval_seconds`` this does NOT invent the 300 s default:
+    a relative update ("twice as often") states no absolute interval
+    in the instruction, and the default would falsely fail the row
+    (S5 D10 — the fixed handler's reply states the new cadence, "now
+    checking every 30 minutes", which is what the row is verified
+    against)."""
+    from .continuous_monitoring_companion import _INTERVAL_RE, _WORD_NUMBERS
+
+    matches = list(_INTERVAL_RE.finditer(text or ""))
+    if not matches:
+        return None
+    m = matches[-1] if last else matches[0]
+    num_s, unit = m.group(1), m.group(2).lower()
+    num = 1 if num_s is None else (int(num_s) if num_s.isdigit() else _WORD_NUMBERS.get(num_s.lower(), 5))
+    seconds = num * 3600 if unit.startswith("hour") else num * 60
+    return max(60, seconds)
+
+
+# The watch title a control reply names ("Paused the watch
+# **Price Watch: Iphone 17**", "The watch **X** is already
+# paused") — the reply is the handler's own record of which watch
+# it acted on.
+_CONTROL_REPLY_TITLE_RE = re.compile(
+    r"(?:Paused|Resumed|Cancelled) the watch \*\*(.+?)\*\*"
+    r"|The watch \*\*(.+?)\*\* is already (?:paused|active)",
+    re.IGNORECASE,
+)
+
+
+def _control_reply_title(message: str) -> str | None:
+    m = _CONTROL_REPLY_TITLE_RE.search(message or "")
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or "").strip() or None
+
+
+def _resolve_control_watch(instruction: str, ref: str | None, message: str,
+                           chat_id: str | None,
+                           db_path: str | None) -> tuple[dict | None, str]:
+    """The watch row a control turn acted on, as a plain dict.
+
+    Returns ``(row, status)`` with status "resolved" |
+    "clarification" | "none" | "unresolved". Resolution order, per
+    action:
+
+    * pause / resume: the working context (``resolve_watch_target``
+      over the chat's synced watches — the exact path the handler
+      uses), then the title the reply itself names, then the regex
+      referent. The regex capture alone used to be the only path,
+      so "Pause the first watch." resolved ref='.' and a successful
+      pause was reported failed (M1).
+    * cancel: the reply title first — after a delete the working
+      context no longer holds the cancelled watch, so resolving
+      through it would point at a surviving watch — then the regex
+      referent. A cancel whose target cannot be found at all still
+      returns ("resolved", None): the row being gone IS the
+      verified outcome for a cancel.
+    """
+    from .continuous_monitoring_companion import _resolve_watch
+
+    action_m = re.search(r"\b(pause|resume|cancel|delete|stop)\b",
+                         instruction or "", re.IGNORECASE)
+    action = action_m.group(1).lower() if action_m else ""
+    clean_ref = (ref or "").strip().strip("\"'").rstrip(".,;:!?").strip() or None
+
+    def _by_title(title: str | None) -> dict | None:
+        if not title:
+            return None
+        found, _amb = _resolve_watch(title, None, db_path)
+        return dict(found) if found is not None else None
+
+    def _by_ref() -> dict | None:
+        if not clean_ref:
+            return None
+        found, _amb = _resolve_watch(clean_ref, None, db_path)
+        return dict(found) if found is not None else None
+
+    def _by_context() -> tuple[dict | None, str]:
+        if not chat_id:
+            return None, "unresolved"
+        from .working_context import load_working_context, resolve_watch_target
+
+        ctx = load_working_context(chat_id, db_path)
+        result = resolve_watch_target(ctx, instruction or "")
+        if result["status"] == "resolved" and result.get("watch"):
+            row = _read_watch_row(str(result["watch"].get("watch_id") or ""), db_path)
+            return row, "resolved"
+        return None, result["status"]  # "clarification" | "none"
+
+    if action in ("cancel", "delete", "stop"):
+        row = _by_title(_control_reply_title(message))
+        if row is not None:
+            return row, "resolved"
+        row = _by_ref()
+        if row is not None:
+            return row, "resolved"
+        return None, "resolved"  # no row: the cancel outcome is "gone"
+    row, status = _by_context()
+    if status == "resolved":
+        return row, "resolved"
+    if status in ("clarification", "none"):
+        return None, status
+    row = _by_title(_control_reply_title(message))
+    if row is not None:
+        return row, "resolved"
+    row = _by_ref()
+    if row is not None:
+        return row, "resolved"
+    return None, "unresolved"
+
+
+def _verify_monitor_completion(instruction: str, message: str,
+                               db_path: str | None = None,
+                               chat_id: str | None = None) -> VerificationResult:
+    """CONTRACTS4 §3 monitor criteria, verified by re-reading the DB.
+
+    Completed requires: a persisted watch row with the correct
+    product/url, interval_seconds and condition — plus a baseline
+    observation row, or an honest ``baseline_pending`` state (never a
+    claimed baseline that does not exist). A watch-control ask is
+    verified the same way: pause/resume by the row's status on
+    re-read, cancel by the row being gone.
+    """
+    from .continuous_monitoring_companion import (
+        _WATCH_CONTROL_RE,
+        parse_below_price,
+        parse_daily_time,
+        parse_percent_drop,
+    )
+
+    msg = (message or "").strip()
+    intent = "monitor_product"
+    # -- Watch-control asks (pause / resume / cancel): no marker in
+    # the reply; resolve the watch the instruction names and verify
+    # the row's state on re-read. Cancel DELETES the row, so a missing
+    # row after a "Cancelled" reply IS the verified outcome.
+    ctrl = _WATCH_CONTROL_RE.search(instruction or "")
+    if ctrl and not _extract_watch_id(msg):
+        action = ctrl.group(1).lower()
+        ref = (ctrl.group(2) or "").strip() or None
+        if "couldn't find a watch" in msg or msg.startswith("Which watch?") \
+                or "more than one watch" in msg:
+            return VerificationResult(
+                state="awaiting_input", message=msg, is_verified=False,
+                reason="Watch control needs the watch's name or id.",
+            )
+        # M1: resolve through the working context — the same path the
+        # handler uses — never from the regex capture alone. The old
+        # code fed the raw capture ("Pause the first watch." -> '.')
+        # to _resolve_watch, so a successful pause was reported
+        # failed with a self-contradictory message. Rows are plain
+        # dicts here: _resolve_watch returns sqlite3.Row, which has
+        # no .get() and crashed this branch whenever a row WAS found.
+        row, resolve_status = _resolve_control_watch(
+            instruction, ref, msg, chat_id, db_path)
+        if resolve_status in ("clarification", "none"):
+            return VerificationResult(
+                state="awaiting_input", message=msg, is_verified=False,
+                reason="Watch control needs the watch's name or id.",
+            )
+        if action in ("cancel", "delete", "stop"):
+            if row is None:
+                return VerificationResult(
+                    state="completed", message=msg, is_verified=True,
+                    reason="Watch row is gone on re-read — cancel verified.")
+            return VerificationResult(
+                state="failed",
+                message=f"Cancel did not persist: the watch row still exists.\n\n{msg}",
+                is_verified=False,
+                reason="Watch row still present after cancel.",
+            )
+        if row is None:
+            display_ref = (ref or "").strip().strip("\"'").rstrip(".,;:!?").strip()
+            return VerificationResult(
+                state="failed",
+                message=f"Watch control failed: no watch row found for {display_ref or 'the watch you named'!r}.\n\n{msg}",
+                is_verified=False,
+                reason="No watch row found for the named watch.",
+            )
+        want = "paused" if action == "pause" else "active"
+        if row.get("status") == want:
+            return VerificationResult(
+                state="completed", message=msg, is_verified=True,
+                reason=f"Watch status is '{want}' on re-read.")
+        return VerificationResult(
+            state="failed",
+            message=f"Watch {action} did not persist: status is {row.get('status')!r}, not {want!r}.\n\n{msg}",
+            is_verified=False,
+            reason=f"Watch status is {row.get('status')!r} on re-read.",
+        )
+
+    # -- Creation / already-running / updated confirmations.
+    watch_id = _extract_watch_id(msg)
+    if not watch_id:
+        # The handler asked for what is missing, or refused the URL —
+        # that is a clarification / honest failure, never a completion.
+        if "don't have a product to watch yet" in msg:
+            return VerificationResult(
+                state="awaiting_input", message=msg, is_verified=False,
+                reason="No product to watch — clarification needed.",
+            )
+        if "can't watch" in msg:
+            return VerificationResult(
+                state="failed", message=msg, is_verified=False,
+                reason="Monitor URL refused by the URL gate.",
+            )
+        return VerificationResult(
+            state="failed",
+            message=f"Monitoring incomplete: no watch was created and no watch id was returned.\n\n{msg}",
+            is_verified=False,
+            reason="No watch marker and no watch row to verify.",
+        )
+    row = _read_watch_row(watch_id, db_path)
+    if row is None:
+        return VerificationResult(
+            state="failed",
+            message=f"Watch confirmation carried id {watch_id}, but no persisted watch row exists.\n\n{msg}",
+            is_verified=False,
+            reason="Watch row missing on re-read.",
+        )
+    if row.get("status") != "active":
+        return VerificationResult(
+            state="failed",
+            message=f"Watch {watch_id} exists but its status is {row.get('status')!r}, not active.\n\n{msg}",
+            is_verified=False,
+            reason=f"Watch status is {row.get('status')!r}.",
+        )
+    # Interval: a daily cron watch stores interval 86400 + a cron;
+    # anything else stores the parsed "every N" cadence. A relative
+    # update ("twice as often") states NO absolute interval in the
+    # instruction — the new cadence is the one the reply states ("now
+    # checking every 30 minutes"); verify the row against that, never
+    # against the 300 s default the parser returns for "no interval
+    # found", or every true relative update would fail (S5 D10).
+    # The reply's LAST interval phrase is the new cadence ("was
+    # checking every hour, now checking every 30 minutes").
+    daily = parse_daily_time(instruction)
+    if daily is not None:
+        cron, _display = daily
+        if (row.get("schedule_cron") or "") != cron or row.get("trigger_type") != "cron":
+            return VerificationResult(
+                state="failed",
+                message=f"Watch schedule mismatch: stored cron {row.get('schedule_cron')!r}, expected {cron!r}.\n\n{msg}",
+                is_verified=False,
+                reason="Stored cron does not match the requested daily time.",
+            )
+    else:
+        want_interval = _stated_interval_seconds(instruction) \
+            or _stated_interval_seconds(msg, last=True)
+        if want_interval is None:
+            return VerificationResult(
+                state="failed",
+                message=f"Watch interval cannot be verified: neither the instruction nor the reply states the new cadence.\n\n{msg}",
+                is_verified=False,
+                reason="No interval stated to verify against the stored row.",
+            )
+        if row.get("interval_seconds") != want_interval:
+            return VerificationResult(
+                state="failed",
+                message=f"Watch interval mismatch: stored every {row.get('interval_seconds')}s, "
+                        f"requested every {want_interval}s.\n\n{msg}",
+                is_verified=False,
+                reason="Stored interval does not match the requested cadence.",
+            )
+    # Condition: an absolute threshold stays absolute, a percent stays
+    # a percent — the stored row must carry the requested one.
+    below = parse_below_price(instruction)
+    percent = parse_percent_drop(instruction)
+    params: dict = {}
+    try:
+        params = json.loads(row.get("condition_params") or "{}")
+    except Exception:
+        params = {}
+    if below is not None:
+        if row.get("condition_type") != "below_price" or params.get("threshold") != below:
+            return VerificationResult(
+                state="failed",
+                message=f"Watch condition mismatch: stored {row.get('condition_type')} {params}, "
+                        f"requested below ₹{below:g}.\n\n{msg}",
+                is_verified=False,
+                reason="Stored condition is not the requested absolute-price threshold.",
+            )
+    elif percent is not None:
+        if row.get("condition_type") != "price_drop" or (params.get("min_percent") or 0) != percent:
+            return VerificationResult(
+                state="failed",
+                message=f"Watch condition mismatch: stored {row.get('condition_type')} {params}, "
+                        f"requested a {percent:g}% drop.\n\n{msg}",
+                is_verified=False,
+                reason="Stored condition is not the requested percent drop.",
+            )
+    # URL: when the instruction names a URL, the row must watch it.
+    url_m = re.search(r"https?://[^\s\"'<>)]+", instruction or "")
+    if url_m and (row.get("target_url") or "").rstrip("/") != url_m.group(0).rstrip("/"):
+        return VerificationResult(
+            state="failed",
+            message=f"Watch target mismatch: stored {row.get('target_url')!r}, requested {url_m.group(0)!r}.\n\n{msg}",
+            is_verified=False,
+            reason="Stored target URL does not match the requested URL.",
+        )
+    # Baseline: a recorded state hash is a real baseline; otherwise
+    # the task still completes (the watch is live and the first tick
+    # records it) but the message must say baseline_pending honestly.
+    # S5 F6: a stored price from page text ("contextual") is NOT a
+    # verified baseline price — the message says so, never presenting
+    # the guessed price as confirmed.
+    if row.get("last_state_hash"):
+        return VerificationResult(
+            state="completed", message=f"{msg}{_unverified_price_note(row)}{_no_baseline_price_note(row)}", is_verified=True,
+            reason="Watch row active with correct product/url, interval and condition; baseline recorded.",
+        )
+    return VerificationResult(
+        state="completed",
+        message=f"{msg}\n\nBaseline pending — the first scheduled check has not run yet, so no price is recorded for this watch so far.",
+        is_verified=True,
+        reason="Watch row active with correct product/url, interval and condition; baseline_pending (honest).",
+    )
+
+
+def verify_objective_completion(objective: Any, evidence: dict | None = None,
+                                db_path: str | None = None) -> VerificationResult:
+    """Verify one structured objective against CONTRACTS4 §3.
+
+    ``objective`` is Stream 1's Objective dataclass or a dict with
+    the §1 fields (``primary_intent``, ``entities``, ``condition``,
+    ``interval_seconds``, ``target_url``). ``evidence`` carries what
+    the pipeline produced — watch/job ids, search results, sources,
+    artifact paths, receipts — and every claim in it is checked by
+    re-reading the persisted row / file / receipt. A missing or
+    unverifiable claim is ``failed`` (or ``blocked`` with the
+    blocker), never ``completed``. A bare promise sentence
+    ("I'll search") is never completion.
+    """
+    from pathlib import Path as _Path
+
+    ev = evidence or {}
+    intent = ""
+    if isinstance(objective, dict):
+        intent = str(objective.get("primary_intent") or "")
+    else:
+        intent = str(getattr(objective, "primary_intent", "") or "")
+    if not intent:
+        return VerificationResult(
+            state="failed", message="No objective intent to verify.",
+            is_verified=False, reason="Objective has no primary_intent.")
+
+    def _fail(msg: str, reason: str) -> VerificationResult:
+        return VerificationResult(state="failed", message=msg,
+                                  is_verified=False, reason=reason)
+
+    # -- Search: ≥1 real result with title+url, returned to the user.
+    if intent == "simple_search":
+        results = ev.get("results") or []
+        real = [r for r in results if isinstance(r, dict)
+                and r.get("title") and r.get("url")]
+        if not real:
+            return _fail("Search incomplete: no real search results with title and URL were returned.",
+                         "No search results.")
+        return VerificationResult(
+            state="completed",
+            message=f"Found {len(real)} result(s).",
+            is_verified=True, reason=f"{len(real)} search result(s) with title+url.")
+
+    # -- Research: ≥3 accepted sources, evidence table, artifact file
+    # read-back verified when one was requested.
+    if intent == "research":
+        sources = ev.get("sources") or []
+        accepted = [s for s in sources if isinstance(s, dict) and s.get("url")]
+        if len(accepted) < 3:
+            return _fail(f"Research incomplete: only {len(accepted)} accepted source(s); at least 3 are required.",
+                         f"Only {len(accepted)} accepted source(s).")
+        if not ev.get("evidence_table"):
+            return _fail("Research incomplete: no evidence table was produced.",
+                         "No evidence table.")
+        art = ev.get("artifact_path")
+        if ev.get("artifact_requested") and art:
+            p = _Path(str(art))
+            if not p.exists() or p.stat().st_size == 0:
+                return _fail(f"Research deliverable incomplete: {art} does not exist or is empty.",
+                             "Artifact file missing or empty.")
+            if ev.get("artifact_must_contain") and ev["artifact_must_contain"] not in p.read_text(errors="replace"):
+                return _fail("Research deliverable incomplete: the file does not contain the requested content.",
+                             "Artifact lacks the requested content.")
+        return VerificationResult(
+            state="completed",
+            message=f"Research completed across {len(accepted)} accepted sources.",
+            is_verified=True, reason=f"{len(accepted)} accepted sources + evidence table.")
+
+    # -- Monitoring: persisted watch row, correct config, baseline or
+    # honest baseline_pending.
+    if intent in ("monitor_product", "monitor_website", "monitor_new_listings", "monitor_inbox"):
+        watch_id = ev.get("watch_id")
+        if not watch_id:
+            return _fail("Monitoring incomplete: no watch was created (no watch id in evidence).",
+                         "No watch id.")
+        row = _read_watch_row(str(watch_id), db_path)
+        if row is None:
+            return _fail(f"Monitoring incomplete: no persisted watch row for {watch_id}.",
+                         "Watch row missing on re-read.")
+        if row.get("status") != "active":
+            return _fail(f"Monitoring incomplete: watch {watch_id} status is {row.get('status')!r}, not active.",
+                         f"Watch status is {row.get('status')!r}.")
+        expected = ev.get("expected") or {}
+        if expected.get("target_url") and (row.get("target_url") or "") != expected["target_url"]:
+            return _fail("Monitoring incomplete: stored target URL does not match the objective.",
+                         "Target URL mismatch.")
+        if expected.get("interval_seconds") is not None and \
+                row.get("interval_seconds") != expected["interval_seconds"]:
+            return _fail("Monitoring incomplete: stored interval does not match the objective.",
+                         "Interval mismatch.")
+        if expected.get("condition_type") and row.get("condition_type") != expected["condition_type"]:
+            return _fail("Monitoring incomplete: stored condition does not match the objective.",
+                         "Condition mismatch.")
+        baseline = ev.get("baseline")
+        if isinstance(baseline, dict) and baseline.get("status") == "baseline_pending":
+            return VerificationResult(
+                state="completed",
+                message=f"Watch {watch_id} is active with the correct config. "
+                        f"Baseline pending ({baseline.get('reason') or 'first check not run yet'}).",
+                is_verified=True,
+                reason="Watch row correct on re-read; baseline_pending (honest).")
+        if row.get("last_state_hash") or (isinstance(baseline, dict) and baseline.get("price") is not None):
+            # S5 F6: a stored price from page text ("contextual") is
+            # not a verified baseline price — say so, never present
+            # the guessed price as confirmed.
+            return VerificationResult(
+                state="completed",
+                message=f"Watch {watch_id} is active with a recorded baseline.{_unverified_price_note(row)}{_no_baseline_price_note(row)}",
+                is_verified=True, reason="Watch row correct on re-read; baseline recorded.")
+        return VerificationResult(
+            state="completed",
+            message=f"Watch {watch_id} is active with the correct config. Baseline pending — the first scheduled check has not run yet.",
+            is_verified=True,
+            reason="Watch row correct on re-read; baseline_pending (honest).")
+
+    # -- Monitor updates: the named watch row actually changed.
+    if intent in ("update_monitor", "pause_monitor", "resume_monitor"):
+        watch_id = ev.get("watch_id")
+        want = {"pause_monitor": "paused", "resume_monitor": "active"}.get(intent)
+        if not watch_id:
+            return _fail("Monitor update incomplete: no watch id in evidence.", "No watch id.")
+        row = _read_watch_row(str(watch_id), db_path)
+        if row is None:
+            return _fail("Monitor update incomplete: watch row missing on re-read.", "Watch row missing.")
+        if want and row.get("status") != want:
+            return _fail(f"Monitor update incomplete: status is {row.get('status')!r}, not {want!r}.",
+                         f"Watch status is {row.get('status')!r}.")
+        if intent == "update_monitor" and ev.get("interval_seconds") is not None and \
+                row.get("interval_seconds") != ev["interval_seconds"]:
+            return _fail("Monitor update incomplete: stored interval unchanged on re-read.",
+                         "Interval unchanged.")
+        return VerificationResult(
+            state="completed", message=f"Watch {watch_id} updated and verified by re-read.",
+            is_verified=True, reason="Watch row matches on re-read.")
+    if intent == "cancel_monitor":
+        watch_id = ev.get("watch_id")
+        if not watch_id:
+            return _fail("Monitor cancel incomplete: no watch id in evidence.", "No watch id.")
+        row = _read_watch_row(str(watch_id), db_path)
+        if row is None or row.get("status") == "cancelled":
+            return VerificationResult(
+                state="completed", message=f"Watch {watch_id} is cancelled.",
+                is_verified=True, reason="Watch row gone/cancelled on re-read.")
+        return _fail(f"Monitor cancel incomplete: watch {watch_id} is still {row.get('status')!r}.",
+                     f"Watch still {row.get('status')!r}.")
+
+    # -- Scheduled tasks: persisted job row with next_run_at + receipt.
+    if intent in ("schedule_task", "update_schedule", "cancel_schedule"):
+        from .scheduler import get_job
+
+        job_id = ev.get("job_id")
+        if not job_id:
+            return _fail("Scheduling incomplete: no job id in evidence.", "No job id.")
+        job = get_job(str(job_id), db_path=db_path)
+        if job is None:
+            return _fail(f"Scheduling incomplete: no job row for {job_id}.", "Job row missing.")
+        if intent == "cancel_schedule":
+            if job.get("status") != "cancelled":
+                return _fail(f"Cancel incomplete: job {job_id} is still {job.get('status')!r}.",
+                             f"Job still {job.get('status')!r}.")
+            return VerificationResult(
+                state="completed", message=f"Scheduled job {job_id} is cancelled.",
+                is_verified=True, reason="Job row cancelled on re-read.")
+        if not job.get("next_run_at"):
+            return _fail(f"Scheduling incomplete: job {job_id} has no next run time.",
+                         "Job has no next_run_at.")
+        return VerificationResult(
+            state="completed", message=f"Scheduled job {job_id} is active with next run {job['next_run_at']}.",
+            is_verified=True, reason="Job row with next_run_at on re-read.")
+
+    # -- Email polling: the setting row actually changed, re-read.
+    if intent == "configure_email_polling":
+        from . import db as _db
+
+        mission_id = ev.get("mission_id")
+        want_freq = ev.get("frequency_seconds")
+        if not mission_id or want_freq is None:
+            return _fail("Email polling incomplete: no mission id or frequency in evidence.",
+                         "No mission id / frequency.")
+        mission = _db.get_email_mission(str(mission_id), db_path=db_path)
+        if mission is None:
+            return _fail("Email polling incomplete: email mission row missing.", "Email mission missing.")
+        if mission.get("frequency_seconds") != want_freq:
+            return _fail("Email polling incomplete: stored frequency does not match the requested one.",
+                         "Frequency mismatch on re-read.")
+        return VerificationResult(
+            state="completed",
+            message=f"Email check interval is now every {want_freq} seconds (verified by re-read).",
+            is_verified=True, reason="Email polling setting matches on re-read.")
+
+    # -- Browser task: ≥1 verified browser observation + the outcome.
+    # A promise sentence ("I'll search") is NEVER completion.
+    if intent == "browser_task":
+        observations = ev.get("observations") or []
+        if not observations:
+            return _fail("Browser task incomplete: no verified browser observation was recorded.",
+                         "No verified browser observation.")
+        return VerificationResult(
+            state="completed", message="Browser task completed with a verified observation.",
+            is_verified=True, reason=f"{len(observations)} verified observation(s).")
+
+    # -- Artifact: the file exists, opens, and contains the content.
+    if intent == "artifact_request":
+        art = ev.get("artifact_path")
+        if not art:
+            return _fail("Artifact incomplete: no file path in evidence.", "No artifact path.")
+        p = _Path(str(art))
+        if not p.exists() or p.stat().st_size == 0:
+            return _fail(f"Artifact incomplete: {art} does not exist or is empty.",
+                         "Artifact file missing or empty.")
+        if ev.get("must_contain"):
+            try:
+                content = p.read_text(errors="replace")
+            except Exception as exc:
+                return _fail(f"Artifact incomplete: {art} cannot be read ({exc}).", "Artifact unreadable.")
+            if ev["must_contain"] not in content:
+                return _fail("Artifact incomplete: the file does not contain the requested content.",
+                             "Artifact lacks the requested content.")
+        return VerificationResult(
+            state="completed", message=f"Artifact ready: {art}.",
+            is_verified=True, reason="Artifact file exists and contains the requested content.")
+
+    # -- Connector / MCP: execution receipt (id, status).
+    if intent in ("connector_task", "mcp_task"):
+        receipt = ev.get("receipt") or {}
+        if not receipt.get("id") or not receipt.get("status"):
+            return _fail(f"{intent} incomplete: no execution receipt (id, status) was returned.",
+                         "No execution receipt.")
+        return VerificationResult(
+            state="completed",
+            message=f"{intent} executed (receipt {receipt['id']}, {receipt['status']}).",
+            is_verified=True, reason="Execution receipt present.")
+
+    # -- Memory: store needs the row on re-read; recall needs the fact.
+    if intent == "memory_store":
+        if not ev.get("stored_row"):
+            return _fail("Memory store incomplete: no stored row was read back.",
+                         "No stored row on re-read.")
+        return VerificationResult(
+            state="completed", message="Fact stored and read back.",
+            is_verified=True, reason="Stored row present on re-read.")
+    if intent == "memory_recall":
+        if not ev.get("fact"):
+            return _fail("Memory recall incomplete: no fact was returned from the store.",
+                         "No fact returned.")
+        return VerificationResult(
+            state="completed", message="Fact recalled from memory.",
+            is_verified=True, reason="Fact returned from the store.")
+
+    # -- Conversational / greeting / capability: a substantive,
+    # non-refusal answer completes; refusals and empty answers never do.
+    if intent in ("greet", "capability_query", "conversational", "ask_user_answer"):
+        answer = (ev.get("answer") or "").strip()
+        if not answer or is_refusal_message(answer):
+            return _fail("No substantive answer was produced.", "Empty answer or refusal.")
+        return VerificationResult(
+            state="completed", message=answer, is_verified=True,
+            reason="Substantive conversational answer.")
+
+    return _fail(f"Unknown objective intent {intent!r} — no completion criteria exist for it.",
+                 f"Unknown intent {intent!r}.")
+
+
 def verify_task_completion(
     instruction: str,
     candidate_state: str,
@@ -335,6 +1102,8 @@ def verify_task_completion(
     observation: Any = None,
     working_memory: Optional[dict[str, Any]] = None,
     history: Optional[list[dict[str, Any]]] = None,
+    db_path: Optional[str] = None,
+    chat_id: Optional[str] = None,
 ) -> VerificationResult:
     """Strictly verify task outcome against evidence and requirements.
 
@@ -353,12 +1122,20 @@ def verify_task_completion(
     # counts as completed. A substantive conversational answer may mention a
     # limitation ("I cannot monitor sites 24/7") and still be a real result.
     if is_refusal_message(msg) and not is_substantive_conversational_answer(msg, instruction):
-        return VerificationResult(
-            state="failed",
-            message=msg,
-            is_verified=False,
-            reason="Model refusal or capability denial cannot produce successful completion.",
-        )
+        # Stream 3: a deterministic companion outcome ("I can't watch
+        # <url> — <gate reason>") is an honest monitor refusal with a
+        # specific reason, not a model capability denial. It is NOT
+        # failed here with the generic refusal reason — the monitor
+        # branch below (before Rule 6) verifies it against the watch
+        # table and reports the specific reason. A model refusal for
+        # a monitor ask still ends failed there ("no watch created").
+        if not _is_monitor_completion_case(instruction, msg):
+            return VerificationResult(
+                state="failed",
+                message=msg,
+                is_verified=False,
+                reason="Model refusal or capability denial cannot produce successful completion.",
+            )
 
     if not msg:
         return VerificationResult(
@@ -474,6 +1251,28 @@ def verify_task_completion(
                     is_verified=False,
                     reason="No comparison results collected.",
                 )
+
+    # Stream 3 (CONTRACTS4 §3 — the price-watch wart): a monitoring
+    # outcome is verified against the persisted watch row, never
+    # against research evidence. This runs before Rule 6 so a watch
+    # confirmation is never failed for having no research sources.
+    if _is_monitor_completion_case(instruction, msg):
+        checked = _verify_monitor_completion(instruction, msg, db_path=db_path,
+                                             chat_id=chat_id)
+        if candidate_state == "failed":
+            # The loop reported failure: the verifier never launders
+            # that into success — but it says plainly whether the
+            # watch itself is live, so the user is not left guessing.
+            note = (" The watch itself is live and verified."
+                    if checked.state == "completed"
+                    else f" The watch itself is not verified: {checked.reason}.")
+            return VerificationResult(
+                state="failed",
+                message=f"{msg}{note}",
+                is_verified=False,
+                reason="Execution reported failure; verifier does not override it.",
+            )
+        return checked
 
     # Rule 6: Research tasks require evidence and verification across 6 distinct stages
     if category == "RESEARCH" or mem.get("is_research"):

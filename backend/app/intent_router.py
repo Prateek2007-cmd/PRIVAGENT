@@ -45,6 +45,11 @@ class IntentClassification:
     research_topic: Optional[str] = None
     deliverable_type: Optional[str] = None
     operation_type: Optional[ResearchOperationType] = None
+    # Stream 1 (CONTRACTS4 §1): the structured objective for this
+    # instruction (None when the objective builder failed). Downstream
+    # code routes on objective.primary_intent, never by re-matching
+    # keywords in the raw text.
+    objective: Optional[Any] = None
 
     @property
     def is_browser(self) -> bool:
@@ -74,6 +79,7 @@ class IntentClassification:
             "researchTopic": self.research_topic,
             "deliverableType": self.deliverable_type,
             "operationType": self.operation_type.value if self.operation_type else None,
+            "objective": self.objective.to_dict() if self.objective is not None else None,
         }
 
 
@@ -560,6 +566,28 @@ def is_export_deliverable_directive(
     if not text:
         return False, None, None
     clean = text.strip()
+    # Stream 1 (S5 gen B5): a watch/schedule interval change is never a
+    # deliverable export. "change it to every 45 mins" names no format
+    # and no deliverable noun, but the reformat pattern below (whose
+    # tail is `.*$`) reads "change it to <anything>" as "reformat the
+    # deliverable" and defaults the format to pdf — so an interval
+    # update became an empty Technical_Analysis.pdf. A genuine export
+    # always names its format or its deliverable noun.
+    if (
+        re.search(
+            r"\bevery\s+(?:\d+\s*)?(?:minutes?|mins?|hours?|hrs?|days?)\b",
+            clean,
+            re.IGNORECASE,
+        )
+        and not re.search(
+            r"\b(?:pdf|docx|word|pptx|powerpoint|presentation|slides?|slide\s*deck|"
+            r"xlsx|excel|spreadsheet|workbook|csv|markdown|html|report|document|"
+            r"whitepaper|dossier|analysis|findings|results)\b",
+            clean,
+            re.IGNORECASE,
+        )
+    ):
+        return False, None, None
     m = EXPORT_DIRECTIVE_PATTERN.match(clean)
     if m:
         raw_fmt = m.group(1).lower()
@@ -1371,8 +1399,92 @@ BROWSER_TRIGGERS = [
     re.compile(r"\b(?:buy|order|purchase)\s+.*?\s+(?:from|on)\s+" + _SITE_TOKEN + r"\b", re.IGNORECASE),
 ]
 
+# Latest-release check (step 9b, Failure B): "check the latest
+# <brand> <product> thats released". A recency word (latest/newest)
+# plus a release word (released/launched/announced) after "check"
+# means a live lookup. Deliberately narrow: "check the latest email"
+# has no release word and never matches; "check the latest news"
+# has none either.
+_CHECK_LATEST_RE = re.compile(
+    r"\bcheck\b[^.\n]{0,90}?\b(?:latest|newest|most\s+recent)\b[^.\n]{0,60}?\b(?:released|launched|announced|out|new)\b"
+    r"|\bcheck\b[^.\n]{0,60}?\b(?:phone|mobile|laptop|tablet|watch|headphones|earbuds|camera|tv|gpu|car|bike|shoes|device|model)\b[^.\n]{0,40}?\b(?:released|launched|announced)\b",
+    re.IGNORECASE,
+)
+
+# Question-form latest-release check (fixC M8): "What is the latest
+# <brand> <product> released?" / "What's the newest Pixel phone
+# out?" — the same live question as step 9b, asked as a question
+# instead of a "check …" command. A recency word plus a release word
+# or a product noun. Deliberately narrow: "what is the latest news"
+# has neither and never matches, and "which is the latest from these
+# results?" has no release word or product noun either — both stay
+# conversational. The dispatch layer only applies this when the
+# extension is connected (context flag); without a live browser the
+# turn stays conversational and answers honestly from memory.
+_LATEST_RELEASE_QUESTION_RE = re.compile(
+    r"\b(?:what(?:'s|s| is)|which)\b[^.\n]{0,60}?"
+    r"\b(?:latest|newest|most\s+recent)\b[^.\n]{0,60}?"
+    r"\b(?:released|launched|announced|out|new|phone|mobile|laptop|tablet|watch|headphones|earbuds|camera|tv|gpu|car|bike|device|model)\b",
+    re.IGNORECASE,
+)
+
+
+def should_route_email_interval(
+    objective: Any,
+    instruction: str,
+    has_active_email_mission: bool,
+) -> bool:
+    """CONTRACTS4 §1 precedence gate for the email-interval branch.
+
+    True only when the structured objective says this instruction IS
+    an email-polling change — i.e. its object is email/inbox polling
+    (email noun present, no product/website/price noun). A monitor
+    intent ("live monitor iPhone 17 ... check every 10 minutes") is
+    never email polling, however strong its interval token is: the
+    legacy ``is_email_interval_change_instruction`` predicate matches
+    any "check every N minutes" (its non-email-object guard misses
+    product brand/model nouns and percent conditions), so it must
+    never be the sole decider. When no objective could be built, the
+    legacy predicate is the fallback (previous behaviour preserved).
+    """
+    if not has_active_email_mission:
+        return False
+    if objective is not None:
+        return getattr(objective, "primary_intent", None) == "configure_email_polling"
+    try:
+        from .email_intelligence.mission_setup import is_email_interval_change_instruction
+
+        return bool(is_email_interval_change_instruction(instruction))
+    except Exception:
+        return False
+
 
 def classify_intent(
+    instruction: str,
+    context: Optional[dict[str, Any]] = None,
+) -> IntentClassification:
+    """Classify user task intent before any browser operation.
+
+    Thin wrapper over :func:`_classify_intent_impl`: the legacy
+    regex classification runs unchanged, and the structured
+    :class:`app.objective.Objective` for the instruction is attached
+    to the result (``classification.objective``). Downstream code
+    routes on ``objective.primary_intent``; the objective is built
+    deterministically here (no model call — a bare interval stays
+    ambiguous at this point because the active-email-mission flag
+    lives in the dispatch layer, which re-resolves it).
+    """
+    result = _classify_intent_impl(instruction, context=context)
+    try:
+        from .objective import build_objective
+
+        result.objective = build_objective(instruction, context=context)
+    except Exception:
+        result.objective = None
+    return result
+
+
+def _classify_intent_impl(
     instruction: str,
     context: Optional[dict[str, Any]] = None,
 ) -> IntentClassification:
@@ -1691,6 +1803,38 @@ def classify_intent(
                 confidence=0.98,
                 reason="instruction contains explicit URL or web browsing target",
             )
+
+    # 9b. Latest-release check (Failure B): "check the latest <brand>
+    # <product> thats released" is a live lookup, not a knowledge
+    # question. "check" alone is not a web keyword (step 10), so
+    # without this the conversational fast-path answers from memory
+    # and the task "completes" with no search. Email checks are
+    # already claimed by step 5 and monitoring cadences by step 4c2,
+    # so this only fires on a recency + release phrasing. The
+    # objective attached to the result is simple_search, so the
+    # verifier must not apply the research bar to it (CONTRACTS4 §3).
+    if _CHECK_LATEST_RE.search(text):
+        return IntentClassification(
+            intent=TaskIntent.NEW_BROWSER_TASK,
+            confidence=0.9,
+            reason="latest-release check needs a live search",
+        )
+
+    # 9c. Question-form latest-release check (fixC M8): "What is the
+    # latest <brand> <product> released?" asks the same live question
+    # as step 9b but without the word "check", so it fell through to
+    # NON_BROWSER and the chat-only path answered from memory while
+    # claiming it could not confirm whether the extension was
+    # connected — even with the extension connected. Route it to the
+    # browser ONLY when the extension is actually connected (the
+    # dispatch layer passes extension_connected in context); with no
+    # extension the turn stays conversational, as before.
+    if ctx.get("extension_connected") and _LATEST_RELEASE_QUESTION_RE.search(text):
+        return IntentClassification(
+            intent=TaskIntent.NEW_BROWSER_TASK,
+            confidence=0.9,
+            reason="latest-release question needs a live search and the extension is connected",
+        )
 
     # 10. Web research keywords (search, find, look up, buy on the web)
     web_keywords = re.compile(

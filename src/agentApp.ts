@@ -1107,22 +1107,28 @@ function addCompletionStepItem(taskState: string, message: string): void {
   // progress step), adding a "Mission Result" item would show it twice.
   // The reply stays once, in the step that already carries it.
   if (isMessageInTimeline(cleanMessage)) return;
+  // Stream 3 (CONTRACTS4 §4): "unknown" means no backend task record
+  // exists for this message — render it as a plain message, never as
+  // a completion claim (no ✓, no "Mission Result").
+  const isUnknown = taskState === "unknown";
   const isOk = taskState === "completed";
 
   // Each turn owns its own result item. Overwriting a previous turn's result
   // made a follow-up failure erase the answer the user was still reading.
   const li = document.createElement("li");
-  li.className = isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed";
+  li.className = isUnknown
+    ? "agent-step-item"
+    : (isOk ? "agent-step-item agent-step-item--result" : "agent-step-item agent-step-item--failed");
   // The watch card is inlined here (not a helper call) so the
   // innerHTML guard can see escapeHtml(watchId) at the assignment
   // site. It renders only when the backend appended the watch marker
   // to the confirmation; hydrateWatchCard fills in the real title and
   // status from GET /api/control/missions.
   li.innerHTML = `
-    <span class="agent-step-item__icon">${isOk ? "✓" : "✗"}</span>
+    <span class="agent-step-item__icon">${isUnknown ? "•" : (isOk ? "✓" : "✗")}</span>
     <div class="agent-step-item__text">
-      <div class="agent-step-item__label"><strong>${isOk ? "Mission Result" : "Task Incomplete"}</strong>:</div>
-      <div class="md-body">${renderMarkdown(cleanMessage || (isOk ? "Mission completed." : "Task stopped."))}</div>
+      <div class="agent-step-item__label"><strong>${isUnknown ? "Message" : (isOk ? "Mission Result" : "Task Incomplete")}</strong>:</div>
+      <div class="md-body">${renderMarkdown(cleanMessage || (isOk ? "Mission completed." : (isUnknown ? "" : "Task stopped.")))}</div>
       ${watchId ? `
       <div class="watch-card" data-watch-id="${escapeHtml(watchId)}">
         <div class="watch-card__header">
@@ -1303,9 +1309,24 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
       resultCard.classList.add("is-failed");
       // Stream D: a blocked run says so — it is a missing
       // dependency, not a failure of the task itself.
-      resultBadge.textContent = taskState === "blocked"
-        ? "⛔ Blocked — dependency missing"
-        : "✗ Task Blocked / Incomplete";
+      // Stream 3 (CONTRACTS4 §4): awaiting / partial states are
+      // their own badges, never "Blocked / Incomplete" — and
+      // "✓ Mission Completed" appears ONLY when the backend record
+      // is "completed" (the branch above).
+      if (taskState === "blocked") {
+        resultBadge.textContent = "⛔ Blocked — dependency missing";
+      } else if (taskState === "awaiting_input" || taskState === "awaiting_confirmation") {
+        resultCard.classList.remove("is-failed");
+        resultBadge.textContent = "⏸ Waiting for your answer";
+      } else if (taskState === "awaiting_approval" || taskState === "awaiting_takeover") {
+        resultCard.classList.remove("is-failed");
+        resultBadge.textContent = "⏸ Waiting for approval";
+      } else if (taskState === "partially_completed") {
+        resultCard.classList.remove("is-failed");
+        resultBadge.textContent = "◐ Partially completed";
+      } else {
+        resultBadge.textContent = "✗ Task Blocked / Incomplete";
+      }
       resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(stripWatchMarker(message).text || "Task stopped before completing all steps.")}</div>`;
     }
     resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1562,12 +1583,6 @@ async function selectChat(chatId: string): Promise<void> {
     // A newer selection superseded this one while the fetch was in
     // flight: render nothing from the stale detail.
     if (gen !== selectChatGeneration) return;
-    // /api/chat/{id} returns a FLAT shape (chat fields + messages + memory),
-    // not {chat: {...}, messages}. Read status defensively from either form.
-    const chatStatus = (detail as unknown as { status?: string }).status
-      ?? detail.chat?.status
-      ?? "";
-
     if (!detail.messages || detail.messages.length === 0) {
       if (stepsList) {
         stepsList.innerHTML = '<li class="agent-step-placeholder">No messages in this mission thread yet.</li>';
@@ -1577,11 +1592,34 @@ async function selectChat(chatId: string): Promise<void> {
 
     let lastAgentMsg: string | null = null;
     let lastUserMsg = "";
-    let finalTaskState = chatStatus === "failed" || chatStatus === "cancelled" ? chatStatus : "completed";
+    // Stream 3 (CONTRACTS4 §3/§4): the displayed task state comes
+    // ONLY from the backend task record (GET /api/task/{id}). The old
+    // code defaulted to "completed" unless the message text looked
+    // like a failure — so a task the backend recorded as failed
+    // rehydrated as "✓ Mission Completed". A message with no task id
+    // (e.g. a canned greeting) has no backend record and gets NO
+    // terminal claim at all: its state stays "unknown".
+    let finalTaskState = "unknown";
     let calculatedSteps = 0;
 
     const lastMsg = detail.messages[detail.messages.length - 1];
     const isPendingUserTurn = lastMsg && lastMsg.role === "user";
+
+    const backendStates = new Map<string, string>();
+    await Promise.all(detail.messages
+      .filter(m => m.role === "agent" && m.task_id)
+      .map(async (m) => {
+        try {
+          const r = await apiFetch(`${API}/api/task/${m.task_id}`);
+          if (r.ok) {
+            const t = (await r.json()) as { taskState?: string };
+            if (t.taskState) backendStates.set(m.task_id as string, t.taskState);
+          }
+        } catch { /* offline — the state stays unknown, never guessed */ }
+      }));
+    // A newer selection superseded this one while the lookups were
+    // in flight: render nothing from the stale detail.
+    if (gen !== selectChatGeneration) return;
 
     detail.messages.forEach(msg => {
       if (msg.role === "user") {
@@ -1589,19 +1627,11 @@ async function selectChat(chatId: string): Promise<void> {
         addUserMessageItem(msg.content);
       } else if (msg.role === "agent") {
         lastAgentMsg = msg.content;
-        const ev = (msg.evidence || "").toLowerCase();
-        const content = (msg.content || "").toLowerCase();
-        let msgState = "completed";
-        if (ev.includes("failed") || ev.includes("unsupported") || content.startsWith("error:") || content.includes("planner unavailable")) {
-          msgState = "failed";
-          finalTaskState = "failed";
-        } else if (ev.includes("blocked") || content.includes("blocked")) {
-          msgState = "blocked";
-          finalTaskState = "failed";
-        } else if (ev.includes("partially") || content.includes("partially completed")) {
-          msgState = "failed";
-          finalTaskState = "failed";
-        }
+        // Backend record only — never inferred from message text or
+        // evidence. "unknown" renders as a plain message, not a
+        // completion claim.
+        const msgState = (msg.task_id && backendStates.get(msg.task_id)) || "unknown";
+        finalTaskState = msgState;
 
         // Rehydrate intermediate execution steps for this turn if present
         if (Array.isArray(msg.steps) && msg.steps.length > 0) {
@@ -1685,8 +1715,17 @@ async function selectChat(chatId: string): Promise<void> {
       }
     } else if (!isPendingUserTurn && lastAgentMsg) {
       activeInstruction = lastUserMsg;
-      renderCompletion(finalTaskState, lastAgentMsg, false);
-      setTaskState(finalTaskState);
+      // Stream 3: only a backend-known terminal state renders a
+      // completion card. An "unknown" state (no task record, e.g. a
+      // greeting) or a still-running state renders no terminal claim
+      // — never "Mission Completed" for a failed/incomplete task.
+      if (["completed", "failed", "cancelled", "blocked", "partially_completed", "awaiting_input", "awaiting_approval"].includes(finalTaskState)) {
+        renderCompletion(finalTaskState, lastAgentMsg, false);
+        setTaskState(finalTaskState);
+      } else {
+        setTaskState("ready");
+        if (resultCard) resultCard.hidden = true;
+      }
     } else if (isPendingUserTurn) {
       setTaskState("ready");
       if (resultCard) resultCard.hidden = true;

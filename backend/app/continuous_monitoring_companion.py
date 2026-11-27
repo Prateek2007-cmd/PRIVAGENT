@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 from . import db
 from .hub import hub
+from .query_builder import parse_relative_interval_factor, sanitize_query_text
+from .working_context import load_working_context, resolve_watch_target
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,16 @@ _TRACK_NEW_RE = re.compile(_TRACK_NEW_ALT, re.IGNORECASE)
 
 
 MONITORING_DIRECTIVE_PATTERN = re.compile(
+    # FIX-B (M3): "keep an eye on <product>" is a monitor ask even
+    # when the word "price" never appears ("keep an eye on Sony
+    # WH-1000XM6 headphones, ping me if it drops below ₹25000").
+    # The old first branch required "keep an eye on ... price", so
+    # the bare-name shape fell through to the model layer, which
+    # demanded a product URL — while the same shape with "Live
+    # monitor iPhone 17" created directly. A signal word (price /
+    # drop / below / stock / cadence / a product noun) keeps a plain
+    # "keep an eye on the kids" from routing here.
+    r"\bkeep\s+an\s+eye\s+on\b[^.\n]{0,80}?\b(?:price|prices|drops?|below|under|stock|every|evry|headphones|earbuds|phone|iphone|laptop|tablet|camera|tv|shoes|deal|item|product)\b|"
     # A bare price drop ("alert me when the price drops", "notify me
     # when the price drops"): "if" and "when" are the same ask. The
     # product may sit between "when" and "price" ("alert me when
@@ -63,16 +75,17 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # Absolute threshold ("alert me when the price falls below ₹5000",
     # "notify me if it drops under 3000"): a directive verb + below /
     # under + a number. The verb requirement keeps a plain statement
-    # ("the price is below 5000") from becoming a watch.
-    r"\b(?:alert|notify|tell|let)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    # ("the price is below 5000") from becoming a watch. "ping" is an
+    # alert verb too (FIX-B M3: "ping me if it drops below ₹25000").
+    r"\b(?:alert|notify|tell|let|ping)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     r"\b(?:monitor|track|watch)\b[^.\n]{0,60}\b(?:below|under)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     # The threshold forms users actually type, mirroring
     # parse_below_price: "reaches <5000", "drops to ₹5000", "falls
     # below 5000", "<₹5000". "check" is a verb here too ("check the
     # strap and tell me if it reaches <5000") — without it the ask
     # falls through to a browser task that only looks once.
-    r"\b(?:alert|notify|tell|let|check)\b[^.\n]{0,60}?(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
-    r"\b(?:alert|notify|tell|let|check|watch|monitor|track)\b[^.\n]{0,60}?<\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    r"\b(?:alert|notify|tell|let|check|ping)\b[^.\n]{0,60}?(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to)\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
+    r"\b(?:alert|notify|tell|let|check|watch|monitor|track|ping)\b[^.\n]{0,60}?<\s*(?:₹|Rs\.?|INR|\$)?\s*[\d,]+(?:\.\d{1,2})?\b|"
     # Percent-drop watch ("live monitor iPhone 17 when it 10% off",
     # "alert me when it drops by 10%"): a directive verb + a percent
     # drop, in either word order — the number first ("10% off") or
@@ -85,8 +98,8 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # ("it dropped 10% yesterday") from routing. No word boundary
     # after the %: "%" is a non-word character, so \b never matches
     # after it ("drops by 10%" at the end would not route).
-    r"\b(?:monitor|track|watch|alert|notify|tell|let|check)\b[^.\n]{0,60}?\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)\s*(?:off|drops?|down|discount|less|cheaper)\b|"
-    r"\b(?:monitor|track|watch|alert|notify|tell|let|check)\b[^.\n]{0,60}?\b(?:drops?|falls?|goes?\s+down|discounts?|cuts?)\s+(?:by\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)|"
+    r"\b(?:monitor|track|watch|alert|notify|tell|let|check|ping)\b[^.\n]{0,60}?\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)\s*(?:off|drops?|down|discount|less|cheaper)\b|"
+    r"\b(?:monitor|track|watch|alert|notify|tell|let|check|ping)\b[^.\n]{0,60}?\b(?:drops?|falls?|goes?\s+down|discounts?|cuts?)\s+(?:by\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)|"
     # An interval cadence on its own ("alert me every 5 minutes",
     # "check its price and just alert me every 5 minutes"): the
     # directive verb + a per-N-minutes/hours cadence. Without this a
@@ -95,7 +108,10 @@ MONITORING_DIRECTIVE_PATTERN = re.compile(
     # incomplete") — the product/threshold come from the history.
     # The number may be a word ("every five minutes"), not only a
     # digit — the handler parses both (see _parse_interval_seconds).
-    r"\b(?:alert|notify|tell|let|check|monitor|track|watch)\b[^.\n]{0,60}?\bevery\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?)\b|"
+    # "evry" is the common misspelling of "every" (FIX-B M3: "check
+    # evry 20 mins" must route and parse as 20 minutes, not fall
+    # through to the model layer and default to 5 minutes).
+    r"\b(?:alert|notify|tell|let|check|monitor|track|watch|ping)\b[^.\n]{0,60}?\b(?:every|evry)\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?)\b|"
     + _TRACK_NEW_ALT,
     re.IGNORECASE,
 )
@@ -137,7 +153,9 @@ _WORD_NUMBERS = {
 }
 
 _INTERVAL_RE = re.compile(
-    r"\bevery\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(minutes?|mins?|hours?)\b",
+    # FIX-B (M3): "evry" is the common misspelling of "every" —
+    # "check evry 20 mins" parses as 1200 s, not the 300 s default.
+    r"\b(?:every|evry)\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(minutes?|mins?|hours?)\b",
     re.IGNORECASE,
 )
 
@@ -575,45 +593,590 @@ def _resolve_watch(ref: str | None, chat_id: Optional[str], db_path: Optional[st
     return None, False
 
 
-def _handle_watch_control(instruction: str, chat_id: Optional[str],
-                          db_path: Optional[str]) -> str | None:
-    """Pause/resume/cancel watches from chat. None = not a watch-control ask."""
-    m = _WATCH_CONTROL_RE.search(instruction or "")
+def _ref_after_watch(text: str) -> str | None:
+    """The old regex's post-"watch" capture, punctuation-stripped.
+
+    "Pause the first watch." used to capture "." here and fail with
+    "couldn't find a watch for '.'" — a trailing "." is not a
+    referent, so it normalises to None now."""
+    m = _WATCH_CONTROL_RE.search(text or "")
     if not m:
         return None
-    action = m.group(1).lower()
-    ref = (m.group(2) or "").strip() or None
-    row, ambiguous = _resolve_watch(ref, chat_id, db_path)
-    if ambiguous:
-        return "That matches more than one watch — give me more of its name, or its id."
-    if row is None:
-        if ref:
-            return f"I couldn't find a watch for '{ref}'. Check the watch card in this chat for its exact name or id."
-        return "Which watch? Give me part of its name or its id (from the watch card)."
+    ref = (m.group(2) or "").strip().strip("\"'").rstrip(".,;:!?").strip()
+    return ref or None
+
+
+def _apply_watch_action(action: str, row: Any, db_path: Optional[str]) -> str:
+    """Pause/resume/cancel one watch row, VERIFIED by DB re-read.
+
+    Stream 5 F1: a reply must never claim a pause/resume/cancel
+    the DB disagrees with ("Watch Cancelled" while the row stayed
+    active). Every branch re-reads the row after the write and
+    reports honestly when the state did not change. Already-in-state
+    (pause a paused watch) is reported as such, not as a fresh
+    change."""
     mission_id = row["id"]
     title = row["title"]
+    current = str(row["status"] or "")
     if action in ("cancel", "delete", "stop"):
         with db.get_connection(db_path) as conn:
             conn.execute("DELETE FROM monitoring_events WHERE mission_id=?", (mission_id,))
             conn.execute("DELETE FROM monitoring_missions WHERE id=?", (mission_id,))
         hub.spawn(hub.broadcast_control_state())
+        with db.get_connection(db_path) as conn:
+            gone = conn.execute(
+                "SELECT id FROM monitoring_missions WHERE id=?", (mission_id,)
+            ).fetchone() is None
+        if not gone:
+            return (
+                f"I tried to cancel the watch **{title}**, but it is still in the store — "
+                "nothing was cancelled. Say 'list watches' to see its current state."
+            )
         return f"Cancelled the watch **{title}**. It will not check again."
     now = time.time()
     if action == "pause":
+        if current == "paused":
+            return f"The watch **{title}** is already paused."
         with db.get_connection(db_path) as conn:
             conn.execute(
                 "UPDATE monitoring_missions SET status='paused', next_run_at=NULL WHERE id=?",
                 (mission_id,),
             )
         hub.spawn(hub.broadcast_control_state())
+        with db.get_connection(db_path) as conn:
+            status = conn.execute(
+                "SELECT status FROM monitoring_missions WHERE id=?", (mission_id,)
+            ).fetchone()
+        if not status or status["status"] != "paused":
+            return (
+                f"I tried to pause the watch **{title}**, but it is still active — "
+                "nothing changed. Say 'list watches' to see its current state."
+            )
         return f"Paused the watch **{title}**. Say 'resume watch {title}' to start it again."
+    if current == "active":
+        return f"The watch **{title}** is already active."
     with db.get_connection(db_path) as conn:
         conn.execute(
             "UPDATE monitoring_missions SET status='active', next_run_at=? WHERE id=?",
             (now, mission_id),
         )
     hub.spawn(hub.broadcast_control_state())
+    with db.get_connection(db_path) as conn:
+        status = conn.execute(
+            "SELECT status FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+    if not status or status["status"] != "active":
+        return (
+            f"I tried to resume the watch **{title}**, but it is still paused — "
+            "nothing changed. Say 'list watches' to see its current state."
+        )
     return f"Resumed the watch **{title}** — the next check runs now."
+
+
+# Watch-marker history + pronoun/interval follow-up routing.
+# A turn whose assistant history carries a watch marker ("cancel
+# it", "change it to every 45 mins") refers to a real watch the
+# handler can act on; without one it is not a monitoring turn.
+_WATCH_MARKER_RE = re.compile(r"<!--\s*privagent-watch:\s*[0-9a-fA-F-]{8,}\s*-->")
+_PRONOUN_CONTROL_RE = re.compile(
+    r"\b(?:pause|resume|cancel|delete|stop)\b[^.\n]{0,40}?"
+    r"\b(?:it|that|this|them|that\s+one|this\s+one|the\s+watch|the\s+(?:\w+\s+){0,3}?one)\b",
+    re.IGNORECASE,
+)
+_INTERVAL_FOLLOW_UP_RE = re.compile(
+    r"\bchange\b[^.\n]{0,40}?\b(?:it|that|this|them|every)\b"
+    r"|\bmake\b[^.\n]{0,20}?\bthat\s+check\b",
+    re.IGNORECASE,
+)
+
+
+def _history_has_watch_marker(history: Optional[list[dict[str, Any]]]) -> bool:
+    for entry in reversed(history or []):
+        if not isinstance(entry, dict):
+            continue
+        content = str(entry.get("content") or entry.get("message") or "")
+        if "privagent-watch:" in content:
+            return True
+    return False
+
+
+def _is_watch_follow_up(text: str, history: Optional[list[dict[str, Any]]]) -> bool:
+    if not _history_has_watch_marker(history):
+        return False
+    if _PRONOUN_CONTROL_RE.search(text or ""):
+        return True
+    if _INTERVAL_FOLLOW_UP_RE.search(text or ""):
+        return True
+    if parse_relative_interval_factor(text or "") is not None:
+        return True
+    return False
+
+
+def _handle_watch_control(instruction: str, chat_id: Optional[str],
+                          db_path: Optional[str], history: Optional[list[dict[str, Any]]] = None) -> str | None:
+    """Pause/resume/cancel watches from chat. None = not a watch-control ask.
+
+    Stream 2 follow-up (Stream 5 F2): the old code took its referent
+    ONLY from _WATCH_CONTROL_RE's post-"watch" capture, so "Pause
+    the first watch" / "Cancel the Samsung watch" captured "." and
+    pronoun-only turns ("cancel it") never matched the regex at all.
+    The regex is now only a trigger. The REFERENT is resolved from
+    the working context (working_context.resolve_watch_target):
+    explicit id/prefix, ordinal by creation order, the word before
+    "watch" (brand / product / "website"), any other product token,
+    pronoun -> most recent watch, or the single watch in the chat.
+    Anything else is a concise clarification naming the watches —
+    never a guess, and never a success claim without a DB re-read
+    (see _apply_watch_action).
+    """
+    text = instruction or ""
+    verb_m = re.search(r"\b(pause|resume|cancel|delete|stop)\b", text, re.IGNORECASE)
+    if not verb_m:
+        return None
+    action = verb_m.group(1).lower()
+    # 1. Explicit id/prefix after "watch" — the old path, kept.
+    after = _ref_after_watch(text)
+    if after:
+        row, ambiguous = _resolve_watch(after, chat_id, db_path)
+        if ambiguous:
+            return "That matches more than one watch — give me more of its name, or its id."
+        if row is not None:
+            return _apply_watch_action(action, row, db_path)
+        # A post-"watch" ref that matches nothing falls through to
+        # working-context resolution below (it may be an ordinal or
+        # brand the id matcher cannot see) instead of failing here.
+    # 2. Working-context resolution — the referent lives in the
+    # conversation (ordinal / brand / pronoun), not in the regex.
+    ctx = load_working_context(chat_id or "")
+    result = resolve_watch_target(ctx, text)
+    if result["status"] == "none":
+        return (
+            "You don't have any watches in this chat yet. Tell me a product "
+            "to watch (for example, \"watch the Aurora X9 earbuds\") and I'll set one up."
+        )
+    if result["status"] == "clarification":
+        return result["question"]
+    watch = result["watch"]
+    # Re-read the live row: the resolver works off the synced blob,
+    # the action applies to the DB state.
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE id=?", (watch["watch_id"],)
+        ).fetchone()
+    if row is None:
+        return (
+            f"I couldn't find the watch for **{watch.get('label') or watch.get('title')}** "
+            "any more — it may have been deleted already. Say 'list watches' to see what's running."
+        )
+    return _apply_watch_action(action, row, db_path)
+
+
+# FIX-B (B4): a stock / availability ask. "out of stock" covers
+# "tell me if it goes out of stock"; "back in stock" is the same
+# condition from the other side. A bare "in stock" on its own is a
+# question, not a condition — it only counts with "back" or "goes".
+_STOCK_ALERT_RE = re.compile(
+    r"\b(?:out\s+of\s+stock|back\s+in\s+stock|goes\s+out\s+of\s+stock|"
+    r"stock\s+alert|availability\s+alert|tell\s+me\s+if\s+it\s+goes\s+out\s+of\s+stock)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_stock_alert(text: str) -> bool:
+    """True when the instruction asks to be told about stock /
+    availability ("tell me if it goes out of stock")."""
+    return bool(_STOCK_ALERT_RE.search(text or ""))
+
+
+_WATCH_LIST_RE = re.compile(
+    r"\b(?:list|show|what\s+are)\b[^.\n]{0,40}?\b(?:my\s+)?(?:product\s+)?watches\b",
+    re.IGNORECASE,
+)
+
+
+def _handle_watch_list(instruction: str, chat_id: Optional[str],
+                       db_path: Optional[str], history: Optional[list[dict[str, Any]]] = None) -> str | None:
+    """List the user's watches, read from the DB (Stream 5 F4, FIX-B M5).
+
+    FIX-B (M5): the old answer read the working context, which is
+    synced per-chat and active/paused-only — so "show my watches"
+    omitted paused watches and every watch from other chats. "Show
+    my watches" now reads ALL rows in monitoring_missions (every
+    chat, every status — paused included, status shown), and says
+    its scope in the reply. Guard: "show me both watches" can also
+    be a wristwatch-shopping ask, so this only fires for "product
+    watches" or when this chat already has a watch. None = not a
+    list-watches ask."""
+    if not _WATCH_LIST_RE.search(instruction or ""):
+        return None
+    # "show MY watches" is unambiguous (the user's own watches, not
+    # wristwatch shopping) — it lists even from a fresh chat with no
+    # marker. "show me both watches" stays guarded: without "my" /
+    # "product" / a marker it may be shopping, so it falls through.
+    if ("product" not in (instruction or "").lower()
+            and "my watches" not in (instruction or "").lower()
+            and not _history_has_watch_marker(history)):
+        return None
+    db.init_db(db_path)
+    with db.get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitoring_missions ORDER BY created_at DESC"
+        ).fetchall()
+    if not rows:
+        return (
+            "No watches are set up yet — nothing is being monitored right now. "
+            "Tell me a product to watch and I'll set one up."
+        )
+    lines = ["### 👀 Your watches (all chats, including paused)\n"]
+    for row in rows:
+        interval = row["interval_seconds"] or 0
+        if row["trigger_type"] == "cron":
+            cadence = "daily"
+        elif interval:
+            cadence = _describe_interval(interval)
+        else:
+            cadence = "—"
+        title = row["title"] or ""
+        label = title.removeprefix("Price Watch: ").removeprefix("New listings: ")
+        lines.append(
+            f"• `{row['id']}` — **{label}** — {row['status']} — {cadence} — {row['target_url'] or ''}"
+        )
+    return "\n".join(lines)
+
+
+# FIX-B (M6): "what did I ask you to watch earlier" — a summary of
+# the user's own watch requests. The model layer used to answer this
+# from its own guess and confidently denied a request the user HAD
+# made ("You never mentioned a Kindle" — D4 of the same chat asked
+# for a Kindle watch). This handler answers deterministically from
+# (a) every monitoring_missions row in the DB and (b) the user's own
+# earlier turns, including asks that never became a watch
+# (clarification-pending / unfulfilled). It never asserts what the
+# user did or did not ask beyond what those two sources show; when
+# they show nothing it says its scope instead of denying the request.
+_WATCH_SUMMARY_RE = re.compile(
+    r"\bwhat\s+did\s+i\s+ask\s+you\s+to\s+(?:watch|monitor|track)\b"
+    r"|\bwhat\s+(?:have\s+i\s+asked|did\s+i\s+ask)\b[^.\n]{0,40}?\b(?:watch|monitor|track)\b"
+    r"|\bwhat\s+(?:watches|monitors)\s+did\s+i\s+ask\b"
+    r"|\bwhat\s+did\s+i\s+ask\s+you\s+to\s+watch\b",
+    re.IGNORECASE,
+)
+_WATCH_ASK_VERB_RE = re.compile(
+    r"\b(?:watch|monitor|track|keep\s+an\s+eye\s+on)\b", re.IGNORECASE
+)
+
+
+def _display_product(phrase: str) -> str:
+    """Short display name for a product phrase pulled from a compound
+    ask ("new Kindle and also remind me about my 3pm meeting" ->
+    "new Kindle"): cut a trailing second ask ("and also remind ...",
+    "and tell me ...") and an alert tail, without touching the
+    product itself."""
+    text = (phrase or "").strip()
+    # A sanitizer may already have eaten the "and" ("Fire-Boltt
+    # Smartwatch Also") — cut a dangling "also" on its own too.
+    text = re.split(r"\s+also\b", text, flags=re.IGNORECASE)[0]
+    text = re.split(
+        r"\s+and\s+(?:also\s+)?(?:remind|tell|notify|alert|check|watch|monitor|book|call|set|do|find|search)\b",
+        text, flags=re.IGNORECASE,
+    )[0]
+    text = re.split(r"\s*,\s*(?:alert|notify|tell)\b", text, flags=re.IGNORECASE)[0]
+    return text.strip().strip("\"'").rstrip(".,;:!?").strip()
+
+
+def _watch_ask_product(content: str) -> str:
+    """The product a user turn asked to watch, or "".
+
+    A turn counts as a watch ask when it carries a monitor verb
+    (or matches the monitoring directive pattern) and names a
+    product. Garbage / service / retailer candidates are not
+    products — they are skipped, never reported as asks."""
+    text = content or ""
+    if not _WATCH_ASK_VERB_RE.search(text) and not MONITORING_DIRECTIVE_PATTERN.search(text):
+        return ""
+    product, _url = _extract_monitored_product(text)
+    if not product or _is_garbage_product_title(product):
+        return ""
+    if _is_service_name(product) or _is_retailer_or_place_product(product):
+        return ""
+    return _display_product(product)
+
+
+def _handle_watch_summary(instruction: str, chat_id: Optional[str],
+                          db_path: Optional[str], history: Optional[list[dict[str, Any]]] = None) -> str | None:
+    """Answer "what did I ask you to watch" from the DB + history.
+
+    Set-up watches come from monitoring_missions (all chats, all
+    statuses) plus the working context's synced watches; asked-but-
+    not-set-up requests come from the user's own earlier turns in
+    this chat — the passed history topped up from the messages table
+    (the conversational path only passes the last 6 messages, so a
+    request four turns back would otherwise be invisible). None =
+    not a watch-summary ask."""
+    if not _WATCH_SUMMARY_RE.search(instruction or ""):
+        return None
+    db.init_db(db_path)
+    with db.get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitoring_missions ORDER BY created_at DESC"
+        ).fetchall()
+    # Working context (this chat, synced from the same table): any
+    # watch it carries that the DB read missed is still shown — the
+    # two sources are merged, never played against each other.
+    wc_labels: list[str] = []
+    try:
+        ctx = load_working_context(chat_id or "")
+        for w in (ctx.active_watches or []):
+            label = (w.get("label") or w.get("title") or "").strip()
+            if label:
+                wc_labels.append(label)
+    except Exception:
+        logger.warning("watch summary: working-context load failed", exc_info=True)
+    # Earlier user turns: passed history first, then the messages
+    # table (same chat, last 30) so older asks are not lost to the
+    # 6-message conversational window.
+    turns: list[str] = []
+    seen: set[str] = set()
+    for entry in (history or []):
+        if isinstance(entry, dict) and (entry.get("role") or "").lower() == "user":
+            content = str(entry.get("content") or entry.get("message") or "")
+            if content and content not in seen:
+                seen.add(content)
+                turns.append(content)
+    if chat_id:
+        try:
+            for m in db.get_recent_messages(chat_id, limit=30, db_path=db_path):
+                if (m.get("role") or "").lower() != "user":
+                    continue
+                content = str(m.get("content") or "")
+                if content and content not in seen:
+                    seen.add(content)
+                    turns.append(content)
+        except Exception:
+            logger.warning("watch summary: message-table top-up failed", exc_info=True)
+    asked: list[str] = []
+    for content in turns:
+        product = _watch_ask_product(content)
+        if product and product.lower() not in {a.lower() for a in asked}:
+            asked.append(product)
+    # Which asked-about products already have a watch? Match on the
+    # normalised title or the stored target param.
+    set_up: list[str] = []
+    for row in rows:
+        title = _normalised_product_title(row["title"] or "")
+        try:
+            target = _normalised_product_title(
+                (json.loads(row["condition_params"] or "{}") or {}).get("target") or ""
+            )
+        except Exception:
+            target = ""
+        for product in asked:
+            norm = _normalised_product_title(f"Price Watch: {product}")
+            if norm and (norm == title or norm == target or _normalised_product_title(product) == target):
+                if product not in set_up:
+                    set_up.append(product)
+    pending = [a for a in asked if a not in set_up]
+    lines: list[str] = []
+    if rows:
+        lines.append("### 👀 Watches set up (all chats, including paused)\n")
+        for row in rows:
+            interval = row["interval_seconds"] or 0
+            cadence = "daily" if row["trigger_type"] == "cron" else (
+                _describe_interval(interval) if interval else "—")
+            label = (row["title"] or "").removeprefix("Price Watch: ").removeprefix("New listings: ")
+            lines.append(
+                f"• `{row['id']}` — **{label}** — {row['status']} — {cadence}"
+            )
+    for label in wc_labels:
+        if not any(label.lower() in line.lower() for line in lines):
+            lines.append(f"• **{label}** — listed in this chat's working context")
+    if pending:
+        lines.append("\n### 📝 You also asked about — no watch set up yet\n")
+        for product in pending:
+            lines.append(
+                f"• **{product}** — you asked me to watch it, but no watch is set up "
+                "for it yet. Tell me the missing detail and I'll set it up."
+            )
+    if not rows and not pending:
+        return (
+            "I don't see any watch request in this conversation yet, and no "
+            "watches are set up. Tell me a product to watch and I'll set one up."
+        )
+    if rows and not pending and not asked:
+        lines.append(
+            "\nThat's everything set up. (This summary covers all your chats; "
+            "I only looked at watches and watch requests, not other tasks.)"
+        )
+    return "\n".join(lines)
+
+
+def _find_watch_by_product(product_title: str, chat_id: Optional[str], db_path: Optional[str]):
+    """Most recent watch for this product in this chat, any status —
+    an active one first, else the most recent paused one. A stock
+    condition can be added to a paused watch too; the follow-up
+    handler uses this instead of the active-only lookup."""
+    try:
+        with db.get_connection(db_path) as conn:
+            rows = conn.execute(
+                """SELECT * FROM monitoring_missions
+                   WHERE conversation_id = ?
+                   ORDER BY created_at DESC""",
+                (chat_id or "default",),
+            ).fetchall()
+    except Exception:
+        logger.warning("watch-by-product lookup failed for %r", product_title, exc_info=True)
+        return None
+    wanted = _normalised_product_title(f"Price Watch: {product_title}")
+    for row in rows:
+        if _normalised_product_title(row["title"]) == wanted and row["status"] == "active":
+            return row
+    for row in rows:
+        if _normalised_product_title(row["title"]) == wanted:
+            return row
+    return None
+
+
+def _handle_stock_follow_up(instruction: str, chat_id: Optional[str],
+                            db_path: Optional[str], history: Optional[list[dict[str, Any]]] = None) -> str | None:
+    """FIX-B (B4): "also tell me if it goes out of stock" — add a
+    stock condition to the watch this chat is already setting up.
+
+    Only a PURE stock follow-up reaches here (no product, threshold
+    or URL named in this turn): a turn that names a product goes
+    through creation, which stores the condition at creation time.
+    The flag is stored on the watch row (``condition_params`` ->
+    ``stock_alert: true``) and verified by DB re-read before the
+    reply claims anything. With no watch to attach it to, this asks
+    which product to watch — it never creates a watch on its own.
+    None = not a pure stock follow-up."""
+    if not _wants_stock_alert(instruction or ""):
+        return None
+    if _PRODUCT_RE.search(instruction or "") or _product_phrase_from_text(instruction or ""):
+        return None
+    if parse_below_price(instruction or "") is not None or parse_percent_drop(instruction or "") is not None:
+        return None
+    if re.search(r"https?://[^\s\"'<>)]+", instruction or ""):
+        return None
+    # Resolve the watch: the product named earlier in this chat, else
+    # the single watch running here. Several watches and no referent
+    # is ambiguous — ask, never guess.
+    row = None
+    product, _url = _extract_monitored_product("", history=history)
+    if product and not _is_garbage_product_title(product):
+        row = _find_watch_by_product(product, chat_id, db_path)
+    if row is None:
+        db.init_db(db_path)
+        with db.get_connection(db_path) as conn:
+            rows = conn.execute(
+                """SELECT * FROM monitoring_missions
+                   WHERE conversation_id = ? AND status IN ('active', 'paused')
+                   ORDER BY created_at DESC""",
+                (chat_id or "default",),
+            ).fetchall()
+        if len(rows) == 1:
+            row = rows[0]
+            product = (row["title"] or "").removeprefix("Price Watch: ")
+        elif len(rows) > 1:
+            names = ", ".join(
+                f"**{(r['title'] or '').removeprefix('Price Watch: ')}**" for r in rows
+            )
+            return (
+                "You have more than one watch running here — tell me which one "
+                f"should also flag out-of-stock ({names}). Nothing was changed."
+            )
+    if row is None:
+        return (
+            "I don't have a watch running to add the out-of-stock alert to yet — "
+            "tell me which product to watch first and I'll set it up with the stock alert included."
+        )
+    title = (row["title"] or "").removeprefix("Price Watch: ")
+    try:
+        params = json.loads(row["condition_params"] or "{}")
+    except Exception:
+        params = {}
+    if not isinstance(params, dict):
+        params = {}
+    if params.get("stock_alert") is True:
+        return (
+            f"The watch for **{title}** already flags out-of-stock — nothing changed.\n\n"
+            f"<!-- privagent-watch: {row['id']} -->"
+        )
+    params["stock_alert"] = True
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE monitoring_missions SET condition_params=? WHERE id=?",
+            (json.dumps(params), row["id"]),
+        )
+        conn.commit()
+    hub.spawn(hub.broadcast_control_state())
+    with db.get_connection(db_path) as conn:
+        reread = conn.execute(
+            "SELECT condition_params FROM monitoring_missions WHERE id=?", (row["id"],)
+        ).fetchone()
+    try:
+        raw_params = reread["condition_params"] if reread is not None else None
+        stored = json.loads(raw_params or "{}")
+    except Exception:
+        stored = {}
+    if not isinstance(stored, dict) or stored.get("stock_alert") is not True:
+        return (
+            f"I tried to add the out-of-stock alert to the watch for **{title}**, "
+            "but it did not save — nothing changed. Say 'list watches' to see its current state."
+        )
+    interval = row["interval_seconds"] or 300
+    return (
+        f"Done — the watch for **{title}** will now also alert you if it goes out of stock, "
+        f"in addition to its price check {_describe_interval(interval)}.\n\n"
+        f"• **Watch ID:** `{row['id']}`\n"
+        f"• **Status:** {row['status']}\n\n"
+        f"<!-- privagent-watch: {row['id']} -->"
+    )
+
+
+def _handle_relative_interval(instruction: str, chat_id: Optional[str],
+                              db_path: Optional[str]) -> str | None:
+    """A relative cadence change ("make that check twice as often").
+
+    Stream 5 D10: the model used to claim "Frequency Doubled — Now
+    Every 30 Minutes" while the DB row stayed at 3600 s. The factor
+    (0.5 / 2.0) applies to the RESOLVED watch's stored interval, the
+    row is updated, and the new value is verified by DB re-read
+    before the reply claims anything. None = no relative change
+    named. Absolute interval changes ("change it to every 15
+    minutes") go through the normal update path, not here."""
+    factor = parse_relative_interval_factor(instruction or "")
+    if factor is None:
+        return None
+    ctx = load_working_context(chat_id or "")
+    result = resolve_watch_target(ctx, instruction or "")
+    if result["status"] == "none":
+        return "I don't have a watch in this chat to change — tell me which product to watch first."
+    if result["status"] != "resolved":
+        return result["question"]
+    watch = result["watch"]
+    current = int(watch.get("interval_seconds") or 300)
+    new_interval = max(60, min(604800, int(round(current * factor))))
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE monitoring_missions SET interval_seconds=?, next_run_at=? WHERE id=?",
+            (new_interval, time.time(), watch["watch_id"]),
+        )
+    hub.spawn(hub.broadcast_control_state())
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT interval_seconds FROM monitoring_missions WHERE id=?",
+            (watch["watch_id"],),
+        ).fetchone()
+    if not row or row["interval_seconds"] != new_interval:
+        return (
+            f"I tried to change the watch for **{watch.get('label') or watch.get('title')}**, "
+            "but the interval did not update — nothing changed. "
+            "Say 'list watches' to see its current state."
+        )
+    return (
+        f"Updated the watch for **{watch.get('label') or watch.get('title')}** — "
+        f"it was checking {_describe_interval(current)}, now checking {_describe_interval(new_interval)}."
+    )
 
 
 _BELOW_PRICE_RE = re.compile(
@@ -757,6 +1320,40 @@ def _find_active_watch(product_title: str, chat_id: Optional[str], db_path: Opti
     return None
 
 
+def _stock_alert_from_existing_watch(
+    product_title: str, chat_id: Optional[str], db_path: Optional[str]
+) -> bool:
+    """True when the running watch for this product already carries a
+    stock condition — a later cadence/threshold change must not wipe
+    it (upsert overwrites ``condition_params`` wholesale)."""
+    row = _find_watch_by_product(product_title, chat_id, db_path)
+    if row is None:
+        return False
+    try:
+        params = json.loads(row["condition_params"] or "{}")
+    except Exception:
+        return False
+    return isinstance(params, dict) and params.get("stock_alert") is True
+
+
+def _is_pure_follow_up(instruction: str) -> bool:
+    """True when the turn names no product of its own — it only
+    changes the cadence, adds a stock flag, or repeats the check
+    ("change it to every 45 mins", "check every 5 minutes"). Its
+    product, if any, comes from history, never from this turn."""
+    text = instruction or ""
+    if re.search(r"https?://[^\s\"'<>)]+", text):
+        return False
+    if _PRODUCT_RE.search(text) or _product_phrase_from_text(text):
+        return False
+    return bool(
+        _INTERVAL_RE.search(text)
+        or parse_relative_interval_factor(text) is not None
+        or _wants_stock_alert(text)
+        or re.search(r"\b(?:change|update|modify)\b[^.\n]{0,40}?\b(?:it|that|this|them|every)\b", text, re.IGNORECASE)
+    )
+
+
 def _thresholds_from_existing_watch(
     product_title: str, chat_id: Optional[str], db_path: Optional[str]
 ) -> tuple[float | None, float | None]:
@@ -791,9 +1388,33 @@ def _thresholds_from_existing_watch(
     return None, None
 
 
+def _as_float(value: Any) -> float | None:
+    """Coerce a stored threshold/percent to float, or None.
+
+    Stream 2 (Failure E format-string fix): ``condition_params`` is
+    an untyped JSON blob — the missions API stores whatever the
+    caller sent, so a threshold can arrive as the STRING "5000".
+    Formatting a string with ``:g`` raises ``ValueError: Unknown
+    format code 'g' for object of type 'str'`` and a string never
+    equals the float the handler parses, so the same-settings check
+    also misfires. Every read of a stored numeric goes through here.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.replace(",", "").strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _percent_threshold_text(percent: float | None) -> str:
     """Reply fragment for a %-drop threshold: 0 means any drop, not
     the nonsense 'drops 0% or more' a bare-drop watch used to show."""
+    percent = _as_float(percent)
     if percent is None:
         return ""
     if percent == 0:
@@ -824,6 +1445,7 @@ _PRODUCT_STOPWORDS = {
     "is", "the", "a", "an", "best", "price", "on", "at", "and", "if", "when",
     "for", "with", "under", "in", "of", "to", "from", "by", "vs", "or", "it",
     "this", "that", "please", "now", "just", "me", "my", "i", "want", "like",
+    "also",
 }
 
 
@@ -858,6 +1480,38 @@ def _is_service_name(title: str) -> bool:
     )
 
 
+# Model tokens that can never name a product (FIX-B M4): a retailer,
+# a storefront, a country or a page word. The assistant's own prose
+# ("the Amazon.in / Flipkart / Croma / Sony India page for the
+# XM6") used to yield the brand+model match "Sony India" — "India"
+# is a model token to _PRODUCT_RE — and the follow-up minted a watch
+# for a retailer name. A match whose model tokens are ALL in this
+# set is not a product, wherever it appears (instruction, user
+# history, or assistant history).
+_NON_PRODUCT_MODEL_TOKENS = {
+    "india", "amazon", "flipkart", "croma", "store", "shop", "online",
+    "website", "webpage", "page", "site", "app", "in",
+}
+
+
+def _is_retailer_or_place_product(title: str) -> bool:
+    """True when a brand+model candidate names a retailer / place /
+    page instead of a product ("Sony India", "Sony India Page").
+
+    The first token is the brand; the rest are the model. Only a
+    match with NO real model token is rejected, so "Sony WH-1000XM6"
+    and "Apple iPhone 17" (real model tokens) pass, while a
+    retailer/country/page word alone does not."""
+    tokens = re.findall(r"[a-z0-9]+", (title or "").lower())
+    if not tokens:
+        return False
+    brands = set(_MONITORED_BRANDS.split("|"))
+    rest = tokens[1:] if tokens[0] in brands else tokens
+    if not rest:
+        return False
+    return all(t in _NON_PRODUCT_MODEL_TOKENS for t in rest)
+
+
 def _truncate_title(text: str, limit: int = 80) -> str:
     """Shorten a product title to at most `limit` chars without cutting
     a word in half: cut at the last space inside the limit. A title cut
@@ -889,7 +1543,10 @@ def _product_phrase_from_text(text: str) -> str:
         # The pronoun after the verb must be a whole word (\b):
         # without it "check its price" matched "it" inside "its" and
         # the phrase became the nonsense "s price and just alert me".
-        r"\b(?:monitor|track|watch|check)\s+(?:(?:this|that|it|the\s+product|this\s+product)\b)?\s*,?\s*(.+)$",
+        # FIX-B (M3): "keep an eye on" is a monitor verb too — a
+        # non-brand product named after it ("keep an eye on the
+        # Aurora X9 earbuds") must extract, not fall through.
+        r"\b(?:keep\s+an\s+eye\s+on|keep\s+a?\s*watch\s+on|monitor|track|watch|check)\s+(?:(?:this|that|it|the\s+product|this\s+product)\b)?\s*,?\s*(.+)$",
         text.strip(),
         re.IGNORECASE | re.DOTALL,
     )
@@ -902,7 +1559,8 @@ def _product_phrase_from_text(text: str) -> str:
     # otherwise the follow-up becomes a phantom watch titled
     # "Every 2 Hours" / "Every Day" and the real watch never changes.
     phrase = re.sub(
-        r"^every\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b\s*,?\s*",
+        # FIX-B (M3): "evry" is the common misspelling of "every".
+        r"^(?:every|evry)\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b\s*,?\s*",
         "",
         phrase,
         flags=re.IGNORECASE,
@@ -919,9 +1577,10 @@ def _product_phrase_from_text(text: str) -> str:
         # "Iphone 17 10% Off" in the watch card and every alert.
         # No word boundary after the %: "%" is a non-word character,
         # so \b never matches after it ("10% off" would not cut).
-        r",\s*(?:alert|notify|tell)\b"
-        r"|\s+if\s+the\s+price\b|\s+if\s+it\b|\s+when\b|\s+and\s+(?:alert|notify|tell)\b"
-        r"|\s+every\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b"
+        r",\s*(?:alert|notify|tell|ping)\b"
+        r"|\s+if\s+the\s+price\b|\s+if\s+it\b|\s+when\b|\s+and\s+(?:alert|notify|tell|ping)\b"
+        r"|\s+and\s+also\s+(?:alert|notify|tell|ping|remind|check|watch|monitor|book|call|set|do|find|search)\b"
+        r"|\s+(?:every|evry)\s+(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*)?(?:minutes?|mins?|hours?|days?|mornings?|evenings?|nights?)\b"
         r"|\s+(?:\d+(?:\.\d{1,2})?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)\s*(?:%|percent|per\s*cent)",
         phrase,
         flags=re.IGNORECASE,
@@ -1015,6 +1674,40 @@ def is_continuous_monitoring_directive(text: str, history: Optional[list[dict[st
         return True
     if _WATCH_CONTROL_RE.search(text):
         return True
+    # Stream 2 follow-up (Stream 5 F1/F2): pronoun-only watch
+    # control ("cancel it", "Resume it."), interval-change follow-ups
+    # ("change it to every 45 mins") and relative changes ("make
+    # that check twice as often") never match the regex, so they fell
+    # through to the model layer, which fabricated the outcome in
+    # prose while the DB stayed unchanged. Route them to the
+    # deterministic handler — but ONLY when this chat already has a
+    # watch (a watch marker in the recent history): a bare "cancel
+    # it" with no watch is not a monitoring turn.
+    if _is_watch_follow_up(text, history):
+        return True
+    # A list-watches ask is answered from the DB by the handler.
+    # Guard: "show me both watches" can be wristwatch shopping, so
+    # this needs the word "product" or a watch in this chat.
+    if _WATCH_LIST_RE.search(text) and (
+        "product" in text.lower() or "my watches" in text.lower()
+        or _history_has_watch_marker(history)
+    ):
+        return True
+    # FIX-B (M6): "what did I ask you to watch earlier" is answered
+    # deterministically from the DB + history by the handler — never
+    # by the model layer, which denied a request the user had made.
+    if _WATCH_SUMMARY_RE.search(text):
+        return True
+    # FIX-B (B4): a stock follow-up ("also tell me if it goes out of
+    # stock") is a watch update, not a new conversational turn — but
+    # only when this chat already has something to attach it to (a
+    # watch marker or a monitored product in the history). With no
+    # watch context it stays conversational, so a bare stock question
+    # ("is it in stock?") is not hijacked into the handler.
+    if _STOCK_ALERT_RE.search(text) and (
+        _history_has_watch_marker(history) or _history_has_monitored_product(history or [])
+    ):
+        return True
     # Fix 5: a bare "yes" answering the alert offer the agent just
     # made ("Want me to keep an eye on it?") is an acceptance, not a
     # new conversational turn — route it to the handler so a real
@@ -1058,7 +1751,7 @@ def _history_has_monitored_product(history: list[dict[str, Any]]) -> bool:
             continue
         content = str(entry.get("content") or entry.get("message") or "")
         prod_m = _PRODUCT_RE.search(content)
-        if prod_m and not _is_service_name(_clean_product_match(prod_m.group(0))):
+        if prod_m and not _is_service_name(_clean_product_match(prod_m.group(0))) and not _is_retailer_or_place_product(_clean_product_match(prod_m.group(0))):
             return True
         if _product_phrase_from_text(content):
             return True
@@ -1147,7 +1840,19 @@ def needs_unverified_suggestion_note(instruction: str, answer: str) -> bool:
     return True
 
 
-def _extract_monitored_product(instruction: str, history: Optional[list[dict[str, Any]]] = None) -> tuple[str, str]:
+def _is_garbage_product_title(title: str) -> bool:
+    """True when a candidate "product" is really the instruction's
+    tail misread as a name: a pronoun-led fragment ("This For Every
+    5 Mins", "That Watch") or a bare cadence ("Twice As Often",
+    "Every 5 Mins"). No real product name contains those words, so
+    this is a safe repair trigger — never a product filter."""
+    words = set(re.findall(r"[a-z]+", (title or "").lower()))
+    return bool(words & {"this", "that", "it", "every", "twice", "half"})
+
+
+def _extract_monitored_product(instruction: str, history: Optional[list[dict[str, Any]]] = None,
+                               objective_product: str | None = None,
+                               objective_url: str | None = None) -> tuple[str, str]:
     """Extract product title and best available URL from instruction or recent history.
 
     Returns ("", "") when neither a product nor a store URL can be
@@ -1155,6 +1860,12 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     inventing a watch. The old fallback watched the Flipkart homepage
     for "your last suggestion", and the detector reads the first ₹
     price on the page, so that watch tracked a random banner price.
+
+    ``objective_product`` / ``objective_url`` are the structured
+    Objective's (Stream 1) product / target URL when the handler has
+    one: a pronoun-led or cadence-led regex candidate ("This For
+    Every 5 Mins") is garbage, and the objective's product replaces
+    it instead of minting a watch for the garbage name.
     """
     candidate_title = ""
     # A brand + model named in the instruction wins ("I want like the
@@ -1162,7 +1873,7 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     prod_m = _PRODUCT_RE.search(instruction or "")
     if prod_m:
         cleaned_match = _clean_product_match(prod_m.group(0))
-        if not _is_service_name(cleaned_match):
+        if not _is_service_name(cleaned_match) and not _is_retailer_or_place_product(cleaned_match):
             candidate_title = cleaned_match
     # The product named after the verb ("monitor this, Grandbiker Rear
     # Wheel Paddock Stand ...") — no brand in _MONITORED_BRANDS, so
@@ -1170,11 +1881,40 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     if not candidate_title:
         candidate_title = _product_phrase_from_text(instruction or "")
     # Weaker signal: "monitor price of X" / "track X on Amazon".
+    # A pronoun-led or cadence-led capture ("this for every 5 mins",
+    # "that watch", "every 5 mins") is the instruction's tail, not a
+    # product — the old code accepted it and minted a garbage watch
+    # titled "This For Every 5 Mins" (S1 Failure E). Reject it here
+    # so the handler asks instead of inventing a watch.
     if not candidate_title:
         m = re.search(r"\b(?:for|of|on)\s+([^,.\n]+?)(?:\s+(?:on|at|and|if|when)|$)", instruction, re.IGNORECASE)
         raw = m.group(1).strip() if m else ""
-        if raw.lower() not in ("this", "this product", "the product", "this price", "it", ""):
+        first = raw.lower().split(" ", 1)[0] if raw else ""
+        if (raw.lower() not in ("this", "this product", "the product", "this price", "it", "")
+                and first not in ("this", "that", "it")
+                and not raw.lower().startswith(("every ", "evry "))):
             candidate_title = raw
+
+    # Stream 2 (Failure E): the extractors above can hand back
+    # instruction metadata as the "product" — the weak for/of/on
+    # fallback took the interval phrase ("every 5 mins") and the
+    # verb-phrase extractor took the alert tail ("alert me") or a
+    # dangling preposition ("product for"), so the Flipkart search
+    # URL was built from the cadence instead of the product. Strip
+    # pronouns, intervals, conditions and notification phrases from
+    # the candidate; when nothing product-like remains there is no
+    # product in THIS instruction, so the history scan below (or the
+    # handler's ask-the-user branch) decides instead of a phantom
+    # watch titled "Every 5 Mins".
+    # Merge note (S2+S3): sanitizing can erase the garbage signal —
+    # "3 so can u watch the price of this for" sanitizes to
+    # "3 so can u watch", which no longer contains a garbage word,
+    # so the history scan and the objective repair below would both
+    # skip it and mint a watch for the remnant. Keep the pre-sanitize
+    # candidate so both checks below judge garbage-ness on it too.
+    raw_candidate_title = candidate_title
+    if candidate_title:
+        candidate_title = sanitize_query_text(candidate_title)
 
     # A URL pasted in the instruction itself wins — the history
     # loop below only sees earlier messages, so a URL given with the
@@ -1188,6 +1928,10 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     url_m = re.search(r"https?://[^\s\"'<>)]+", instruction or "")
     if url_m:
         best_url = url_m.group(0)
+    # The objective's target URL is the structured decision — it wins
+    # over a URL scraped from raw text when both are present.
+    if objective_url:
+        best_url = objective_url
 
     # Look back in history for product name and URL. The history scan
     # used to take the first brand+model match from ANY message —
@@ -1195,35 +1939,87 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     # Google Calendar ..."), which produced a watch for "Google
     # Calendar" when the user asked about a bike stand. Now: user
     # messages may name the product (verb phrase or brand+model);
-    # assistant messages only count when they carry a real suggestion
-    # (a store URL or a price), never a greeting or capability list.
-    # Service names ("Google Calendar") are rejected everywhere.
+    # assistant messages only count when they carry a real store URL,
+    # never a greeting or capability list — and never on a bare price
+    # mention alone (FIX-B M4: the assistant's B3 reply mentioned
+    # ₹34,990, which let "Sony India" out of its own prose become the
+    # product for B5's follow-up). Service names ("Google Calendar")
+    # and retailer/place names ("Sony India") are rejected everywhere.
+    # Two passes, user first: the operator's own words outrank the
+    # assistant's paraphrase, so an assistant-derived candidate can
+    # never shadow the product the user actually named.
     if history:
-        for entry in reversed(history):
-            content = entry.get("content") or entry.get("message") or ""
-            role = (entry.get("role") or "").lower()
-            # Check for URL (only when the instruction gave none)
-            url_match = re.search(r"https?://[^\s\"'<>)]+", content)
-            if not best_url and url_match and ("amazon" in url_match.group(0) or "flipkart" in url_match.group(0) or "croma" in url_match.group(0)):
-                best_url = url_match.group(0)
-            if candidate_title:
-                continue
-            if role == "user":
+        # Pass 0: a store URL from any message (a pasted URL is a real
+        # signal whatever its role) — only when the instruction gave none.
+        if not best_url:
+            for entry in reversed(history):
+                content = str(entry.get("content") or entry.get("message") or "")
+                url_match = re.search(r"https?://[^\s\"'<>)]+", content)
+                if url_match and ("amazon" in url_match.group(0) or "flipkart" in url_match.group(0) or "croma" in url_match.group(0)):
+                    best_url = url_match.group(0)
+                    break
+        # A garbage candidate ("This For Every 5 Mins") must not
+        # block the history scan: a real product named in an
+        # earlier message replaces it below. Judge garbage-ness
+        # on the pre-sanitize candidate too (see above).
+        needs_product = (
+            not candidate_title
+            or _is_garbage_product_title(candidate_title)
+            or _is_garbage_product_title(raw_candidate_title)
+        )
+        if needs_product:
+            # Pass 1: the user's own messages, most recent first.
+            for entry in reversed(history):
+                if (entry.get("role") or "").lower() != "user":
+                    continue
+                content = str(entry.get("content") or entry.get("message") or "")
                 phrase = _product_phrase_from_text(content)
                 if phrase:
                     candidate_title = phrase
+                    break
+                prod_m = _PRODUCT_RE.search(content)
+                if prod_m:
+                    cleaned_match = _clean_product_match(prod_m.group(0))
+                    if not _is_service_name(cleaned_match) and not _is_retailer_or_place_product(cleaned_match):
+                        candidate_title = cleaned_match
+                        break
+        if needs_product and (not candidate_title or _is_garbage_product_title(candidate_title)):
+            # Pass 2: assistant messages, ONLY when they carry a real
+            # store URL (a suggestion with a link). A bare price in
+            # prose ("launched around ₹34,990") is not a suggestion
+            # and never yields a product.
+            for entry in reversed(history):
+                if (entry.get("role") or "").lower() == "user":
                     continue
+                if not _STORE_LINK_RE.search(str(entry.get("content") or entry.get("message") or "")):
+                    continue
+                content = str(entry.get("content") or entry.get("message") or "")
                 prod_m = _PRODUCT_RE.search(content)
                 if prod_m:
                     cleaned_match = _clean_product_match(prod_m.group(0))
-                    if not _is_service_name(cleaned_match):
+                    if not _is_service_name(cleaned_match) and not _is_retailer_or_place_product(cleaned_match):
                         candidate_title = cleaned_match
-            elif _STORE_LINK_RE.search(content) or _PRICE_RE.search(content):
-                prod_m = _PRODUCT_RE.search(content)
-                if prod_m:
-                    cleaned_match = _clean_product_match(prod_m.group(0))
-                    if not _is_service_name(cleaned_match):
-                        candidate_title = cleaned_match
+                        break
+
+    # Stream 2 + Stream 3 (Failure E / S5 D10): a pronoun- or cadence-led
+    # candidate is garbage, never a product — and when the regexes
+    # find NO product at all, the structured objective's product is
+    # the answer (it extracted "Galaxy S26 Ultra 5G" from the preamble
+    # the regexes cannot read). Prefer the objective's product when the
+    # candidate is empty or garbage; otherwise drop the garbage so the
+    # caller asks instead of minting a watch for it. A clean regex
+    # candidate still wins — the objective is the repair, not the
+    # default. Then strip any threshold tail the history scan may have
+    # kept ("kestrel 4k drone below 40000"). Judge garbage-ness on the
+    # pre-sanitize candidate too (see above): a sanitized remnant like
+    # "3 so can u watch" must still trigger the objective repair.
+    if not candidate_title or _is_garbage_product_title(candidate_title) or _is_garbage_product_title(raw_candidate_title):
+        if objective_product and not _is_service_name(objective_product) and not _is_retailer_or_place_product(objective_product):
+            candidate_title = objective_product
+        elif candidate_title:
+            candidate_title = ""
+    if candidate_title:
+        candidate_title = sanitize_query_text(candidate_title)
 
     if not candidate_title and not best_url:
         # No product was named anywhere: say so instead of inventing
@@ -1452,14 +2248,306 @@ def _threshold_from_history(history: Optional[list[dict[str, Any]]]) -> float | 
     return None
 
 
+def upsert_monitor_mission(*, product_title: str, watch_title: str, target_url: str,
+                         trigger_type: str, schedule_cron: str | None,
+                         interval_seconds: int, condition_type: str,
+                         condition_params: dict, below: float | None = None,
+                         percent: float | None = None,
+                         stock_alert: bool | None = None,
+                         chat_id: str | None = None,
+                         db_path: str | None = None) -> dict[str, Any]:
+    """Structured create-or-update of a ``monitoring_missions`` row.
+
+    Stream 3: the single creation core shared by the NL handler
+    (:func:`handle_continuous_monitoring_instruction`, which parses
+    raw text) and the structured orchestration pipeline
+    (:func:`app.monitoring_orchestration.orchestrate_monitor`, which
+    is driven by Objective + WorkingContext, never by raw text).
+
+    Returns ``{"mission_id", "outcome", "row", "previous"}`` where
+    outcome is "created" | "existing" | "updated", "row" is the
+    post-state row and "previous" is the pre-existing active row for
+    this product (or None). Dedup semantics (unchanged from the
+    handler's inline logic): a follow-up that only changes the
+    cadence must not create a SECOND watch — same settings returns
+    the existing mission; different settings update the existing
+    mission in place; only a genuinely new product creates a row.
+    The comparison uses the condition-relevant values only
+    (threshold for below_price, min_percent normalised None -> 0
+    for price_drop), never the display target, so a re-ask that adds
+    or drops the brand still matches the same watch.
+    ``stock_alert`` is tri-state (FIX-B B4): True/False sets the
+    out-of-stock flag, None (the default, used by the structured
+    orchestration pipeline) preserves whatever the stored row has —
+    a cadence change must not silently wipe a stock condition the
+    user asked for earlier.
+    """
+    db.init_db(db_path)
+    now = time.time()
+    with db.get_connection(db_path) as conn:
+        existing = conn.execute(
+            """SELECT id, trigger_type, condition_type, condition_params, interval_seconds, schedule_cron
+               FROM monitoring_missions
+               WHERE conversation_id = ? AND title = ? AND status = 'active'
+               ORDER BY created_at DESC LIMIT 1""",
+            (chat_id or "default", watch_title),
+        ).fetchone()
+    # A re-ask that adds or drops the brand ("Apple iPhone 17"
+    # after "iPhone 17") is the same watch — fall back to the
+    # normalised-title match, or it becomes a duplicate watch.
+    if existing is None:
+        existing = _find_active_watch(product_title, chat_id, db_path)
+    if existing is not None:
+        previous = dict(existing)
+        try:
+            stored_params = json.loads(previous.get("condition_params") or "{}")
+        except Exception:
+            stored_params = {}
+        stored_threshold = stored_params.get("threshold")
+        stored_percent = stored_params.get("min_percent")
+        stored_stock = bool(stored_params.get("stock_alert")) if isinstance(stored_params, dict) else False
+        effective_stock = stored_stock if stock_alert is None else bool(stock_alert)
+        same_settings = (
+            previous["trigger_type"] == trigger_type
+            and previous["interval_seconds"] == interval_seconds
+            and (previous["schedule_cron"] or None) == (schedule_cron or None)
+            and previous["condition_type"] == condition_type
+            and (stored_threshold if condition_type == "below_price" else None)
+            == (below if condition_type == "below_price" else None)
+            and ((stored_percent or 0) if condition_type == "price_drop" else None)
+            == ((percent or 0) if condition_type == "price_drop" else None)
+            and stored_stock == effective_stock
+        )
+        if same_settings:
+            return {"mission_id": previous["id"], "outcome": "existing",
+                    "row": previous, "previous": previous}
+        merged_params = dict(condition_params or {})
+        if effective_stock:
+            merged_params["stock_alert"] = True
+        else:
+            merged_params.pop("stock_alert", None)
+        with db.get_connection(db_path) as conn:
+            conn.execute(
+                """UPDATE monitoring_missions
+                   SET target_url = ?, trigger_type = ?, schedule_cron = ?, interval_seconds = ?,
+                       condition_type = ?, condition_params = ?, next_run_at = ?
+                   WHERE id = ?""",
+                (target_url, trigger_type, schedule_cron, interval_seconds,
+                 condition_type, json.dumps(merged_params), now, previous["id"]),
+            )
+            conn.commit()
+        with db.get_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM monitoring_missions WHERE id=?", (previous["id"],)
+            ).fetchone()
+        return {"mission_id": previous["id"], "outcome": "updated",
+                "row": dict(row) if row else previous, "previous": previous}
+    mission_id = str(uuid.uuid4())
+    merged_params = dict(condition_params or {})
+    if stock_alert is True:
+        merged_params["stock_alert"] = True
+    elif stock_alert is False:
+        merged_params.pop("stock_alert", None)
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            """INSERT INTO monitoring_missions
+            (id, conversation_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
+             condition_type, condition_params, status, created_at, next_run_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (mission_id, chat_id or "default", watch_title, target_url,
+             trigger_type, schedule_cron, interval_seconds, condition_type,
+             json.dumps(merged_params), now, now),
+        )
+        conn.commit()
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+    return {"mission_id": mission_id, "outcome": "created",
+            "row": dict(row) if row else {"id": mission_id}, "previous": None}
+
+
+# ---------------------------------------------------------------------------
+# Structured Objective consumption (Stream 1 + Stream 3, S5 D10 / S1 E)
+# ---------------------------------------------------------------------------
+
+def _objective_for(instruction: str, objective: Any | None = None) -> dict | None:
+    """The structured Objective for this turn, as a plain dict.
+
+    Prefer the objective the caller already built (agentLoop stores
+    it in working memory as ``initial_memory["objective"]``); otherwise
+    build it from the instruction with Stream 1's deterministic
+    classifier. Returns None when no objective module exists (the base
+    build has no ``objective.py``) or the build fails — the regex paths
+    below are the fallback, so the handler never depends on the
+    objective existing.
+    """
+    if objective is not None:
+        if isinstance(objective, dict):
+            return objective
+        to_dict = getattr(objective, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return to_dict()
+            except Exception:
+                return None
+        return None
+    try:
+        from .objective import build_objective
+    except Exception:
+        return None
+    try:
+        obj = build_objective(instruction or "")
+    except Exception:
+        return None
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return to_dict()
+        except Exception:
+            return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _relative_interval_seconds(factor: str, current: int) -> int:
+    """New interval for a relative update, 60 s floor. ``twice_as_often``
+    halves the cadence; ``half_as_often`` doubles it. The factor is
+    NEVER a guessed number — it comes from the objective's
+    ``relative_interval`` entity; the current interval comes from the
+    DB row being updated."""
+    if factor == "twice_as_often":
+        return max(60, int(current or 300) // 2)
+    if factor == "half_as_often":
+        return int(current or 300) * 2
+    raise ValueError(f"unknown relative_interval {factor!r}")
+
+
+def _resolve_update_target(objective: dict, chat_id: Optional[str],
+                           history: Optional[list[dict[str, Any]]],
+                           db_path: Optional[str]) -> tuple[dict | None, bool]:
+    """The watch a pronoun-only update refers to. Returns (row,
+    ambiguous). Resolution order: the objective's watch ref / product,
+    the most recent product named in history, then — only when exactly
+    one active watch exists — that watch. Several active watches and
+    no referent is ambiguous, never a guess."""
+    entities = (objective or {}).get("entities") or {}
+    for ref in (entities.get("watch_id"), entities.get("watch_ref"),
+                entities.get("product")):
+        if ref:
+            row, ambiguous = _resolve_watch(str(ref), chat_id, db_path)
+            if row is not None or ambiguous:
+                return (dict(row) if row is not None else None), ambiguous
+    if history:
+        product, _url = _extract_monitored_product("", history=history)
+        if product and not _is_garbage_product_title(product):
+            row, ambiguous = _resolve_watch(product, chat_id, db_path)
+            if row is not None or ambiguous:
+                return (dict(row) if row is not None else None), ambiguous
+    db.init_db(db_path)
+    with db.get_connection(db_path) as conn:
+        active = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE status='active' "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+    if len(active) == 1:
+        return dict(active[0]), False
+    if len(active) > 1:
+        return None, True
+    return None, False
+
+
+def _apply_relative_interval_update(objective: dict, instruction: str,
+                                    chat_id: Optional[str],
+                                    history: Optional[list[dict[str, Any]]],
+                                    db_path: Optional[str]) -> str | None:
+    """S5 gen D10: "make that check twice as often". Halve (or double)
+    the resolved watch's interval IN PLACE and return the reply.
+
+    Returns None only when the objective carries no relative interval
+    (not this turn's case). Every relative-interval turn is answered
+    here — updated, or an honest "which watch?" — so it can never fall
+    through to creation, where the old path extracted "Twice As Often"
+    as a product name and minted a second 300 s watch while the
+    original stayed at 3600 s.
+    """
+    entities = (objective or {}).get("entities") or {}
+    factor = entities.get("relative_interval")
+    if factor not in ("twice_as_often", "half_as_often"):
+        return None
+    row, ambiguous = _resolve_update_target(objective, chat_id, history, db_path)
+    if ambiguous:
+        return ("That matches more than one watch — tell me which one to check "
+                f"{'twice' if factor == 'twice_as_often' else 'half'} as often, "
+                "by name or id (from the watch card). No watch was changed.")
+    if row is None:
+        return ("I don't have a watch to change yet — no watch is running in "
+                "this conversation. Tell me which product to watch first, and "
+                "I'll set it up.")
+    mission_id = row["id"]
+    title = row["title"] or mission_id
+    old_interval = row.get("interval_seconds") or 300
+    old_cadence = ("daily" if row.get("trigger_type") == "cron"
+                   else _describe_interval(old_interval))
+    try:
+        new_interval = _relative_interval_seconds(factor, old_interval)
+    except ValueError:
+        return (f"I can't apply that relative change ({factor!r}) — say the new "
+                "interval directly, e.g. 'check every 30 minutes'. No watch was changed.")
+    now = time.time()
+    with db.get_connection(db_path) as conn:
+        # A daily cron watch has no interval to halve: the relative
+        # change converts it to an interval watch at the halved (or
+        # doubled) cadence, and the reply says so plainly.
+        conn.execute(
+            """UPDATE monitoring_missions
+               SET trigger_type='interval', schedule_cron=NULL,
+                   interval_seconds=?, next_run_at=?
+               WHERE id=?""",
+            (new_interval, now, mission_id),
+        )
+        conn.commit()
+    with db.get_connection(db_path) as conn:
+        reread = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+    if reread is None or reread["interval_seconds"] != new_interval:
+        return ("The watch change did not persist — the stored interval is "
+                f"unchanged. No watch was changed; try again or check the dashboard.")
+    hub.spawn(hub.broadcast_control_state())
+    from .monitoring_scheduler import format_ist_short
+
+    new_cadence = _describe_interval(new_interval)
+    return (
+        f"Updated the watch for **{title}** — it was checking {old_cadence}, "
+        f"now checking {new_cadence}.\n\n"
+        f"• **Watch ID:** `{mission_id}`\n"
+        f"• **Next check:** {format_ist_short(now) or '—'}\n"
+        f"• **Manage:** say `pause watch {mission_id[:8]}`, `resume watch {mission_id[:8]}`, "
+        f"or `cancel watch {mission_id[:8]}`, or use the card below."
+    ) + f"\n\n<!-- privagent-watch: {mission_id} -->"
+
+
 async def handle_continuous_monitoring_instruction(
     instruction: str,
     chat_id: Optional[str] = None,
     history: Optional[list[dict[str, Any]]] = None,
     db_path: Optional[str] = None,
+    objective: Any | None = None,
 ) -> str:
     """Register a persistent continuous monitoring mission and return natural departure handoff."""
     db.init_db(db_path)
+    # Stream 3 (S5 D10 / S1 E): consume the structured Objective
+    # (Stream 1) when one is available — built here from the
+    # instruction when the caller did not pass one (agentLoop stores
+    # it in working memory as initial_memory["objective"]). A relative
+    # interval ("twice as often") is handled before anything else: it
+    # updates the resolved watch in place and never reaches creation.
+    obj = _objective_for(instruction, objective=objective)
+    if obj and (obj.get("entities") or {}).get("relative_interval"):
+        relative_answer = _apply_relative_interval_update(
+            obj, instruction, chat_id, history, db_path)
+        if relative_answer is not None:
+            return relative_answer
     # Stream C: chat control + NL scheduling dispatch first — but a
     # genuine monitor ask always wins over a control phrase that
     # happens to share a word ("show me the jobs" inside a track-new
@@ -1468,9 +2556,26 @@ async def handle_continuous_monitoring_instruction(
         job_answer = _handle_job_control(instruction, db_path)
         if job_answer is not None:
             return job_answer
-        watch_answer = _handle_watch_control(instruction, chat_id, db_path)
+        # Stream 2 follow-up (Stream 5 F2/F4/D10): watch list,
+        # watch control and relative-cadence follow-ups are answered
+        # by the deterministic handler (DB-verified), never by the
+        # model layer — the model used to claim the change in prose
+        # while the DB stayed unchanged.
+        list_answer = _handle_watch_list(instruction, chat_id, db_path, history)
+        if list_answer is not None:
+            return list_answer
+        summary_answer = _handle_watch_summary(instruction, chat_id, db_path, history)
+        if summary_answer is not None:
+            return summary_answer
+        watch_answer = _handle_watch_control(instruction, chat_id, db_path, history)
         if watch_answer is not None:
             return watch_answer
+        stock_answer = _handle_stock_follow_up(instruction, chat_id, db_path, history)
+        if stock_answer is not None:
+            return stock_answer
+        relative_answer = _handle_relative_interval(instruction, chat_id, db_path)
+        if relative_answer is not None:
+            return relative_answer
         if is_schedule_directive(instruction):
             return await _handle_schedule_instruction(instruction, chat_id, history, db_path)
     # Price signals are read first: a price ask must never become a
@@ -1520,7 +2625,18 @@ async def handle_continuous_monitoring_instruction(
                 "or ask me to search for the listings first and I'll offer the watch after."
             )
         return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path)
-    product_title, target_url = _extract_monitored_product(instruction, history=history)
+    # The objective's product / target URL (Stream 1) is the
+    # structured decision: it repairs a pronoun-led regex candidate
+    # ("This For Every 5 Mins") inside _extract_monitored_product
+    # instead of minting a watch for the garbage name (S1 Failure E).
+    obj_product = obj_target_url = None
+    if obj and obj.get("primary_intent") in (
+            "monitor_product", "monitor_website", "monitor_new_listings"):
+        obj_product = ((obj.get("entities") or {}).get("product") or "").strip() or None
+        obj_target_url = (obj.get("target_url") or "").strip() or None
+    product_title, target_url = _extract_monitored_product(
+        instruction, history=history,
+        objective_product=obj_product, objective_url=obj_target_url)
     if not product_title:
         # Bare "yes" answering the alert offer after a listing search
         # (e.g. internships): the history carries the search page, so
@@ -1542,6 +2658,21 @@ async def handle_continuous_monitoring_instruction(
             "in this conversation. Tell me which product to watch (for example, "
             "\"watch the Samsung Galaxy Fit3\") or paste the store link, and I'll "
             "set up the watch."
+        )
+
+    # FIX-B (M4): a pure follow-up ("change it to every 45 mins")
+    # names no product of its own — its product comes from history.
+    # When no watch exists for that product, the follow-up cannot be
+    # an update of anything: creating one now would mint a watch
+    # from a paraphrase (in the live run, from the assistant's own
+    # "Sony India" text). Ask instead — never create a watch from a
+    # follow-up with no resolvable existing watch.
+    if _is_pure_follow_up(instruction) and _find_watch_by_product(product_title, chat_id, db_path) is None:
+        return (
+            f"I don't have a watch running for **{product_title}** yet, so there's "
+            "nothing to change — the earlier ask never became a watch. Tell me "
+            "which product to watch (with its price condition and how often to "
+            "check) and I'll set it up."
         )
 
     # Stream C (RC-LIVE-04): creation uses the SAME URL gate as the
@@ -1572,7 +2703,9 @@ async def handle_continuous_monitoring_instruction(
     if percent is None and below is None:
         below, percent = _thresholds_from_existing_watch(product_title, chat_id, db_path)
 
-    mission_id = str(uuid.uuid4())
+    # Stream 3: the mission id is minted inside upsert_monitor_mission
+    # (shared creation core) — no id is allocated before the dedup
+    # check, or a re-ask would burn an id for a watch that already exists.
     now = time.time()
     # Stream C: a generic (non-store) page watch is a text_change /
     # keyword watch, NOT a price watch. The old code built a
@@ -1708,6 +2841,57 @@ async def handle_continuous_monitoring_instruction(
             f"the below-₹{below:g} condition, not the percent drop.\n"
         )
 
+    # FIX-B (B4): a stock condition is stored on the watch, never
+    # dropped. It is requested either in this turn ("watch X, tell me
+    # if it goes out of stock") or inherited from the running watch
+    # (a later cadence change must not wipe it — upsert overwrites
+    # condition_params wholesale). A stock-only change — every other
+    # setting identical to the stored row — is applied directly
+    # below, so the reply says what actually changed instead of the
+    # upsert's "Updated ... now checking <same cadence>".
+    stock_alert = _wants_stock_alert(instruction) or _stock_alert_from_existing_watch(
+        product_title, chat_id, db_path
+    )
+    if stock_alert:
+        condition_params = {**condition_params, "stock_alert": True}
+        alert_line += "• **Stock alert:** I'll also alert you if it goes out of stock\n"
+    if stock_alert and _wants_stock_alert(instruction):
+        _existing_row = _find_watch_by_product(product_title, chat_id, db_path)
+        if _existing_row is not None:
+            try:
+                _stored = json.loads(_existing_row["condition_params"] or "{}")
+            except Exception:
+                _stored = {}
+            if not isinstance(_stored, dict):
+                _stored = {}
+            _same_except_stock = (
+                _existing_row["trigger_type"] == trigger_type
+                and (_existing_row["interval_seconds"] or 300) == interval_sec
+                and (_existing_row["schedule_cron"] or None) == (schedule_cron or None)
+                and _existing_row["condition_type"] == condition_type
+                and (_as_float(_stored.get("threshold")) if condition_type == "below_price" else None)
+                == (below if condition_type == "below_price" else None)
+                and ((_as_float(_stored.get("min_percent")) or 0) if condition_type == "price_drop" else None)
+                == ((percent or 0) if condition_type == "price_drop" else None)
+            )
+            if _same_except_stock and _stored.get("stock_alert") is not True:
+                _stored["stock_alert"] = True
+                with db.get_connection(db_path) as conn:
+                    conn.execute(
+                        "UPDATE monitoring_missions SET condition_params=? WHERE id=?",
+                        (json.dumps(_stored), _existing_row["id"]),
+                    )
+                    conn.commit()
+                hub.spawn(hub.broadcast_control_state())
+                return (
+                    f"Done — the watch for **{product_title}** will now also alert you if it goes "
+                    f"out of stock, in addition to its price check "
+                    f"{_describe_interval(interval_sec) if trigger_type == 'interval' else 'daily'}.\n\n"
+                    f"• **Watch ID:** `{_existing_row['id']}`\n"
+                    f"• **Status:** {_existing_row['status']}\n\n"
+                    f"<!-- privagent-watch: {_existing_row['id']} -->"
+                )
+
     # A follow-up that only changes the cadence ("check its price and
     # just alert me every 5 minutes") must not create a SECOND watch
     # for the same product — the first watch already checks every 5
@@ -1719,26 +2903,53 @@ async def handle_continuous_monitoring_instruction(
     # nothing, so the reply was false and the request was silently
     # dropped. Same settings -> say so; different settings -> update
     # the existing mission in place and say what changed.
-    with db.get_connection(db_path) as conn:
-        existing = conn.execute(
-            """SELECT id, trigger_type, condition_type, condition_params, interval_seconds, schedule_cron
-               FROM monitoring_missions
-               WHERE conversation_id = ? AND title = ? AND status = 'active'
-               ORDER BY created_at DESC LIMIT 1""",
-            (chat_id or "default", watch_title),
-        ).fetchone()
-    # A re-ask that adds or drops the brand ("Apple iPhone 17"
-    # after "iPhone 17") is the same watch — fall back to the
-    # normalised-title match, or it becomes a duplicate watch.
-    if existing is None:
-        existing = _find_active_watch(product_title, chat_id, db_path)
-    if existing:
+    # Stream 3: the dedup/update/insert itself lives in
+    # upsert_monitor_mission (shared with the structured
+    # orchestration pipeline); this handler only builds the replies.
+    upsert = upsert_monitor_mission(
+        product_title=product_title, watch_title=watch_title, target_url=target_url,
+        trigger_type=trigger_type, schedule_cron=schedule_cron,
+        interval_seconds=interval_sec, condition_type=condition_type,
+        condition_params=condition_params, below=below, percent=percent,
+        stock_alert=True if stock_alert else None,
+        chat_id=chat_id, db_path=db_path,
+    )
+    mission_id = upsert["mission_id"]
+    existing = upsert["previous"]
+    if upsert["outcome"] == "existing" and existing is not None:
         try:
-            stored_params = json.loads(existing["condition_params"] or "{}")
+            stored_params = json.loads(existing.get("condition_params") or "{}")
         except Exception:
             stored_params = {}
         stored_threshold = stored_params.get("threshold")
         stored_percent = stored_params.get("min_percent")
+        cadence = _describe_interval(interval_sec) if trigger_type == "interval" else "daily"
+        if below is not None:
+            threshold_line = f", alerting when the price falls below \u20b9{below:g}"
+        elif condition_type == "price_drop":
+            threshold_line = _percent_threshold_text(
+                percent if percent is not None else stored_percent
+            )
+        else:
+            threshold_line = ""
+        return (
+            f"That watch is already running — **{product_title}** is being checked "
+            f"{cadence}{threshold_line}."
+        ) + f"\n\n<!-- privagent-watch: {existing['id']} -->"
+    if upsert["outcome"] == "updated" and existing is not None:
+        try:
+            stored_params = json.loads(existing.get("condition_params") or "{}")
+        except Exception:
+            stored_params = {}
+        stored_threshold = _as_float(stored_params.get("threshold"))
+        stored_percent = _as_float(stored_params.get("min_percent"))
+        # Stream 2 (Failure E format-string fix): stored_params is
+        # untyped JSON — a threshold stored as the string "5000"
+        # used to crash the reply below at f"{stored_threshold:g}"
+        # (ValueError: Unknown format code 'g' for object of type
+        # 'str') and to fail the same-settings comparison against
+        # the float the handler parses. Coerced here, both the
+        # comparison and the :g formatting below see floats.
         # A bare price_drop watch stores min_percent 0 while a bare
         # re-ask parses percent None — compare them normalized (None
         # -> 0) or the re-ask never matches and the user gets a false
@@ -1774,7 +2985,7 @@ async def handle_continuous_monitoring_instruction(
         )
         new_cadence = _describe_interval(interval_sec) if trigger_type == "interval" else "daily"
         old_threshold = (
-            f", alerting below ₹{stored_threshold:g}"
+            f", alerting below \u20b9{stored_threshold:g}"
             if stored_threshold is not None
             else (
                 _percent_threshold_text(stored_percent)
@@ -1783,7 +2994,7 @@ async def handle_continuous_monitoring_instruction(
             )
         )
         new_threshold = (
-            f", alerting when the price falls below ₹{below:g}"
+            f", alerting when the price falls below \u20b9{below:g}"
             if below is not None
             else (
                 _percent_threshold_text(percent)
@@ -1791,24 +3002,6 @@ async def handle_continuous_monitoring_instruction(
                 else ""
             )
         )
-        with db.get_connection(db_path) as conn:
-            conn.execute(
-                """UPDATE monitoring_missions
-                   SET target_url = ?, trigger_type = ?, schedule_cron = ?, interval_seconds = ?,
-                       condition_type = ?, condition_params = ?, next_run_at = ?
-                   WHERE id = ?""",
-                (
-                    target_url,
-                    trigger_type,
-                    schedule_cron,
-                    interval_sec,
-                    condition_type,
-                    json.dumps(condition_params),
-                    now,
-                    existing["id"],
-                ),
-            )
-            conn.commit()
         # Stream C (R-03): broadcast_control_state now exists on the
         # hub; the old try/except: pass hid the missing method.
         hub.spawn(hub.broadcast_control_state())
@@ -1822,28 +3015,6 @@ async def handle_continuous_monitoring_instruction(
             f"• **Manage:** say `pause watch {existing['id'][:8]}`, `resume watch {existing['id'][:8]}`, "
             f"or `cancel watch {existing['id'][:8]}`, or use the card below."
         ) + f"\n\n<!-- privagent-watch: {existing['id']} -->"
-
-    with db.get_connection(db_path) as conn:
-        conn.execute(
-            """INSERT INTO monitoring_missions
-            (id, conversation_id, title, target_url, trigger_type, schedule_cron, interval_seconds,
-             condition_type, condition_params, status, created_at, next_run_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
-            (
-                mission_id,
-                chat_id or "default",
-                watch_title,
-                target_url,
-                trigger_type,
-                schedule_cron,
-                interval_sec,
-                condition_type,
-                json.dumps(condition_params),
-                now,
-                now,
-            ),
-        )
-        conn.commit()
 
     # Inform connected workspace clients (alerts land in the
     # conversation the watch was created in).

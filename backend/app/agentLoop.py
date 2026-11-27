@@ -243,10 +243,271 @@ async def run_with_injection(
         _takeover_wait_events.pop(task_id, None)
 
 
+# ---------------------------------------------------------------------------
+# Stream 4: form-result reading.
+#
+# Live failure (YatraDemo, 2026-11-27): the agent filled the search form,
+# submitted it, and then re-filled the same form for 50 steps without ever
+# reading or reporting the results. Three stacked causes, all fixed here
+# or in the extension (see extension/lib/content.ts — <li>/<article>
+# results were missing from the observation's page text):
+#
+# 1. `raw_text` below never saw the extension's `pageText` key, so every
+#    loop-side detector that reads page text (send verification, research
+#    harvesting, takeover triggers) ran on an empty string.
+# 2. Nothing in the loop recognised "the form was submitted and the
+#    results are now on the page", so a re-fill looked like fresh work.
+# 3. The planner could not see result content at all (cause 1 in the
+#    extension), so it concluded the search had produced nothing.
+#
+# The helpers below are deliberately generic: currency amounts and
+# result wording, never a site name, a sandbox host, or a user prompt.
+# ---------------------------------------------------------------------------
+
+_CURRENCY_RE = re.compile(r"(?:₹|Rs\.?|INR|\$|£|€)\s?[\d,]+(?:\.\d{1,2})?")
+_EMPTY_RESULTS_RE = re.compile(
+    r"no (?:options|products|results?|items?) (?:found|match)|"
+    r"no .*? found for this|"
+    r"0 products?|"
+    r"nothing (?:found|matches)",
+    re.IGNORECASE,
+)
+_RESULT_WORD_RE = re.compile(r"\b(results?|options?|products?|listings?|fares?|prices?)\b", re.IGNORECASE)
+_SUBMIT_NAME_RE = re.compile(r"\b(search|submit|find|apply|go)\b", re.IGNORECASE)
+# Instructions that ask for an ANSWER about the results (as opposed to a
+# follow-on action such as booking or buying). Only for those does the
+# loop complete deterministically from the visible results; action tasks
+# only get the "read the results" penalty and keep their own next step.
+_ANSWER_REQUEST_RE = re.compile(
+    r"\b(cheapest|lowest\s+price|best\s+price|how\s+much|what(?:'s| is) the price|"
+    r"tell me .* price|cheapest option|which .* (?:cheapest|best|lowest)|"
+    r"list .* (?:options|products|results)|compare .* prices?)\b",
+    re.IGNORECASE,
+)
+
+
+def _results_state_in_text(text: str) -> str | None:
+    """What the fresh page text says about search results.
+
+    Returns "results" when priced result content is visible, "empty"
+    when the page says the search returned nothing, else None. A
+    single price with a result word counts (one-option routes exist);
+    a lone price with no result wording does not — a fare shown on a
+    booking summary is not a results list.
+    """
+    if not text:
+        return None
+    amounts = _CURRENCY_RE.findall(text)
+    if _EMPTY_RESULTS_RE.search(text) and not amounts:
+        return "empty"
+    if len(amounts) >= 2:
+        return "results"
+    if amounts and _RESULT_WORD_RE.search(text):
+        return "results"
+    return None
+
+
+def _search_submitted_in_history(history: list[dict[str, Any]]) -> bool:
+    """True when a search form was already submitted in this task: a
+    successful `type` with submit, or a successful click on a
+    search/submit-named control."""
+    for entry in history or []:
+        if not entry.get("result_ok"):
+            continue
+        action = entry.get("action") or {}
+        params = action.get("params") or {}
+        if action.get("type") == "type" and params.get("submit"):
+            return True
+        if action.get("type") == "click":
+            target = action.get("target") or {}
+            name = str(target.get("name") or target.get("targetId") or "")
+            if _SUBMIT_NAME_RE.search(name):
+                return True
+    return False
+
+
+def _is_form_refill_action(action: dict[str, Any]) -> bool:
+    """True when the planned action re-fills a search form instead of
+    acting on results: typing, picking a date, choosing a select
+    option, or clicking a search/submit control. Clicking a result
+    (select/buy/book/details) is NOT a refill and is never blocked."""
+    if not isinstance(action, dict):
+        return False
+    if action.get("type") in {"type", "set_date", "select"}:
+        return True
+    if action.get("type") == "click":
+        target = action.get("target") or {}
+        name = str(target.get("name") or target.get("targetId") or "")
+        return bool(_SUBMIT_NAME_RE.search(name))
+    return False
+
+
+def _extract_result_summary(text: str) -> str | None:
+    """Deterministic summary of the priced results visible in page text.
+
+    Results arrive as blank-line-separated blocks (one block per option:
+    service/product name, times or specs, fare). The cheapest block wins;
+    the summary quotes it in full and counts the other priced blocks.
+    Blocks carrying an email address or a long digit run (phone/order
+    ids) are skipped — result blocks are names, times, and fares, never
+    PII. Returns None when no priced block can be extracted."""
+    if not text:
+        return None
+    priced: list[tuple[float, str]] = []
+    for _block in re.split(r"\n\s*\n", str(text)):
+        _lines = [re.sub(r"\s+", " ", ln).strip() for ln in _block.splitlines()]
+        _lines = [ln for ln in _lines if ln]
+        if not _lines:
+            continue
+        _joined = " · ".join(_lines)
+        if len(_joined) > 300 or "@" in _joined:
+            continue
+        if re.search(r"\d{6,}", _joined):
+            continue
+        _found = _CURRENCY_RE.findall(_joined)
+        if not _found:
+            continue
+        try:
+            _amount = float(re.sub(r"[^\d.]", "", _found[0]) or "nan")
+        except ValueError:
+            continue
+        priced.append((_amount, _joined))
+    if not priced:
+        return None
+    priced.sort(key=lambda p: p[0])
+    cheapest_amount, cheapest_block = priced[0]
+    summary = f"Cheapest option: {cheapest_block}."
+    if len(priced) > 1:
+        summary += f" {len(priced) - 1} other priced option(s) shown."
+    summary += " (Read from the search results shown in the browser.)"
+    return summary
+
+
+def _record_results_page_as_research_source(
+    working_memory: dict, task_id: str, instruction: str, url: str, title: str, text: str
+) -> bool:
+    """Record the results page just read in the browser as a research source.
+
+    Live failure (YatraDemo, 2026-11-27): the loop completed a form-answer
+    task with the correct cheapest-option summary read from the results
+    page, but the completion verifier classifies "search for ... tell me
+    the cheapest" as RESEARCH and requires a substantive source in
+    ``research_knowledge_package`` — which the loop never built for this
+    task class (``is_research`` is never set for a form task), so the
+    correct answer was discarded as "Research incomplete". The page the
+    agent actually read IS the substantive source. Harvest it with the
+    collector's own function and reliability scoring, so the verifier can
+    see the evidence behind the answer. Returns True when a source was
+    registered. Never raises; a harvest failure leaves the answer intact.
+    A page the collector itself classifies as a search-results page is
+    never registered as a substantive source."""
+    try:
+        from .research.collector import harvest_page_evidence
+        from .research.models import ResearchKnowledgePackage, ResearchTopic
+
+        _pkg_data = working_memory.get("research_knowledge_package")
+        if isinstance(_pkg_data, dict) and _pkg_data:
+            _pkg = ResearchKnowledgePackage.from_dict(_pkg_data)
+        else:
+            _pkg = ResearchKnowledgePackage(
+                package_id=f"pkg_{task_id}",
+                topic=ResearchTopic(
+                    title=working_memory.get("research_topic") or instruction,
+                    objective=instruction,
+                ),
+            )
+        _result = harvest_page_evidence(url, title, text, _pkg)
+        if _result and getattr(_result, "status", None) in ("success", "duplicate"):
+            working_memory["research_knowledge_package"] = _pkg.to_dict()
+            return True
+        # harvest_page_evidence returns "search_results"/"inaccessible"/
+        # "error" for pages it refuses to count — respect the refusal.
+        return False
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Stream 4: the task's own authorized host as a research source.
+#
+# Live failure (YatraDemo, 2026-11-27): the compound instruction split
+# into "Navigate to http://127.0.0.1:8124/" (part 1) and "search for
+# flights ..." (part 2). Part 2 carries no URL of its own, so discovery
+# ran Scenario B, offered only public travel hubs, and the task allow-list
+# ([127.0.0.1, localhost]) filtered every one of them out — "Research
+# blocked: no source on the domain allow-list". The sandbox host the
+# operator authorized for the mission was never offered as a source.
+# The same shape bites a single instruction naming a loopback URL: the
+# resolver rejects it as SSRF-unsafe, so Scenario A returns an empty
+# primary URL and no blocked reason.
+#
+# Rule: an explicit http(s) URL named in the task's own instruction —
+# or, for a compound part, in its parent task's instruction — IS an
+# authorized research/navigation source when its host passes the task's
+# own domain allow-list. The allow-list stays the authorization
+# boundary: a host outside it is never admitted by this override.
+# No resolver/allow-list/planner code is touched (other streams' files).
+# ---------------------------------------------------------------------------
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>)]+")
+
+
+def _task_authorized_host_url(
+    instruction: str,
+    allowed_domains: list[str] | None,
+    *,
+    parent_instruction: str | None = None,
+) -> str | None:
+    """First explicit URL in the instruction (else the parent task's)
+    whose host the task's domain allow-list permits, else None."""
+    from .allowlist import url_allowed
+
+    candidates: list[str] = []
+    for _text in (instruction or "", parent_instruction or ""):
+        candidates.extend(_URL_IN_TEXT_RE.findall(_text))
+    for _raw in candidates:
+        _url = _raw.rstrip(".,)")
+        try:
+            if url_allowed(_url, allowed_domains):
+                return _url
+        except Exception:
+            continue
+    return None
+
+
+def _apply_authorized_host_override(
+    discovery_res: dict[str, Any],
+    host_url: str,
+) -> dict[str, Any]:
+    """Re-seed a blocked/empty discovery with the task's own authorized
+    host as the primary source. Returns the (mutated) discovery dict."""
+    from urllib.parse import urlsplit as _split
+
+    _host = (_split(host_url).hostname or "").lower()
+    discovery_res["scenario"] = "A"
+    discovery_res["specified_website"] = _host
+    discovery_res["primary_navigation_url"] = host_url
+    discovery_res["selected_sources"] = [
+        {
+            "domain": _host,
+            "url": host_url,
+            "title": _host,
+            "is_verified_official": False,
+            "selection_rationale": (
+                "Explicit URL in the task instruction, on the task's domain "
+                "allow-list — the task's own authorized host."
+            ),
+        }
+    ]
+    discovery_res["discovery_blocked_reason"] = None
+    return discovery_res
+
+
 async def _run_loop(
     ext_hub: Any,
     *,
     planner: Callable[..., dict[str, Any]],
+
     obs_factory: Callable[[], dict[str, Any]],
     task_id: str,
     instruction: str,
@@ -738,6 +999,8 @@ async def _run_loop(
         raw_text = str(
             getattr(raw_obs, "page_text", None)
             or (raw_obs.get("page_text") if isinstance(raw_obs, dict) else "")
+            or getattr(raw_obs, "pageText", None)
+            or (raw_obs.get("pageText") if isinstance(raw_obs, dict) else "")
             or getattr(raw_obs, "readable_text", None)
             or (raw_obs.get("readable_text") if isinstance(raw_obs, dict) else "")
             or ""
@@ -1423,6 +1686,67 @@ async def _run_loop(
                     "The message was typed and submitted, but the sent message is not visible "
                     "in the chat yet. Check whether it actually sent before doing anything else — "
                     "do not type or send it again."
+                )
+                continue
+
+            # Stream 4: form-result reading. The search form was already
+            # submitted and the fresh page text shows results (or says
+            # the search returned nothing), but the planner is about to
+            # re-fill the form. That is the YatraDemo 50-step loop: the
+            # results were on the page while the agent kept re-typing
+            # the same fields. First time: penalise and re-plan so the
+            # planner reads the results from <page-context> instead.
+            # Second time on an answer task (cheapest/price/list): stop
+            # and complete from the results actually visible, instead
+            # of burning the step budget. Action tasks (book/buy) only
+            # ever get the penalty — their next step is a result click,
+            # which is not a refill and is never intercepted here.
+            _results_state = _results_state_in_text(raw_text)
+            if _results_state is not None and _search_submitted_in_history(history) and _is_form_refill_action(action):
+                _prompted_key = "form_results_read_prompted"
+                if not working_memory.get(_prompted_key):
+                    working_memory[_prompted_key] = _results_state
+                    if _results_state == "empty":
+                        penalties.append(
+                            "The search was already submitted and the page says it returned no options. "
+                            "Do NOT re-type the same search fields or click Search again with the same values — "
+                            "say the search returned nothing, or change the search (different date, route, or filters)."
+                        )
+                    else:
+                        penalties.append(
+                            "The search results are already on this page — the priced options are quoted in "
+                            "<page-context>. Read them from the page text and answer from them. Do NOT re-type "
+                            "the search fields, change the date, or click Search again."
+                        )
+                    continue
+                if _results_state == "results" and _ANSWER_REQUEST_RE.search(instruction or ""):
+                    _result_summary = _extract_result_summary(raw_text)
+                    if _result_summary:
+                        # Stream 4: record the results page as the research
+                        # source behind this answer (see
+                        # _record_results_page_as_research_source) — the
+                        # verifier classifies this instruction as RESEARCH
+                        # and would otherwise discard the correct answer
+                        # for having no package source.
+                        _record_results_page_as_research_source(
+                            working_memory, task_id, instruction, raw_url, raw_title, raw_text
+                        )
+                        return {
+                            "final": "completed",
+                            "steps": steps_done,
+                            "summary": _result_summary,
+                            "history": history,
+                            "url": raw_url,
+                            "last_obs": raw_obs,
+                        }
+                    penalties.append(
+                        "The search results are already on this page, but no priced option could be read from "
+                        "the page text. Quote exactly what the results section shows instead of re-filling the form."
+                    )
+                    continue
+                penalties.append(
+                    "The search results are already on this page. Do NOT re-fill the search form — "
+                    "act on the results shown (select an option, open details) or conclude from them."
                 )
                 continue
 
@@ -2890,6 +3214,139 @@ def _is_mock_canned_greeting(instruction: str, answer: str) -> bool:
         return False
     return not _is_greeting_instruction(instruction)
 
+
+# ---------------------------------------------------------------------------
+# Task-state taxonomy (fixA M7, CONTRACTS4 §4) — applied where a
+# verified outcome is recorded on the TaskRecord, and ONLY there:
+# this mapping never touches dispatch or routing, and it never
+# changes what the turn did, only the state the outcome is recorded
+# under. The verifier is honest in prose but its states drifted:
+# a missing account / missing capability is a BLOCKER, not a
+# failure ("no mail account" ended failed) and not a completion
+# ("no file tool" ended completed); a correct no-op cancel is
+# COMPLETED, not failed; a clarification question is
+# AWAITING_INPUT, not failed. A client reading taskState must be
+# able to tell "blocked by a missing account" from "failed".
+# ---------------------------------------------------------------------------
+
+# An honest refusal whose ONLY reason is a missing account or a
+# missing capability. Phrases are the companions' own wording, not
+# user prompts — keep this list to blockers the product itself
+# reports, never to a guess about what the user meant.
+_MISSING_CAPABILITY_MARKERS = (
+    "no active mail account",
+    "no mail account",
+    "mail account not connected",
+    "mail account is not connected",
+    "no active email account",
+    "no email account",
+    "no file tool",
+    "extension is not connected",
+    "extension not connected",
+)
+
+# A correct no-op cancel: the thing to cancel never existed, so
+# there is nothing to undo — the turn did exactly what was asked.
+_NOOP_CANCEL_MARKERS = (
+    "nothing was ever created",
+    "nothing to undo",
+    "nothing to cancel",
+    "already cancelled",
+    "nothing to remove",
+)
+
+# A clarification asks the user for a missing input before the work
+# can proceed ("I need the actual target first … tell me the exact
+# model"). A question mark alone is not enough — a failed turn may
+# end with a rhetorical question — so the message must ALSO carry
+# an explicit ask for a missing detail.
+#
+# fixC N4: live clarifications asked WITHOUT a question mark, so the
+# old "?" gate missed them — D4 asked with imperatives ("Send me the
+# model name", "Give me the Kindle link", "I need a specific
+# listing"), C8 asked "Which models?" / "Which way do you want to
+# go?" (plural "models" and "way" were not in the noun list), and C12
+# asked "tell me your local time and timezone" as a statement. Two
+# tiers now: a STRONG ask (an explicit request for a missing input)
+# counts on its own; the weaker question-form ask still needs a "?"
+# so a rhetorical question cannot flip a genuine failure.
+_CLARIFICATION_STRONG_RES = (
+    # "I need a specific listing" / "I need your timezone" — but not
+    # "I need to check …", which is the agent describing its own next
+    # step, not asking the user for anything.
+    re.compile(r"\bi need (?!to\b)", re.IGNORECASE),
+    re.compile(r"\b(?:send|give) me\b", re.IGNORECASE),
+    re.compile(r"\b(?:tell|send) me (?:the|a|an|your|which)\b", re.IGNORECASE),
+    re.compile(
+        r"\bwhich (?:one|models?|kind|product|date|time|day|version|watch|job|way)\b",
+        re.IGNORECASE,
+    ),
+)
+_CLARIFICATION_ASK_RES = (
+    re.compile(r"\bi need (?:the|a|an|to know|your)\b", re.IGNORECASE),
+    re.compile(r"\b(?:tell|send) me (?:the|a|an|your|which)\b", re.IGNORECASE),
+    re.compile(
+        r"\bwhich (?:one|models?|kind|product|date|time|day|version|watch|job|way)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _is_clarification_message(message: str) -> bool:
+    """True when the message asks the user for a missing input,
+    rather than reporting an outcome: either an explicit request for
+    a missing detail (imperative or not), or a question carrying an
+    explicit ask."""
+    text = message or ""
+    if any(p.search(text) for p in _CLARIFICATION_STRONG_RES):
+        return True
+    if "?" not in text:
+        return False
+    return any(p.search(text) for p in _CLARIFICATION_ASK_RES)
+
+
+def _is_capability_turn(instruction: str, message: str) -> bool:
+    """True when the turn answered a capabilities question: the
+    instruction asked what PrivAgent can do, or the message IS the
+    live capability overview (its header is deterministic)."""
+    if (message or "").startswith("### PrivAgent Capabilities"):
+        return True
+    try:
+        from .capabilities import is_capability_query
+
+        return bool(is_capability_query(instruction or ""))
+    except Exception:
+        return False
+
+
+def _map_outcome_state(instruction: str, verified_state: str,
+                       message: str) -> str:
+    """Reclassify a verified outcome into the CONTRACTS4 §4 state
+    taxonomy. Order matters: a no-op cancel wins over a
+    clarification (its message may end with a question), and a
+    missing-capability blocker wins over a clarification (its
+    message may offer an alternative and ask which one)."""
+    # fixC N2: a capabilities listing is a delivered answer, not a
+    # blocked turn. The overview honestly reports the pieces that are
+    # not connected ("extension is not connected"), which the
+    # missing-capability rule below would misread as a blocker and
+    # record the turn blocked even though the user got exactly what
+    # they asked for. A capability turn keeps the verifier's state.
+    if _is_capability_turn(instruction, message):
+        return verified_state
+    low = (message or "").lower()
+    if verified_state == "failed" and re.search(
+            r"\b(?:cancel|delete|stop|remove)\b", (instruction or "").lower()):
+        if any(m in low for m in _NOOP_CANCEL_MARKERS):
+            return "completed"
+    if verified_state in ("failed", "completed"):
+        if any(m in low for m in _MISSING_CAPABILITY_MARKERS):
+            return "blocked"
+    if verified_state == "failed" and _is_clarification_message(message or ""):
+        return "awaiting_input"
+    return verified_state
+
+
 # ---------------------------------------------------------------------------
 # Ask-user gate (Stream D, RC-1.1 / R5-07, CONTRACTS §2)
 # ---------------------------------------------------------------------------
@@ -2979,18 +3436,109 @@ def cancel_ask_user(task_id: str) -> bool:
     return True
 
 
+# FIX-B (M10): plausibility gate for pending ask-user answers.
+# The intercept used to treat EVERY next chat message as the answer
+# to the pending question — "what time is it in Tokyo right now",
+# asked while a booking date was pending, was swallowed as the date
+# and no time was ever given. A pending answer must only consume a
+# turn that plausibly answers it; an unrelated question runs as its
+# own turn and the pending question stays open (re-asked on the
+# reply — see the deferred_ask_user note at the chat-only
+# completion point in _run_task_impl).
+_DATE_TIME_VALUE_RE = re.compile(
+    r"\b(?:today|tonight|tomorrow|yesterday|next\s+week|this\s+week|"
+    r"this\s+weekend|next\s+weekend|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday|january|february|march|april|may|june|"
+    r"july|august|september|october|november|december)\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)\b"
+    r"|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"
+    r"|\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b|\bo['\u2019]?clock\b"
+    r"|\bin\s+\d+\s*(?:minutes?|mins?|hours?|hrs?|days?|weeks?)\b"
+    r"|\bat\s+\d{1,2}\s*(?:am|pm)?\b",
+    re.IGNORECASE,
+)
+_BUDGET_VALUE_RE = re.compile(
+    r"(?:\u20b9|\$|\u20ac|\u00a3|rs\.?|inr|usd)\s?[\d,]+|[\d,]+\s*(?:rupees|dollars|rs\.?)",
+    re.IGNORECASE,
+)
+_QUESTION_SHAPE_RE = re.compile(
+    r"^\s*(?:what|when|where|who|whom|whose|why|how|which|is|are|was|were|"
+    r"can|could|should|would|do|does|did|will|shall|may|might)\b|\?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _plausible_ask_user_answer(pending: dict[str, Any], text: str) -> bool:
+    """True when `text` plausibly answers the pending ask-user
+    question. Pure function — unit-tested directly.
+
+    * options present: the text names one of them (or is not a
+      question about something else — a free-text answer counts).
+    * ``date_time``: the text carries a date/time VALUE ("tomorrow",
+      "12 Dec", "7pm") — a question about the time ("what time is it
+      in Tokyo right now") carries none and is implausible.
+    * ``budget``: the text carries an amount.
+    * ``confirmation``: a yes/no (or an option); a question-shaped
+      turn is implausible.
+    * every other kind (file / account / auth / preference /
+      missing_info): no value test exists, so the old behaviour is
+      kept — the turn is consumed.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    options = pending.get("options") if isinstance(pending, dict) else None
+    if options:
+        norm = t.lower()
+        if any(str(o).strip().lower() in norm or norm in str(o).strip().lower() for o in options):
+            return True
+        if _QUESTION_SHAPE_RE.search(t):
+            return False
+        return True
+    kind = (pending.get("kind") if isinstance(pending, dict) else None) or "missing_info"
+    if kind == "date_time":
+        if not _DATE_TIME_VALUE_RE.search(t):
+            return False
+        # A question-shaped turn that merely CONTAINS a date word is
+        # not an answer ("what's the weather in Pune today" carries
+        # "today" but asks about the weather). Strip the date/time
+        # values: what remains must be a bare proposal ("what about
+        # tomorrow?", "is Friday ok?"), not a question about another
+        # topic with two or more content words left over.
+        if _QUESTION_SHAPE_RE.search(t):
+            stripped = _DATE_TIME_VALUE_RE.sub(" ", t)
+            stripped = re.sub(
+                r"\b(?:what|about|is|it|the|a|an|please|maybe|how|or|can|we|do|does|did|"
+                r"you|i|me|my|ok|okay|fine|sure|yes|yeah|that|this|then|so|and|for|on|at|"
+                r"in|to|be|would|could|should|let|us|work|works|good|great|sounds?)\b",
+                " ", stripped, flags=re.IGNORECASE,
+            )
+            if len(re.findall(r"[a-z]+", stripped.lower())) >= 2:
+                return False
+        return True
+    if kind == "budget":
+        return bool(_BUDGET_VALUE_RE.search(t))
+    if kind == "confirmation":
+        if _QUESTION_SHAPE_RE.search(t):
+            return False
+        return bool(re.match(
+            r"^(?:yes|yeah|yep|yup|ok|okay|sure|no|nope|not\s+really|go\s+ahead|do\s+it)\b",
+            t, re.IGNORECASE,
+        ) or len(t) < 80)
+    return True
+
+
 async def _deliver_pending_ask_user_answer(record: TaskRecord) -> bool:
     """Chat-message intercept: a message sent while another task in
     this chat is ``awaiting_input`` IS the answer to its pending
     question. Delivers it, completes this message as a passthrough,
     and returns True so the caller returns without starting a new
     task. The words ``cancel`` / ``stop`` (alone) cancel the paused
-    task instead. Returns False when nothing is paused.
-
-    Trade-off, stated plainly: while a question is pending, the next
-    chat message is always treated as the answer — the ASK_USER event
-    and the paused task's message say so, and the user can still
-    cancel the paused task first.
+    task instead. Returns False when nothing is paused, and also
+    when the message does not plausibly answer the pending question
+    (FIX-B M10) — that turn then runs as its own task, the pending
+    question stays open, and the reply re-asks it.
     """
     if not record.chat_id:
         return False
@@ -3007,6 +3555,13 @@ async def _deliver_pending_ask_user_answer(record: TaskRecord) -> bool:
         pending = getattr(other, "pending_ask_user", None)
         if not isinstance(pending, dict):
             continue
+        # FIX-B (M10): plausibility is judged BEFORE the user message
+        # is persisted here — a declined turn falls through to
+        # run_task's normal persist, so persisting first would store
+        # the message twice.
+        if text.lower() not in ("cancel", "stop", "never mind", "nevermind") and not _plausible_ask_user_answer(pending, text):
+            record.deferred_ask_user = pending
+            return False
         # The operator's own message belongs in the chat history even
         # though this task is only a passthrough (run_task's normal
         # user-message persist happens after this intercept).
@@ -3812,6 +4367,35 @@ def _persist_task_record(task_id: str) -> None:
 
 
 
+def _record_working_context_turn(task_id: str) -> None:
+    """Stream 2 (CONTRACTS4 §2): record one finished turn into the
+    chat's working context. Best-effort and silent: a recording
+    failure must never break the task record that was just
+    persisted. Only what the turn proves is recorded (a watch marker
+    in the reply, URLs in a completed reply, a sanitised query
+    phrase) — see working_context.note_completed_turn."""
+    try:
+        record = real_hub.tasks.get(task_id)
+        if record is None or not getattr(record, "chat_id", None):
+            return
+        from .working_context import (
+            load_working_context,
+            note_completed_turn,
+            save_working_context,
+        )
+
+        ctx = load_working_context(record.chat_id)
+        note_completed_turn(
+            ctx,
+            instruction=record.instruction or "",
+            message=record.message or "",
+            state=record.state or "",
+        )
+        save_working_context(ctx)
+    except Exception:
+        pass
+
+
 async def run_task(task_id: str) -> None:
     """Production entrypoint — wires real hub, real planner, live observation.
 
@@ -3826,6 +4410,10 @@ async def run_task(task_id: str) -> None:
         await _run_task_impl(task_id)
     finally:
         _persist_task_record(task_id)
+        # Stream 2: the turn's outcome feeds the chat's working
+        # context (entities / watches / results) for the next turn's
+        # deictic resolution.
+        _record_working_context_turn(task_id)
 
 
 async def _run_task_impl(task_id: str) -> None:
@@ -3910,6 +4498,22 @@ async def _run_task_impl(task_id: str) -> None:
                 initial_memory["conversation_history"] = [
                     {"role": m["role"], "content": m["content"]} for m in raw_msgs
                 ]
+            # Stream 2 (CONTRACTS4 §2): conversational working context
+            # for this chat — entities discussed, watches active here.
+            # Only the MODEL-SAFE view is attached: at most the last 2
+            # entity labels + active watch labels. Full history and
+            # sensitive fields never reach the planner prompt (the
+            # prompt dumps the rest of working_memory as JSON, so the
+            # full WorkingContext must never be stored here). This is
+            # working state, not persistent memory: it never touches
+            # user_semantic_facts / long_memory_facts.
+            try:
+                from .working_context import load_working_context
+
+                _wc = load_working_context(chat_id)
+                initial_memory["working_context"] = _wc.model_view()
+            except Exception:
+                initial_memory["working_context"] = {"entity_labels": [], "active_watch_labels": []}
             chat_mem = db.get_chat_memory(chat_id)
             if chat_mem:
                 initial_memory["session_memory"] = chat_mem
@@ -4063,7 +4667,17 @@ async def _run_task_impl(task_id: str) -> None:
 
     intent_context = {
         "active_session": active_session,
+        # fixC M8: the classifier needs to know whether a live browser
+        # exists before routing a latest-release question to it — the
+        # question form is only a browser task when the extension is
+        # actually connected (intent_router step 9c).
+        "extension_connected": bool(real_hub.extension_sockets),
         "conversation_history": initial_memory.get("conversation_history", []),
+        # Stream 2 (CONTRACTS4 §2): model-safe working-context view
+        # (last 2 entity labels + active watch labels) so intent
+        # classification and follow-up handling can resolve "this" /
+        # "that watch" without the full history.
+        "working_context": initial_memory.get("working_context", {}),
         "session_memory": initial_memory.get("session_memory", {}),
         "is_research": bool(initial_memory.get("is_research") or (initial_memory.get("session_memory", {}).get("research_topic")) or latest_pkg_record),
         "requested_format": initial_memory.get("requested_format"),
@@ -4077,6 +4691,18 @@ async def _run_task_impl(task_id: str) -> None:
     classification = classify_intent(record.instruction, context=intent_context)
     record.intent = classification.intent.value
     record.is_browser_task = classification.is_browser
+
+    # Stream 1 (CONTRACTS4 §1): the structured objective rides in
+    # working memory so every downstream consumer — the NON_BROWSER
+    # dispatch chain below, the browser loop, and the completion
+    # verifier call site — reads the SAME routing decision instead
+    # of re-matching keywords in the raw text. The verifier itself
+    # (Stream 3's module) consumes ``working_memory["objective"]``.
+    if classification.objective is not None:
+        try:
+            initial_memory["objective"] = classification.objective.to_dict()
+        except Exception:
+            pass
 
     # -- Task 14: connector auto-routing --------------------------------
     # A Gmail / Calendar / Drive read (or a gated write) goes to the
@@ -4512,6 +5138,27 @@ async def _run_task_impl(task_id: str) -> None:
                     pass
             return
 
+        # fixC N1: a one-off timer request has no implementation behind
+        # it (no timer table, no fire path) and must never reach the
+        # model sink, which invents a queued one-shot check that never
+        # fires. Answer the honest boundary deterministically: blocked
+        # (missing capability, CONTRACTS4 §4), zero rows created. A
+        # reminder ("remind me in N minutes to …") is NOT a timer —
+        # it owns its own branch below and still creates a real job.
+        from .capabilities import is_one_off_timer_request, TIMER_UNSUPPORTED_MESSAGE
+
+        if is_one_off_timer_request(record.instruction):
+            record.steps_done = 1
+            record.state = "blocked"
+            record.message = TIMER_UNSUPPORTED_MESSAGE
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(chat_id, record.message, evidence="blocked", task_id=task_id)
+                except Exception:
+                    pass
+            return
+
         # Stream D: deterministic fast path (Atticus T1) — a bare
         # greeting is answered with 0 planner calls and 0 provider
         # tokens. The reply is canned, so the route is labelled
@@ -4618,7 +5265,37 @@ async def _run_task_impl(task_id: str) -> None:
             # watch, so it must fall through to the monitoring
             # directive instead of silently changing the email
             # interval.
-            if is_email_interval_change_instruction(record.instruction) and get_active_email_mission(chat_id):
+            # Stream 1 (CONTRACTS4 §1): re-resolve the objective with
+            # the active-email-mission flag — a bare interval ("check
+            # every 5 minutes") is ambiguous without it — and gate the
+            # email-interval branch on the OBJECTIVE, not on the raw
+            # interval token. The legacy predicate matches any
+            # "check every N minutes" (its non-email-object guard
+            # misses product brand/model nouns and percent
+            # conditions), so without this gate a product watch
+            # ("live monitor iPhone 17 ... check every 10 minutes")
+            # silently rewrites the email polling interval whenever
+            # an email mission happens to be active (Failure A).
+            _active_email_mission = get_active_email_mission(chat_id)
+            _branch_objective = classification.objective
+            try:
+                from .objective import build_objective as _build_branch_objective
+
+                _branch_objective = _build_branch_objective(
+                    record.instruction,
+                    context={
+                        "conversation_history": initial_memory.get("conversation_history", []),
+                        "has_active_email_mission": bool(_active_email_mission),
+                    },
+                )
+                initial_memory["objective"] = _branch_objective.to_dict()
+            except Exception:
+                pass
+            from .intent_router import should_route_email_interval
+
+            if should_route_email_interval(
+                _branch_objective, record.instruction, bool(_active_email_mission)
+            ):
                 answer = await handle_email_interval_change(record.instruction, chat_id=chat_id)
             elif is_email_mission_control_instruction(record.instruction):
                 answer = await handle_email_mission_control(record.instruction, chat_id=chat_id)
@@ -4645,6 +5322,31 @@ async def _run_task_impl(task_id: str) -> None:
                 _rem_answer, _rem_ok = _create_reminder_job(record, _reminder_parsed)
                 answer = _rem_answer
                 _reminder_failed = not _rem_ok
+            elif (
+                _branch_objective is not None
+                and _branch_objective.primary_intent
+                in {"update_monitor", "pause_monitor", "resume_monitor",
+                    "cancel_monitor", "list_monitors"}
+            ):
+                # Stream 1 (S5 gen B5/D10/D11): the objective names a
+                # watch-control turn the regex directive misses
+                # (pronoun-only "change it to every 45 mins",
+                # "make that check twice as often", "cancel it").
+                # Route it to the monitoring handler with history —
+                # the handler updates the existing watch in place
+                # (S5 handler test test_update_interval_by_pronoun)
+                # or asks when no watch resolves. Never let it fall
+                # to the model/research sink, which fabricates the
+                # update (or an empty Technical_Analysis.pdf).
+                # Placed BEFORE the schedule branch on purpose:
+                # detect_schedule_intent reads "update it to check
+                # every 45 minutes" as create_schedule("update it to
+                # check") and would swallow the turn as a bogus job.
+                answer = await handle_continuous_monitoring_instruction(
+                    record.instruction,
+                    chat_id=chat_id,
+                    history=initial_memory.get("conversation_history", []),
+                )
             elif _schedule_intent is not None:
                 answer = _handle_schedule_intent(
                     _schedule_intent, allowed_domains=record.allowed_domains
@@ -4935,15 +5637,34 @@ async def _run_task_impl(task_id: str) -> None:
                 message=answer,
                 observation=None,
                 working_memory=initial_memory,
+                chat_id=chat_id,
             )
             record.steps_done = 1
-            record.state = verified.state
+            # fixA M7: record the outcome under the CONTRACTS4 §4
+            # state taxonomy (blocked / completed / awaiting_input),
+            # not the verifier's raw state.
+            record.state = _map_outcome_state(
+                record.instruction, verified.state, verified.message)
             record.message = verified.message
+            # FIX-B (M10): this turn did not answer a pending
+            # ask-user question — it ran as its own task instead
+            # (see _deliver_pending_ask_user_answer). The pending
+            # question stays open: re-ask it on this reply so the
+            # user knows it is still waiting.
+            _deferred = getattr(record, "deferred_ask_user", None)
+            if isinstance(_deferred, dict) and _deferred.get("question"):
+                record.message = (
+                    f"{verified.message}\n\n---\n\nStill waiting on my earlier question: "
+                    f"{_deferred['question']} Reply with the answer when you're ready."
+                )
             await real_hub.broadcast_progress(record)
             if chat_id:
                 try:
-                    evidence_tag = "conversational" if verified.state == "completed" else "failed"
-                    _persist_agent_message(chat_id, verified.message, evidence=evidence_tag, task_id=task_id)
+                    evidence_tag = {"completed": "conversational",
+                                    "blocked": "blocked",
+                                    "awaiting_input": "awaiting_input"}.get(
+                                        record.state, "failed")
+                    _persist_agent_message(chat_id, record.message, evidence=evidence_tag, task_id=task_id)
                 except Exception:
                     pass
             return
@@ -5137,6 +5858,40 @@ async def _run_task_impl(task_id: str) -> None:
             # died on the first step).
             allowed_domains=record.allowed_domains,
         )
+        # Stream 4: authorized-host override. When discovery offers no
+        # primary URL — Scenario B blocked by the allow-list, or
+        # Scenario A whose explicit URL the resolver rejected (loopback
+        # hosts are SSRF-rejected even when the task allow-lists them)
+        # — fall back to an explicit URL the task itself names (or its
+        # parent task names, for a compound part), when that host is on
+        # the task's allow-list. Without this, a compound part that
+        # inherits the mission's host only via its parent ("Navigate to
+        # <sandbox> and search ...") dies with "Research blocked" even
+        # though the operator authorized the host for the whole mission.
+        # The override never drops a discovery result: on any error
+        # the original (blocked) discovery stands and fails honestly.
+        if not discovery_res.get("primary_navigation_url"):
+            try:
+                _parent_instruction = None
+                _parent_id = getattr(record, "parent_task_id", None)
+                if _parent_id:
+                    _parent = real_hub.tasks.get(_parent_id)
+                    if _parent is not None:
+                        _parent_instruction = getattr(_parent, "instruction", None)
+                _host_url = _task_authorized_host_url(
+                    record.instruction,
+                    record.allowed_domains,
+                    parent_instruction=_parent_instruction,
+                )
+                if _host_url:
+                    logger.info(
+                        "task %s: discovery offered no primary URL; using task-authorized host %s",
+                        task_id,
+                        _host_url,
+                    )
+                    discovery_res = _apply_authorized_host_override(discovery_res, _host_url)
+            except Exception:
+                pass
         initial_memory["autonomous_discovery"] = discovery_res
     except Exception:
         pass
@@ -5346,6 +6101,7 @@ async def _run_task_impl(task_id: str) -> None:
             observation=state.get("last_obs") or ({"url": state["url"]} if state.get("url") else None),
             working_memory=state.get("working_memory") or initial_memory,
             history=state.get("history") or [],
+            chat_id=chat_id,
         )
         record.last_observation = state.get("last_obs")
         # Task 11: per-step timings (durations + counts + action types
@@ -5355,7 +6111,10 @@ async def _run_task_impl(task_id: str) -> None:
             final_state = "cancelled"
             record.message = "Task cancelled by user."
         elif record.state != "cancelled":
-            final_state = verified.state
+            # fixA M7: record the outcome under the CONTRACTS4 §4
+            # state taxonomy (blocked / completed / awaiting_input).
+            final_state = _map_outcome_state(
+                record.instruction, verified.state, verified.message)
             record.message = verified.message
         else:
             final_state = "cancelled"

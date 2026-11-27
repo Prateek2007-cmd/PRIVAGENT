@@ -150,6 +150,19 @@ def init_db(db_path: Optional[str] = None) -> None:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Stream 2 (CONTRACTS4 §2): conversational WORKING context
+            -- (entities discussed in this chat, active watches, last
+            -- results). One JSON blob per chat_id. This is short-lived
+            -- turn state, deliberately SEPARATE from persistent
+            -- personal memory (user_semantic_facts /
+            -- long_memory_facts) — the two are never merged, and
+            -- nothing here is read as a durable fact.
+            CREATE TABLE IF NOT EXISTS working_context (
+                chat_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS user_semantic_facts (
                 id TEXT PRIMARY KEY, category TEXT NOT NULL CHECK(category IN ('personal','retail','coding')),
                 fact_key TEXT NOT NULL, fact_value TEXT NOT NULL, created_at REAL NOT NULL,

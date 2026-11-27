@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from .capabilities import CapabilityRegistry
+from .capabilities import CapabilityRegistry, format_capability_overview, gather_live_capability_state
 from .hub import hub
 from .mcp.policy import ApprovalPolicy
 from .mcp.sanitizer import sanitize_tool_output
@@ -61,6 +61,29 @@ def routes():
     return [{**registry.resolve(capability, operation).__dict__, "mutating": mutating}
             for capability, operations in registry._OPERATIONS.items()
             for operation, mutating in operations.items()]
+
+
+@router.get("/overview")
+def overview():
+    """Live capability overview (Stream 4): the same answer chat gives
+    for "what can you do", derived from the registered tool registry,
+    the actual provider selection, the extension connection, and the
+    OAuth connectors that really have credentials. Nothing here is a
+    static list — an app is "connected" only when its credentials are
+    stored, and retailer access is never promised."""
+    state = gather_live_capability_state()
+    return {
+        "provider": state.provider,
+        "provider_model": state.provider_model,
+        "provider_configured": state.provider_configured,
+        "browser_connected": state.browser_connected,
+        "connectors": state.connectors,
+        "tool_counts": state.tool_counts,
+        "tool_registry_available": state.tool_registry_available,
+        "mcp_servers": state.mcp_servers,
+        "approval_required_for": list(state.approval_required_for),
+        "overview": format_capability_overview(state),
+    }
 
 
 @router.post("/prepare")

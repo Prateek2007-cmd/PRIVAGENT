@@ -231,6 +231,15 @@ class ConnectorRoute:
         }
 
 
+def route_to_intent(route: Optional[ConnectorRoute]) -> Optional[str]:
+    """Map a connector route to the canonical INTENT vocabulary
+    (CONTRACTS4 §1): every connector-routed instruction is a
+    ``connector_task``. Returns None when there is no route."""
+    if route is None:
+        return None
+    return "connector_task"
+
+
 def _is_disallowed_overlap(text: str) -> bool:
     """True when another subsystem already owns this instruction.
 

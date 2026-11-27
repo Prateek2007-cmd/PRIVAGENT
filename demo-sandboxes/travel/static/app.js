@@ -6,7 +6,19 @@ const inr = (n) => "₹" + Number(n).toLocaleString("en-IN");
 const show = (id) => { ["step-search","step-results","step-seats","step-passenger","step-summary"].forEach(s => $(s).hidden = s !== id); };
 const showErr = (id, msg) => { const el = $(id); if (!msg) { el.hidden = true; return; } el.textContent = msg; el.hidden = false; };
 
-function cityCode(val) { const m = /\(([A-Z]{3})\)/.exec(val || ""); return m ? m[1] : (val || "").trim().toUpperCase(); }
+/* Stream 4: resolve what the operator/agent typed into a city code.
+ * Accepts "Hyderabad (HYD)", a bare code ("HYD"), and a bare city name
+ * ("Hyderabad", any case). Previously only the parenthesised form
+ * worked: typing a bare name produced from_code=HYDERABAD, the API
+ * returned zero options, and the agent re-filled the form forever
+ * believing the search had failed. Name lookup uses the /cities list
+ * loaded at startup (falls back to the code itself when unknown). */
+function cityCode(val) { const m = /\(([A-Z]{3})\)/.exec(val || ""); if (m) return m[1];
+  const v = (val || "").trim();
+  if (/^[A-Za-z]{3}$/.test(v)) return v.toUpperCase();
+  const hit = state.cities.find(c => c.name.toLowerCase() === v.toLowerCase());
+  if (hit) return hit.code;
+  return v.toUpperCase(); }
 function cityLabel(code) { const c = state.cities.find(c => c.code === code); return c ? `${c.name} (${c.code})` : code; }
 
 async function loadCities() {
