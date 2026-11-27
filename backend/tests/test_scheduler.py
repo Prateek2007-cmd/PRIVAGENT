@@ -123,9 +123,11 @@ def test_execute_job_creates_background_task_with_allow_list(tmp_path, monkeypat
     assert record.background is True
     # The job's allow-list — not the global one — was wired onto the task.
     assert record.allowed_domains == ["example.com"]
-    # No extension is attached in tests, so the run fails honestly; the
+    # No extension is attached in tests, so the run stops honestly; the
     # important part is that it ran as a normal gated task and settled.
-    assert record.state in ("failed", "completed", "awaiting_confirmation")
+    # Stream D: an extension-disconnected browser run is "blocked",
+    # not "failed" — the task did not fail, its dependency is missing.
+    assert record.state in ("blocked", "failed", "completed", "awaiting_confirmation")
     # The job row records the run and its task id for polling.
     refreshed = get_job(job["id"], db_path=path)
     assert refreshed["last_task_id"] == task_id

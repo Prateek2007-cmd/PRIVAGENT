@@ -153,6 +153,39 @@ PATTERNS = {
     "sensitive_kv": re.compile(
         r"(?i)\b((?:session|auth|access|refresh|id|user|csrf|xsrf)_?token|client_?secret|api_?key|password|passwd|secret)\s*(?:[:=]|\bis\b)\s*([a-zA-Z0-9_\-\.]{8,})"
     ),
+    # Labelled secret with a bare space separator ("Password
+    # hunter2-9x7q"). sensitive_kv needs ":" / "=" / "is" between the
+    # label and the value, so a space-separated token slipped through
+    # — found 2026-11-27 by the live OCR test, where tesseract read
+    # "Password hunter2-9x7q" off the pixels and it reached the
+    # planner unredacted. The token must be 8+ chars AND contain a
+    # digit: "Password requirements" / "Password reset" are words, not
+    # secrets, and must survive. The label is kept, the token is
+    # redacted (see _redact_text's special case below).
+    "labelled_secret": re.compile(
+        r"(?i)\b((?:password|passwd|pwd|secret|api[_\s-]?key|auth[_\s-]?token|access[_\s-]?token|client[_\s-]?secret))"
+        r"\b[\s:=\-]{0,3}(?=[A-Za-z0-9_\-+/=]*\d)([A-Za-z0-9_\-+/=]{8,})"
+    ),
+    # R5-02: labelled one-time codes. sensitive_kv needs an 8+ char
+    # value, so a 6-digit OTP next to "OTP"/"verification code" slipped
+    # through. The label + the 4-8 digit code are redacted together.
+    "otp_labelled": re.compile(
+        r"(?i)\b(?:otp|one[_\s-]?time(?:\s+pass)?code|verification\s+code)\b[^0-9]{0,24}?\d{4,8}\b"
+    ),
+    # R5-02: postal street addresses ("221B Baker Street, London
+    # NW1 6XE"). A street number + name + suffix, with an optional
+    # trailing ", city postcode" tail, is address-shaped even with no
+    # label. False positives (a street mentioned in prose) are
+    # acceptable: the planner never needs the exact address.
+    "postal_address": re.compile(
+        r"\b\d{1,5}[A-Za-z]?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2}\s+"
+        r"(?:Street|St\.?|Road|Rd\.?|Avenue|Ave\.?|Lane|Ln\.?|Drive|Dr\.?|"
+        r"Court|Ct\.?|Place|Pl\.?|Boulevard|Blvd\.?|Way|Close|Square|Sq\.?)"
+        r"\b(?:\s*,[^,\n]{0,80})?"
+    ),
+    # R5-02: UK-style postcodes ("NW1 6XE") are location PII on their
+    # own, even when the street part was not matched above.
+    "uk_postcode": re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b"),
 }
 
 
@@ -189,6 +222,42 @@ def _looks_like_bare_secret(value: str) -> bool:
     return classes >= 2
 
 
+# R5-02: a bare 6-digit run in free text is OTP-shaped. Years are 4
+# digits, prices group differently, phone/card runs are longer — a
+# standalone 6-digit number on a page is far more often a one-time
+# code (or a PIN code, which is location PII) than a value the planner
+# needs exactly. Fail closed: mask it. This is deliberately NOT part
+# of PATTERNS/_redact_text: that path also redacts URLs, and a 6-digit
+# segment in a URL path (an order/product id) must survive so the link
+# still works. Apply this helper only to page text, OCR text and
+# element values — never to URLs or element names.
+_BARE_OTP_RE = re.compile(r"\b\d{6}\b")
+
+# Field names that mark a value as a one-time code / PIN even when the
+# digits themselves carry no label.
+_OTP_FIELD_NAME_RE = re.compile(
+    r"\b(?:otp|one[_\s-]?time|verification|auth(?:entication)?|security)"
+    r"(?:\s*(?:code|pin|number))?\b|\b(?:code|pin)\b",
+    re.IGNORECASE,
+)
+
+
+def _redact_bare_otp_codes(text: str) -> str:
+    """Mask standalone 6-digit runs (bare OTPs / PIN codes) in text."""
+    if not text:
+        return text
+    return _BARE_OTP_RE.sub(REDACTED, text)
+
+
+def _is_otp_like_value(name: Optional[str], value: str) -> bool:
+    """True when *value* is a short all-digit code in an OTP/PIN/code
+    field — a one-time code even though no pattern names the digits."""
+    v = (value or "").strip()
+    if not re.fullmatch(r"\d{4,8}", v):
+        return False
+    return bool(name and _OTP_FIELD_NAME_RE.search(name))
+
+
 def _redact_text(value: str, max_len: int) -> str:
     """Mask known secret patterns in free text, then truncate.
 
@@ -212,6 +281,8 @@ def _redact_text(value: str, max_len: int) -> str:
     for name, pattern in PATTERNS.items():
         if name == "sensitive_kv":
             out = pattern.sub(r"\1: " + REDACTED, out)
+        elif name == "labelled_secret":
+            out = pattern.sub(r"\1 " + REDACTED, out)
         else:
             out = pattern.sub(REDACTED, out)
     for index, original in enumerate(placeholders):
@@ -317,8 +388,11 @@ def _redact_element(el: InteractiveElement) -> InteractiveElement:
         # though no pattern names it.
         if _has_sensitive_value(value) or _looks_like_bare_secret(value):
             value = None
+        elif _is_otp_like_value(el.name, value):
+            # R5-02: a short all-digit code in an OTP/code/PIN field.
+            value = None
         else:
-            value = _redact_text(value, MAX_NAME_LEN)
+            value = _redact_bare_otp_codes(_redact_text(value, MAX_NAME_LEN))
     update_dict: dict[str, Any] = {
         "value": value,
         "name": _redact_text(el.name or "", MAX_NAME_LEN),
@@ -609,6 +683,14 @@ def classify_and_redact(
             _looks_like_bare_secret(str(e.value or ""))
             for e in obs.interactive
         )
+        # R5-02: a one-time code may be visible in the pixels too —
+        # withhold the screenshot when an OTP/PIN-shaped value is on
+        # the page (labelled code field, or any bare 6-digit value).
+        has_sensitive_element = has_sensitive_element or any(
+            _is_otp_like_value(e.name, str(e.value or ""))
+            or _redact_bare_otp_codes(str(e.value or "")) != str(e.value or "")
+            for e in obs.interactive
+        )
         safe_screenshot = None
         if getattr(config, "ALLOW_SCREENSHOTS", False) and not has_sensitive_element:
             raw_shot = getattr(obs, "screenshot", None)
@@ -639,7 +721,10 @@ def classify_and_redact(
                     len(str(raw_text)),
                     max_chars,
                 )
-            safe_page_text = cleanse_untrusted(_redact_text(redact_text_urls(str(raw_text)), max_chars), max_chars)
+            safe_page_text = cleanse_untrusted(
+                _redact_bare_otp_codes(_redact_text(redact_text_urls(str(raw_text)), max_chars)),
+                max_chars,
+            )
         # Task 7: grounded accessibility tree, built from the REDACTED
         # elements (a ref never carries a secret). Prefer the tree the
         # extension shipped with the observation; derive a legacy tree
@@ -684,16 +769,31 @@ def classify_and_redact(
         # Task 7: OCR over the surviving screenshot, only when the operator
         # opted into screenshots AND OCR. Never raises — a failure means
         # no OCR block, not a failed observation.
+        # R5-05: OCR text is pixels the DOM redactor never saw — it may
+        # hold an OTP, password or address. Route it through the same
+        # redactor as page text (_redact_text + bare-OTP masking +
+        # cleanse_untrusted) BEFORE it is stored on the payload, so a
+        # synthetic OTP in OCR text reaches the planner as [REDACTED].
         ocr_text = None
         if safe_screenshot and getattr(config, "OCR_ENABLED", False):
             try:
                 from .ocr import extract_ocr_text
 
-                ocr_text = extract_ocr_text(
+                raw_ocr = extract_ocr_text(
                     safe_screenshot,
                     enabled=True,
                     max_chars=int(getattr(config, "OCR_MAX_CHARS", 2000)),
                 )
+                if raw_ocr:
+                    from .adversarial_guard import cleanse_untrusted
+
+                    ocr_max = int(getattr(config, "OCR_MAX_CHARS", 2000))
+                    ocr_text = cleanse_untrusted(
+                        _redact_bare_otp_codes(
+                            _redact_text(redact_text_urls(raw_ocr), ocr_max)
+                        ),
+                        ocr_max,
+                    )
             except Exception as exc:  # noqa: BLE001 — OCR must never break planning
                 logger.warning("privacy: OCR failed (%s); continuing text-only", exc)
                 ocr_text = None

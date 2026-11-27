@@ -1,0 +1,391 @@
+{
+  "phases": {
+    "A_nl_research": {
+      "prompt": "Research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations.",
+      "chat_id": "1e229b7e5dfb4b1789125fa07be99157",
+      "task_id": "62d3a1a2d434424cb7b03ba27517648c",
+      "duration_s": 102.4,
+      "state": "completed",
+      "steps_done": 26,
+      "intent": "RESEARCH_TASK",
+      "route": {
+        "via": "http_research",
+        "planner_calls": 2,
+        "steps": 26,
+        "sources_accepted": 8,
+        "sources_rejected": 7,
+        "synthesis_path": "provider"
+      },
+      "message": "## Architecture\nThe evidence describes three distinct architectural approaches to on-device AI agents. Agent-X is presented as a software-only, accuracy-preserving framework that accelerates both the prefill and decode stages of on-device agent workloads, and is described as seamlessly integrable into existing on-device AI agents [1]. A second approach, Division-of-Thoughts (DoT), is a collaborative reasoning framework that leverages the synergy between locally deployed Smaller-scale Language Models (SLMs) and cloud-based LLMs, using an adapter for task allocation that is trained via a self-reinforced method relying solely on task execution feedback [2]. A third line of work centres on NNStreamer, a stream pipeline framework for on-device AI systems that handles neural networks with complex data stream pipelines on devices [3, 6]; the project aims to make each AI service atomic, re-deployable, and shared among connected devices of arbitrary vendors, and is a Linux Foundation (LF AI and Data) open source project accepting public contributions [3]. The brief does not provide further architectural detail (for example, model partitioning mechanics or memory layout) beyond these descriptions.\n## Performance\nReported performance results are specific to each framework. Agent-X is reported to achieve a 1.61x end-to-end speedup on representative agentic workloads in real systems with no accuracy loss [1]. DoT is reported to significantly reduce LLM costs while maintaining competitive reasoning accuracy across extensive experiments on various benchmarks [2]. NNStreamer is described as significantly improving overall performance with minimal efforts [6], and its authors report that applying the stream pipeline framework saves developmental costs and hardware resources and improves performance [3], with the additional claim that it simplifies implementations and allows reusing off\n\n> Evidence note: the collected sources did not cover limitations in the harvested evidence, so those sections report the gap instead of inventing detail.\n\n\ud83d\udcc4 **Deliverable Ready:**\n- [on-device_AI_agents_using_five_credible_.pdf] (PDF, 198.0 KB)\n- [on-device_AI_agents_using_five_credible_.xlsx] (XLSX, 13.6 KB)\nAvailable for download.",
+      "artifacts": [
+        {
+          "artifact_id": "art_62d3a1a2d434424cb7b03ba27517648c_xlsx",
+          "task_id": "62d3a1a2d434424cb7b03ba27517648c",
+          "conversation_id": "1e229b7e5dfb4b1789125fa07be99157",
+          "filename": "on-device_AI_agents_using_five_credible_.xlsx",
+          "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/62d3a1a2d434424cb7b03ba27517648c/on-device_AI_agents_using_five_credible_.xlsx",
+          "file_format": "xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "file_size_bytes": 13964,
+          "title": "on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional and sheet (XLSX)",
+          "summary": "Autonomous research deliverable in XLSX format.",
+          "metadata": {
+            "sources_count": 11,
+            "claims_count": 22,
+            "tables_count": 1,
+            "visuals_count": 2,
+            "read_back_verified": true,
+            "read_back_detail": "XLSX OK: 4 sheet(s), 321 cells"
+          },
+          "created_at": 1795753531.0551686
+        },
+        {
+          "artifact_id": "art_62d3a1a2d434424cb7b03ba27517648c_pdf",
+          "task_id": "62d3a1a2d434424cb7b03ba27517648c",
+          "conversation_id": "1e229b7e5dfb4b1789125fa07be99157",
+          "filename": "on-device_AI_agents_using_five_credible_.pdf",
+          "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/62d3a1a2d434424cb7b03ba27517648c/on-device_AI_agents_using_five_credible_.pdf",
+          "file_format": "pdf",
+          "mime_type": "application/pdf",
+          "file_size_bytes": 202788,
+          "title": "on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional and sheet (PDF)",
+          "summary": "Autonomous research deliverable in PDF format.",
+          "metadata": {
+            "sources_count": 11,
+            "claims_count": 22,
+            "tables_count": 1,
+            "visuals_count": 2,
+            "read_back_verified": true,
+            "read_back_detail": "PDF OK: 8 page(s), 15621 chars"
+          },
+          "created_at": 1795753530.9154732
+        }
+      ],
+      "xlsx": {
+        "sheets": [
+          "Executive Summary",
+          "Comparison & Metrics",
+          "Verified Claims",
+          "Sources & Provenance"
+        ],
+        "rows_per_sheet": {
+          "Executive Summary": 14,
+          "Comparison & Metrics": 5,
+          "Verified Claims": 23,
+          "Sources & Provenance": 12
+        },
+        "domains_found": [
+          "arxiv.org"
+        ],
+        "file_bytes": 13964
+      },
+      "pdf": {
+        "pages": 8,
+        "chars": 15622,
+        "domains_found": [
+          "arxiv.org"
+        ],
+        "file_bytes": 202788
+      }
+    },
+    "B_daily_summary": {
+      "task_id": "57cc69e8e9f744fe83e1bceb6dc6bd1c",
+      "duration_s": 5.0,
+      "state": "completed",
+      "message": "### \ud83d\udcc5 Scheduled job created\n\nI'll run **Give me a summary of my watches and jobs at 9am** daily at 9:00 AM IST.\n\n\u2022 **Job ID:** `e28e78d4015c4ae2822c22411109ded8`\n\u2022 **Next run:** 28 Nov 2026, 9:00 AM IST\n\u2022 **Status:** Active\n\nManage it in chat: `pause scheduled job e28e78d4`, `resume scheduled job e28e78d4`, or `cancel scheduled job e28e78d4`. The job keeps running even with the frontend closed, as long as the backend is up.",
+      "job": {
+        "id": "e28e78d4015c4ae2822c22411109ded8",
+        "instruction": "List my watches with their latest observations and list my scheduled jobs with their statuses and last outcomes, and present it as a short daily summary. Do not ask clarifying questions; if there are no watches or jobs, say so explicitly.",
+        "schedule": "30 3 * * *",
+        "schedule_kind": "cron",
+        "cron": "30 3 * * *",
+        "interval_seconds": null,
+        "status": "active",
+        "next_run_at": 1795836600.0,
+        "last_run_at": null,
+        "last_task_id": null,
+        "allowed_domains": [],
+        "long_horizon": false,
+        "created_at": 1795753532.8459187,
+        "updated_at": 1795753532.8459187,
+        "last_outcome": null,
+        "last_error": null,
+        "last_run_outcome_at": null,
+        "objective": "Give me a summary of my watches and jobs at 9am",
+        "execution_started_at": null,
+        "execution_completed_at": null,
+        "last_artifacts": [],
+        "last_run_summary": null,
+        "run_condition": null,
+        "next_run_ist": "28 Nov 2026, 9:00 AM IST",
+        "last_run_ist": null,
+        "last_outcome_at_ist": null
+      },
+      "run_now": {
+        "task_id": "64cf688f554a44b2b4ae56088f50c68b",
+        "duration_s": 0.0,
+        "state": "completed",
+        "message": "### \ud83d\udcc5 Scheduled jobs\n\n\u2022 `e28e78d4` \u2014 List my watches with their latest observations and list my scheduled jobs with t \u2014 30 3 * * * \u2014 active \u2014 next: 28 Nov 2026, 9:00 AM IST \u2014 last run: \u2014",
+        "job_after": {
+          "id": "e28e78d4015c4ae2822c22411109ded8",
+          "instruction": "List my watches with their latest observations and list my scheduled jobs with their statuses and last outcomes, and present it as a short daily summary. Do not ask clarifying questions; if there are no watches or jobs, say so explicitly.",
+          "schedule": "30 3 * * *",
+          "schedule_kind": "cron",
+          "cron": "30 3 * * *",
+          "interval_seconds": null,
+          "status": "active",
+          "next_run_at": 1795836600.0,
+          "last_run_at": 1795753537.617109,
+          "last_task_id": "64cf688f554a44b2b4ae56088f50c68b",
+          "allowed_domains": [],
+          "long_horizon": false,
+          "created_at": 1795753532.8459187,
+          "updated_at": 1795753537.617109,
+          "last_outcome": "completed",
+          "last_error": null,
+          "last_run_outcome_at": 1795753537.617109,
+          "objective": "Give me a summary of my watches and jobs at 9am",
+          "execution_started_at": 1795753537.5235567,
+          "execution_completed_at": 1795753537.617109,
+          "last_artifacts": [],
+          "last_run_summary": "Completed. ### \ud83d\udcc5 Scheduled jobs  \u2022 `e28e78d4` \u2014 List my watches with their latest observations and list my scheduled jobs with t \u2014 30 3 * * * \u2014 active \u2014 next: 28 Nov 2026, 9:00 AM IST \u2014 last run: \u2014",
+          "run_condition": null,
+          "next_run_ist": "28 Nov 2026, 9:00 AM IST",
+          "last_run_ist": "27 Nov 2026, 9:55 AM IST",
+          "last_outcome_at_ist": "27 Nov 2026, 9:55 AM IST"
+        },
+        "notifications": [
+          {
+            "id": "2402b87c-7b81-4f0f-80c8-31d622c8307c",
+            "kind": "scheduled_completed",
+            "title": "Scheduled job completed",
+            "summary": "Scheduled job completed: Give me a summary of my watches and jobs at 9am. Completed. ### \ud83d\udcc5 Scheduled jobs  \u2022 `e28e78d4` \u2014 List my watches with their latest observations and list my scheduled jobs with t \u2014 30 3 * * * \u2014 active \u2014 next: 28 Nov 2026, 9:00 AM IST \u2014 last run: \u2014",
+            "diff_data": {
+              "task_id": "64cf688f554a44b2b4ae56088f50c68b",
+              "outcome": "completed",
+              "artifacts": []
+            },
+            "created_at": 1795753537.66896,
+            "delivered_at": null,
+            "acknowledged": 0,
+            "mission_id": "e28e78d4015c4ae2822c22411109ded8",
+            "task_id": null,
+            "notification_sent": 0,
+            "state_hash": ""
+          }
+        ]
+      }
+    },
+    "C_scheduled_research": {
+      "schedule_task_id": "3c1d1e1239e146cda191d5bf5f425c80",
+      "schedule_message": "Scheduled (once, in 1 minutes) \u2014 job `f216768216944b6aa5c74e70506720fc`: 'research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations'.\nNext run: 27 Nov 2026 09:56 IST (IST, UTC+5:30).\nPause, resume or cancel it from the Control Center (job `f216768216944b6aa5c74e70506720fc`), or tell me 'pause job f216768216944b6aa5c74e70506720fc'.",
+      "job": {
+        "id": "f216768216944b6aa5c74e70506720fc",
+        "instruction": "research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations Execute this directly at run time. Do not ask clarifying questions; if some information is missing, state what is missing and complete as much as possible.",
+        "schedule": "in 1 minutes",
+        "schedule_kind": "once",
+        "cron": null,
+        "interval_seconds": 60,
+        "status": "active",
+        "next_run_at": null,
+        "last_run_at": 1795753674.0115333,
+        "last_task_id": "a8dde5222a31483799a8245b8f0afd30",
+        "allowed_domains": [],
+        "long_horizon": false,
+        "created_at": 1795753541.3186288,
+        "updated_at": 1795753674.0115333,
+        "last_outcome": "completed",
+        "last_error": null,
+        "last_run_outcome_at": 1795753674.0115333,
+        "objective": "research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations",
+        "execution_started_at": 1795753601.6597242,
+        "execution_completed_at": 1795753674.0115333,
+        "last_artifacts": [
+          {
+            "artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_xlsx",
+            "filename": "on-device_AI_agents_using_five_credible_.xlsx",
+            "file_format": "xlsx",
+            "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/a8dde5222a31483799a8245b8f0afd30/on-device_AI_agents_using_five_credible_.xlsx",
+            "file_size_bytes": 14124
+          },
+          {
+            "artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_pdf",
+            "filename": "on-device_AI_agents_using_five_credible_.pdf",
+            "file_format": "pdf",
+            "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/a8dde5222a31483799a8245b8f0afd30/on-device_AI_agents_using_five_credible_.pdf",
+            "file_size_bytes": 203278
+          }
+        ],
+        "last_run_summary": "Completed; produced 2 artifact(s): on-device_AI_agents_using_five_credible_.xlsx, on-device_AI_agents_using_five_credible_.pdf.",
+        "run_condition": null,
+        "next_run_ist": null,
+        "last_run_ist": "27 Nov 2026, 9:57 AM IST",
+        "last_outcome_at_ist": "27 Nov 2026, 9:57 AM IST"
+      },
+      "wait_s": 128.3,
+      "run_task": {
+        "state": "completed",
+        "stepsDone": 26,
+        "intent": "RESEARCH_TASK",
+        "route": {
+          "via": "http_research",
+          "planner_calls": 2,
+          "steps": 26,
+          "sources_accepted": 9,
+          "sources_rejected": 6,
+          "synthesis_path": "provider"
+        },
+        "message": "## Architecture\nThe evidence describes three distinct architectural approaches to on-device AI agents. Agent-X is a software-only, accuracy-preserving framework that accelerates both the prefill and decode stages of on-device agent workloads, and is described as seamlessly integrable into existing on-device AI agents [1, 8]. A second approach, Division-of-Thoughts (DoT), is a collaborative reasoning framework that leverages the synergy between locally deployed Smaller-scale Language Models (SLMs) and cloud-based LLMs [2]; to boost the adapter's task allocation capability, DoT proposes a self-r"
+      },
+      "artifacts": [
+        {
+          "artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_xlsx",
+          "task_id": "a8dde5222a31483799a8245b8f0afd30",
+          "conversation_id": "default",
+          "filename": "on-device_AI_agents_using_five_credible_.xlsx",
+          "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/a8dde5222a31483799a8245b8f0afd30/on-device_AI_agents_using_five_credible_.xlsx",
+          "file_format": "xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "file_size_bytes": 14124,
+          "title": "on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional and sheet (XLSX)",
+          "summary": "Autonomous research deliverable in XLSX format.",
+          "metadata": {
+            "sources_count": 12,
+            "claims_count": 22,
+            "tables_count": 1,
+            "visuals_count": 2,
+            "read_back_verified": true,
+            "read_back_detail": "XLSX OK: 4 sheet(s), 333 cells"
+          },
+          "created_at": 1795753673.7201922
+        },
+        {
+          "artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_pdf",
+          "task_id": "a8dde5222a31483799a8245b8f0afd30",
+          "conversation_id": "default",
+          "filename": "on-device_AI_agents_using_five_credible_.pdf",
+          "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/a8dde5222a31483799a8245b8f0afd30/on-device_AI_agents_using_five_credible_.pdf",
+          "file_format": "pdf",
+          "mime_type": "application/pdf",
+          "file_size_bytes": 203278,
+          "title": "on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional and sheet (PDF)",
+          "summary": "Autonomous research deliverable in PDF format.",
+          "metadata": {
+            "sources_count": 12,
+            "claims_count": 22,
+            "tables_count": 1,
+            "visuals_count": 2,
+            "read_back_verified": true,
+            "read_back_detail": "PDF OK: 8 page(s), 16375 chars"
+          },
+          "created_at": 1795753673.591867
+        }
+      ],
+      "xlsx": {
+        "sheets": [
+          "Executive Summary",
+          "Comparison & Metrics",
+          "Verified Claims",
+          "Sources & Provenance"
+        ],
+        "rows_per_sheet": {
+          "Executive Summary": 14,
+          "Comparison & Metrics": 5,
+          "Verified Claims": 23,
+          "Sources & Provenance": 13
+        }
+      },
+      "pdf": {
+        "pages": 8,
+        "chars": 16376
+      },
+      "notifications_after_reconnect": [
+        {
+          "id": "56a0f905-fa24-4233-ab03-d1133d5dcc87",
+          "kind": "scheduled_completed",
+          "title": "Scheduled job completed",
+          "summary": "Scheduled job completed: research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations. Completed; produced 2 artifact(s): on-device_AI_agents_using_five_credible_.xlsx, on-device_AI_agents_using_five_credible_.pdf.",
+          "diff_data": {
+            "task_id": "a8dde5222a31483799a8245b8f0afd30",
+            "outcome": "completed",
+            "artifacts": [
+              "on-device_AI_agents_using_five_credible_.xlsx",
+              "on-device_AI_agents_using_five_credible_.pdf"
+            ]
+          },
+          "created_at": 1795753674.0643632,
+          "delivered_at": null,
+          "acknowledged": 0,
+          "mission_id": "f216768216944b6aa5c74e70506720fc",
+          "task_id": null,
+          "notification_sent": 0,
+          "state_hash": ""
+        }
+      ],
+      "ack": {
+        "status": 200,
+        "body": {
+          "ok": true
+        }
+      }
+    },
+    "D_pause_resume_cancel": {
+      "paused_job": {
+        "id": "e88663d5243a47aa85048ec803603c3c",
+        "instruction": "hi Execute this directly at run time. Do not ask clarifying questions; if some information is missing, state what is missing and complete as much as possible.",
+        "schedule": "in 1 minutes",
+        "schedule_kind": "once",
+        "cron": null,
+        "interval_seconds": 60,
+        "status": "active",
+        "next_run_at": null,
+        "last_run_at": 1795753759.8197687,
+        "last_task_id": "de52244827724132a1589b8deb2d403c",
+        "allowed_domains": [],
+        "long_horizon": false,
+        "created_at": 1795753674.4456062,
+        "updated_at": 1795753759.8197687,
+        "last_outcome": "completed",
+        "last_error": null,
+        "last_run_outcome_at": 1795753759.8197687,
+        "objective": "hi",
+        "execution_started_at": 1795753754.2808592,
+        "execution_completed_at": 1795753759.8197687,
+        "last_artifacts": [],
+        "last_run_summary": "Completed. Hey! \ud83d\udc4b Good to see you \u2014 but I've got to be straight with you: **the actual task didn't come through.** Your message has the instruction (\"execute directly, don't ask questions\") but no payload tellin",
+        "run_condition": null,
+        "next_run_ist": null,
+        "last_run_ist": "27 Nov 2026, 9:59 AM IST",
+        "last_outcome_at_ist": "27 Nov 2026, 9:59 AM IST"
+      },
+      "cancelled_job": {
+        "id": "44513c262b6e4cb7b95de13490bd17e0",
+        "instruction": "hi Execute this directly at run time. Do not ask clarifying questions; if some information is missing, state what is missing and complete as much as possible.",
+        "schedule": "in 1 minutes",
+        "schedule_kind": "once",
+        "cron": null,
+        "interval_seconds": 60,
+        "status": "cancelled",
+        "next_run_at": 1795753819.9425175,
+        "last_run_at": null,
+        "last_task_id": null,
+        "allowed_domains": [],
+        "long_horizon": false,
+        "created_at": 1795753759.9425175,
+        "updated_at": 1795753760.0117748,
+        "last_outcome": null,
+        "last_error": null,
+        "last_run_outcome_at": null,
+        "objective": "hi",
+        "execution_started_at": null,
+        "execution_completed_at": null,
+        "last_artifacts": [],
+        "last_run_summary": null,
+        "run_condition": null,
+        "next_run_ist": "27 Nov 2026, 10:00 AM IST",
+        "last_run_ist": null,
+        "last_outcome_at_ist": null
+      }
+    }
+  }
+}

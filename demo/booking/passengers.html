@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passenger details — Demo Booking Fixture</title>
+<link rel="stylesheet" href="fixture.css">
+</head>
+<body>
+<main>
+  <div class="banner"><strong>DEMO FIXTURE — synthetic data only.</strong>
+  No real booking, no payment, no backend. Use the made-up passenger below, or any clearly fake details — never real personal data.</div>
+
+  <h1>Passenger details</h1>
+  <p class="sub">Step 3 of 4 — who is travelling. The suggested passenger is fictional.</p>
+  <p class="trip" id="trip-line">Loading trip…</p>
+
+  <form action="summary.html" method="get" id="pax-form">
+    <!-- Trip state carried forward as hidden fields; nothing leaves the browser. -->
+    <input type="hidden" name="from" id="h-from">
+    <input type="hidden" name="to" id="h-to">
+    <input type="hidden" name="date" id="h-date">
+    <input type="hidden" name="passengers" id="h-passengers">
+    <input type="hidden" name="travel_class" id="h-travel_class">
+    <input type="hidden" name="option" id="h-option">
+    <input type="hidden" name="depart" id="h-depart">
+    <input type="hidden" name="arrive" id="h-arrive">
+    <input type="hidden" name="duration" id="h-duration">
+    <input type="hidden" name="cls" id="h-cls">
+    <input type="hidden" name="fare" id="h-fare">
+
+    <fieldset>
+      <legend>Passenger 1</legend>
+      <label for="full_name">Full name</label>
+      <input id="full_name" name="full_name" type="text" value="Demo Traveller" autocomplete="off" required>
+      <div class="row">
+        <div>
+          <label for="age">Age</label>
+          <input id="age" name="age" type="number" min="1" max="120" value="21" required>
+        </div>
+        <div>
+          <label for="berth">Berth preference</label>
+          <select id="berth" name="berth">
+            <option value="Lower">Lower</option>
+            <option value="Middle">Middle</option>
+            <option value="Upper">Upper</option>
+            <option value="Side Lower">Side Lower</option>
+            <option value="No preference">No preference</option>
+          </select>
+        </div>
+      </div>
+      <label for="email">Email <span class="hint">(synthetic — e.g. demo@example.test)</span></label>
+      <input id="email" name="email" type="email" value="demo@example.test" autocomplete="off" required>
+      <label for="phone">Phone <span class="hint">(synthetic — e.g. 90000 00000)</span></label>
+      <input id="phone" name="phone" type="tel" value="90000 00000" autocomplete="off" required>
+    </fieldset>
+    <button class="btn" type="submit">Review booking</button>
+  </form>
+  <p><a class="link" href="index.html">Back to search</a></p>
+
+  <footer>Demo Booking Fixture · NAVIGATOR / PRIVAGENT · Stream F · All data synthetic.</footer>
+</main>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var keys = ["from", "to", "date", "passengers", "travel_class", "option", "depart", "arrive", "duration", "cls", "fare"];
+  keys.forEach(function (k) {
+    var h = document.getElementById("h-" + k);
+    if (h) h.value = q.get(k) || "";
+  });
+  document.getElementById("trip-line").textContent =
+    (q.get("option") || "No option selected") + " · " + (q.get("from") || "") + " to " + (q.get("to") || "") +
+    " · " + (q.get("date") || "") + " · departs " + (q.get("depart") || "") + " · ₹" + (q.get("fare") || "?") + " per passenger";
+})();
+</script>
+</body>
+</html>

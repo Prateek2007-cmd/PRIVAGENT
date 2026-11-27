@@ -214,6 +214,29 @@ def init_db(db_path: Optional[str] = None) -> None:
                 updated_at REAL NOT NULL
             );
 
+            -- Stream D (RC-LIVE-05): durable terminal task records.
+            -- Tasks used to live only in the in-memory hub registry, so
+            -- a backend restart lost every record that had never
+            -- written a checkpoint — a completed conversational task
+            -- (no browser steps, no ask-user pause) vanished entirely
+            -- and GET /api/task/{id} 404'd. Every run_task exit now
+            -- upserts one row here (see agentLoop._persist_task_record)
+            -- AND a terminal checkpoint, so _require can restore the
+            -- record from the checkpoint after a restart. The message
+            -- is the agent's own summary (already scrubbed for
+            -- persistence by the caller); no page text is stored here.
+            CREATE TABLE IF NOT EXISTS task_records (
+                task_id TEXT PRIMARY KEY,
+                chat_id TEXT,
+                instruction TEXT NOT NULL,
+                state TEXT NOT NULL,
+                steps_done INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                intent TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS artifacts (
                 artifact_id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -826,6 +849,61 @@ def get_task_checkpoint(task_id: str, db_path: Optional[str] = None) -> Optional
         except Exception:
             d["working_memory"] = {}
         return d
+
+
+# ---------------------------------------------------------------------------
+# Durable task records (Stream D, RC-LIVE-05)
+# ---------------------------------------------------------------------------
+
+def save_task_record(
+    task_id: str,
+    *,
+    chat_id: Optional[str] = None,
+    instruction: str = "",
+    state: str = "",
+    steps_done: int = 0,
+    message: str = "",
+    intent: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> None:
+    """Upsert the durable record for one task run (RC-LIVE-05).
+
+    The hub registry is in-memory only; without this row a backend
+    restart loses every task that never wrote a checkpoint. The
+    caller (agentLoop._persist_task_record) also writes a terminal
+    checkpoint, which is what main._require restores from — this
+    table is the queryable record of the outcome (state, steps,
+    message, intent) and the source long_memory checks before it
+    treats a run as verified.
+    """
+    init_db(db_path)
+    now = time.time()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO task_records
+                (task_id, chat_id, instruction, state, steps_done, message, intent, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                instruction = excluded.instruction,
+                state = excluded.state,
+                steps_done = excluded.steps_done,
+                message = excluded.message,
+                intent = excluded.intent,
+                updated_at = excluded.updated_at
+            """,
+            (task_id, chat_id, instruction, state, int(steps_done or 0), message or "",
+             intent, now, now),
+        )
+        conn.commit()
+
+
+def get_task_record(task_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Return the durable record for a task, or None when it never ran here."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM task_records WHERE task_id = ?", (task_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def get_latest_checkpoint_for_chat(conversation_id: str, db_path: Optional[str] = None) -> Optional[dict[str, Any]]:

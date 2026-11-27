@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Booking summary — Demo Booking Fixture</title>
+<link rel="stylesheet" href="fixture.css">
+</head>
+<body>
+<main>
+  <div class="banner"><strong>DEMO FIXTURE — synthetic data only.</strong>
+  No real booking, no payment, no backend. This summary is the approval boundary: a real booking would stop here for the operator to approve.</div>
+
+  <h1>Booking summary</h1>
+  <p class="sub">Step 4 of 4 — check everything. Status: <span class="status">PREPARED — awaiting approval</span></p>
+
+  <table class="summary" id="summary-table">
+    <tr><th>Route</th><td id="s-route">—</td></tr>
+    <tr><th>Date of travel</th><td id="s-date">—</td></tr>
+    <tr><th>Option</th><td id="s-option">—</td></tr>
+    <tr><th>Departure / arrival</th><td id="s-times">—</td></tr>
+    <tr><th>Class</th><td id="s-cls">—</td></tr>
+    <tr><th>Passengers</th><td id="s-pax">—</td></tr>
+    <tr><th>Passenger 1</th><td id="s-name">—</td></tr>
+    <tr><th>Berth preference</th><td id="s-berth">—</td></tr>
+    <tr><th>Contact</th><td id="s-contact">—</td></tr>
+    <tr><th>Fare per passenger</th><td id="s-fare">—</td></tr>
+    <tr class="total"><th>Total</th><td id="s-total">—</td></tr>
+  </table>
+
+  <div class="boundary">
+    <h2>Approval boundary — stop here</h2>
+    <p>This booking is <strong>prepared, not completed</strong>. Nothing has been reserved, nothing has been paid, and no account was used. In the real flow the operator reviews this summary and approves (or cancels) before any payment step.</p>
+    <button class="btn" type="button" disabled>Pay &amp; confirm — disabled in this demo</button>
+    <p>The payment button is disabled on purpose: the demo never takes a payment, and the agent must never click past this page.</p>
+  </div>
+
+  <p><a class="link" href="index.html">Start a new search</a></p>
+
+  <footer>Demo Booking Fixture · NAVIGATOR / PRIVAGENT · Stream F · All data synthetic.</footer>
+</main>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var get = function (k) { return q.get(k) || "—"; };
+  var fare = parseInt(q.get("fare") || "0", 10) || 0;
+  var pax = parseInt(q.get("passengers") || "1", 10) || 1;
+  document.getElementById("s-route").textContent = get("from") + " to " + get("to");
+  document.getElementById("s-date").textContent = get("date");
+  document.getElementById("s-option").textContent = get("option") + " (" + get("duration") + ")";
+  document.getElementById("s-times").textContent = "Departs " + get("depart") + " · arrives " + get("arrive");
+  document.getElementById("s-cls").textContent = get("cls") + " (preferred: " + get("travel_class") + ")";
+  document.getElementById("s-pax").textContent = String(pax) + " passenger(s)";
+  document.getElementById("s-name").textContent = get("full_name") + ", age " + get("age");
+  document.getElementById("s-berth").textContent = get("berth");
+  document.getElementById("s-contact").textContent = get("email") + " · " + get("phone");
+  document.getElementById("s-fare").textContent = "₹" + fare;
+  document.getElementById("s-total").textContent = "₹" + (fare * pax) + " (" + pax + " × ₹" + fare + ")";
+})();
+</script>
+</body>
+</html>

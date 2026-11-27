@@ -147,6 +147,10 @@ def public_state() -> dict[str, Any]:
         # URL and model are set.
         "keyConfigured": bool(api_key) or provider == "ollama",
         "model": model or None,
+        # Stream A follow-up: surface the mock-provider banner flag so
+        # clients can tell (without scraping the UI) whether the loud
+        # MOCK PROVIDER banner should show. Default on (config.py).
+        "mockProviderBanner": bool(config.MOCK_PROVIDER_BANNER),
     }
 
 

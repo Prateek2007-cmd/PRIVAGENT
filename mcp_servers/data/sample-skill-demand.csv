@@ -1,0 +1,9 @@
+skill,mentions_in_sample_posts,trend_vs_last_quarter,notes
+Python,184,rising,"Most requested language in the synthetic sample"
+JavaScript,162,stable,"Frontend roles dominate the synthetic sample"
+React,121,rising,"Often paired with JavaScript in the synthetic sample"
+SQL,118,stable,"Listed alongside backend roles in the synthetic sample"
+Java,96,falling,"Enterprise listings in the synthetic sample"
+FastAPI,54,rising,"Small but growing in the synthetic sample"
+Docker,71,stable,"Common 'nice to have' in the synthetic sample"
+Machine Learning,88,rising,"ML-adjacent intern roles in the synthetic sample"

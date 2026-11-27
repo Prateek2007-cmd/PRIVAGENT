@@ -17,6 +17,23 @@ from ..models import (
 )
 
 
+def _natural_source_key(source_id: str) -> tuple[str, int, str]:
+    """Sort key for source IDs: 'src_2' before 'src_10'.
+
+    A plain string sort puts src_10 at citation [2], so a claim citing
+    src_2 points a reader at the wrong bibliography entry whenever a
+    package has >= 10 sources. Split a trailing number off and sort
+    numerically on it; IDs without a trailing number sort after the
+    numbered ones, by plain string.
+    """
+    import re
+
+    m = re.match(r"^(.*?)(\d+)$", source_id or "")
+    if m:
+        return (m.group(1), int(m.group(2)), "")
+    return (source_id or "", -1, source_id or "")
+
+
 class BaseRenderer(ABC):
     """Abstract base class for all PrivAgent research artifact renderers."""
 
@@ -27,8 +44,15 @@ class BaseRenderer(ABC):
 
     @staticmethod
     def build_citation_map(pkg: ResearchKnowledgePackage) -> dict[str, int]:
-        """Create a stable 1-indexed citation number mapping for all sources in the package."""
-        sorted_sources = sorted(pkg.sources.values(), key=lambda s: s.source_id)
+        """Create a stable 1-indexed citation number mapping for all sources in the package.
+
+        Sources sort in NATURAL order (src_2 before src_10), not
+        lexicographic order: a plain string sort puts src_10 at [2],
+        so a claim citing src_2 would point a reader at the wrong
+        source in the bibliography whenever a package has >= 10
+        sources.
+        """
+        sorted_sources = sorted(pkg.sources.values(), key=lambda s: _natural_source_key(s.source_id))
         return {src.source_id: idx for idx, src in enumerate(sorted_sources, start=1)}
 
     @staticmethod

@@ -17,12 +17,32 @@ ACTION_TYPES = [
     # WebMCP tool in the tab; ucp_checkout runs a UCP checkout
     # session — executed by the backend, never sent to the extension.
     "webmcp_tool", "ucp_checkout",
+    # Stream B (S3-R1): mcp_tool calls a server-registered MCP tool
+    # through the unified tool registry (backend/app/tool_registry.py)
+    # — executed by the backend, never sent to the extension. The
+    # planner selects it with params.tool = "mcp.<server>.<tool>" and
+    # params.arguments matching the tool's JSON Schema. Mirror this
+    # entry in extension/src/contracts.ts (Stream F) — the parity test
+    # pins the two lists equal.
+    "mcp_tool",
 ]
 RISK_CLASSES = ["read", "write", "sensitive"]
 TASK_STATES = [
     "planning", "awaiting_confirmation", "running", "awaiting_input",
     "awaiting_takeover",
     "completed", "failed", "cancelled", "paused",
+    # Stream D (CONTRACTS3 outcome vocabulary): "blocked" is a
+    # terminal outcome for a run that stopped on a missing
+    # dependency, not on an error — e.g. the Chrome extension is not
+    # connected, so a browser task cannot start. It is distinct from
+    # "failed": nothing went wrong with the task itself, and the same
+    # objective can proceed once the dependency is present. NOTE: the
+    # TS TaskState union in extension/src/contracts.ts does not list
+    # it yet — the frontend treats taskState as a string and renders
+    # unknown states with the default badge, so this is runtime-safe;
+    # the mirror should gain the member on the next TS touch. The
+    # parity test pins ACTION_TYPES / RISK_CLASSES only, not this list.
+    "blocked",
 ]
 ERROR_CODES = [
     "STALE_TARGET", "TIMEOUT", "NAVIGATION_FAILED", "PRIVACY_VIOLATION",
@@ -93,6 +113,8 @@ class ActionParams(BaseModel):
     # currency). Amount is a string in the contract so no float or
     # Decimal ever crosses the TS boundary; the backend parses it
     # with Decimal and fails closed on anything unparsable.
+    # Stream B (S3-R1): mcp_tool reuses the same tool/arguments
+    # fields (tool = "mcp.<server>.<tool>").
     tool: Optional[str] = None
     arguments: Optional[dict[str, Any]] = None
     merchant: Optional[str] = None

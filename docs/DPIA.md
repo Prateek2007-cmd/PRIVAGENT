@@ -67,11 +67,12 @@ From `docs/EVALS.md`, measured 2026-11-16 on hand-written fixtures
   canonical injections 0.25 (21/28 flagged at plan level), **evasion
   1.0 (0/14 paraphrases flagged)**, benign false-positive rate 0.0.
   The checker catches loud injections and is blind to paraphrase.
-- **Privacy leak rate 0.2609** — 6 of 23 synthetic PII tokens
-  survived redaction into the planner prompt: bare OTP 2/2, labelled
-  OTP 1/1, bare password 1/1, postal address 1/1, phone in an element
-  value 1/3. Every type the redactor's pattern set claims to handle
-  leaks 0; the leaks are all in types the redactor does not cover.
+- **Privacy leak rate 0.0417** — 1 of 24 synthetic PII tokens
+  survived redaction into the planner prompt: the unlabelled password
+  1/1 (no pattern can match a password with no label). Bare OTP 0/2,
+  labelled OTP 0/1 and postal address 0/1 after the 2026-11-26
+  OTP/address fix; phone 0/3 after the 2026-11-18 fix. History: 6/23 on 2026-11-16, 5/24 (0.2083) on 2026-11-18. Every type the
+  redactor's pattern set claims to handle leaks 0.
 - **No live benchmark has ever been run** (WebArena-Verified, OSWorld
   2.0, PrivacyLens: 12 blocked / 0 attempted at the time of writing).
   The numbers above measure the checker/redactor against fixtures,

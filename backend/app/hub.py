@@ -7,6 +7,7 @@ loops via an asyncio.Future per action id.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from typing import Any, Coroutine, Optional
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
+
+logger = logging.getLogger(__name__)
 
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 MAX_RETAINED_TASKS = 200
@@ -135,9 +138,25 @@ class Hub:
             if not self.extension_sockets:
                 self.extension_profile = {}
 
-    def spawn(self, coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
+    def spawn(self, coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any] | None":
         """Keep a strong reference to fire-and-forget broadcasts so the
-        event loop cannot garbage-collect them mid-flight."""
+        event loop cannot garbage-collect them mid-flight.
+
+        Returns None (and drops the broadcast) when called with no
+        running event loop — a sync caller such as a script or a test
+        cannot schedule one. The coroutine is closed so it never
+        warns, and the drop is logged: callers must not depend on
+        delivery from a sync context; the missed-event pull covers it.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                coro.close()
+            except Exception:
+                pass
+            logger.warning("hub.spawn called with no running event loop; broadcast dropped")
+            return None
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -257,6 +276,52 @@ class Hub:
                 await ws.send_json(message)
             except Exception:
                 self.drop_extension(ws)
+
+    async def broadcast_control_state(self) -> None:
+        """Broadcast the current monitoring/scheduling state to clients.
+
+        Stream C (R-03): this method did not exist, yet
+        continuous_monitoring_companion called it at three sites, each
+        wrapped in try/except: pass — so creating/updating a watch
+        never refreshed any client and the AttributeError was swallowed
+        silently. It now broadcasts a CONTROL_STATE envelope with
+        mission counts + the unread-alert count, so the workspace can
+        refresh watch cards and badges without a reload. Best-effort:
+        a DB failure must never break the broadcast.
+        """
+        payload: dict[str, Any] = {"missions": [], "unread_alerts": 0}
+        try:
+            from . import db
+
+            db.init_db()
+            with db.get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, title, status, next_run_at FROM monitoring_missions"
+                    " ORDER BY created_at DESC LIMIT 50"
+                ).fetchall()
+                payload["missions"] = [dict(r) for r in rows]
+                try:
+                    payload["unread_alerts"] = int(conn.execute(
+                        "SELECT COUNT(*) FROM monitoring_events WHERE acknowledged=0"
+                    ).fetchone()[0])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        envelope = {"type": "CONTROL_STATE", "payload": payload}
+        for ws in list(self.client_sockets):
+            if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED or getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
+                if ws in self.client_sockets:
+                    self.client_sockets.remove(ws)
+                continue
+            try:
+                await ws.send_json(envelope)
+            except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError, OSError):
+                if ws in self.client_sockets:
+                    self.client_sockets.remove(ws)
+            except Exception:
+                if ws in self.client_sockets:
+                    self.client_sockets.remove(ws)
 
     async def broadcast_progress(self, task: TaskRecord) -> None:
         from .privacy import scrub_persistent

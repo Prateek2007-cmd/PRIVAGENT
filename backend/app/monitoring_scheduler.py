@@ -14,6 +14,281 @@ from .hub import hub
 
 logger = logging.getLogger(__name__)
 
+# Stream C: India Standard Time is the user's timezone (UTC+5:30,
+# no daylight saving). Contract §3/§6: store UTC in the DB, display
+# IST in the UI with the offset stated. Every user-facing time in this
+# stream goes through format_ist.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def format_ist(ts: float | None) -> str | None:
+    """Epoch seconds -> 'Fri 27 Nov 2026, 2:30 PM IST' (None stays None)."""
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(float(ts), IST).strftime("%a %d %b %Y, %-I:%M %p IST")
+
+
+def format_ist_short(ts: float | None) -> str | None:
+    """Epoch seconds -> '27 Nov 2026, 2:30 PM IST' (None stays None)."""
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(float(ts), IST).strftime("%d %b %Y, %-I:%M %p IST")
+
+
+# Stream C: additive schema for the notification outbox + job outcomes
+# + alert cooldown. db.py is NOT owned by this stream, so the columns
+# / table are added idempotently here (PRAGMA check + ALTER TABLE) the
+# first time any Stream C path touches a DB. Nothing existing is
+# altered; a DB without these columns keeps working (callers read them
+# defensively).
+_STREAM_C_COLUMNS = {
+    "monitoring_events": [("delivered_at", "REAL")],
+    "monitoring_missions": [("alert_cooldown_seconds", "INTEGER NOT NULL DEFAULT 60")],
+    "scheduled_jobs": [
+        ("last_outcome", "TEXT"),
+        ("last_error", "TEXT"),
+        ("last_run_outcome_at", "REAL"),
+    ],
+}
+_SCHEMA_DONE: set[str | None] = set()
+
+
+def ensure_stream_c_schema(db_path: str | None = None) -> None:
+    """Create the notification outbox table and add Stream C columns.
+
+    Idempotent and safe to call on every entry point. The outbox holds
+    notifications that are NOT monitoring events (e.g. a scheduled job
+    blocked on confirmation/takeover) AND — Stream A — one durable
+    row per monitoring alert (kind ``monitor``, ref_id = the event
+    id), so a monitor alert has a notification-outbox row the
+    reconnect pull returns even when no socket was ever connected.
+    ``list_unread_events`` / ``count_unread_events`` deduplicate the
+    outbox monitor row against its monitoring_events row, so one
+    alert is never listed or counted twice.
+    """
+    if db_path in _SCHEMA_DONE:
+        return
+    db.init_db(db_path)
+    with db.get_connection(db_path) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS notification_outbox (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+            diff_data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,
+            delivered_at REAL, acknowledged INTEGER NOT NULL DEFAULT 0
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unread ON notification_outbox(acknowledged, created_at DESC)")
+        for table, columns in _STREAM_C_COLUMNS.items():
+            try:
+                existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            except Exception:
+                continue
+            for name, decl in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    _SCHEMA_DONE.add(db_path)
+
+
+def post_outbox_notification(kind: str, ref_id: str, title: str, summary: str,
+                             *, diff_data: dict | None = None,
+                             db_path: str | None = None) -> str:
+    """Persist a non-monitor notification (scheduled-job blocked, ...).
+
+    Returns the outbox row id. Delivery follows the same rule as
+    monitoring events: not delivered until a client acknowledges it or
+    the missed-event pull returns it.
+    """
+    ensure_stream_c_schema(db_path)
+    now = time.time()
+    note_id = str(uuid.uuid4())
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            """INSERT INTO notification_outbox
+               (id, kind, ref_id, title, summary, diff_data, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (note_id, kind, ref_id, title, summary,
+             json.dumps(diff_data or {}), now),
+        )
+    return note_id
+
+
+async def broadcast_outbox_notification(note_id: str, *, db_path: str | None = None) -> None:
+    """Push one outbox notification to live WS clients (best-effort).
+
+    The row stays unread until acknowledged or pulled, so a closed
+    frontend loses nothing — the pull is the durable channel.
+    """
+    from starlette.websockets import WebSocketDisconnect, WebSocketState
+
+    ensure_stream_c_schema(db_path)
+    with db.get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM notification_outbox WHERE id=?", (note_id,)
+        ).fetchone()
+    if row is None:
+        return
+    envelope = {
+        "type": "SCHEDULED_JOB_BLOCKED" if row["kind"] == "scheduled_blocked" else "NOTIFICATION",
+        "kind": row["kind"],
+        "ref_id": row["ref_id"],
+        "title": row["title"],
+        "message": row["summary"],
+        "event_id": row["id"],
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row["created_at"]))),
+    }
+    for ws in list(hub.client_sockets):
+        if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED or getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
+            hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
+            continue
+        try:
+            await ws.send_json(envelope)
+        except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError, OSError):
+            hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
+        except Exception:
+            hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
+
+
+def list_unread_events(*, since: float | None = None, unread_only: bool = False,
+                       limit: int = 100, db_path: str | None = None) -> list[dict]:
+    """Unified missed-event pull: monitoring events + outbox rows.
+
+    Sorted newest first. Each row carries kind ('monitor' | outbox
+    kind), acknowledged, notification_sent/delivered_at. Callers that
+    surface these rows should mark them read via mark_events_read, or
+    delivered via mark_events_delivered.
+    """
+    ensure_stream_c_schema(db_path)
+    events: list[dict] = []
+    with db.get_connection(db_path) as conn:
+        query = ("SELECT id, mission_id, task_id, detected_at, title, summary, diff_data,"
+                 " notification_sent, acknowledged, state_hash FROM monitoring_events")
+        clauses: list[str] = []
+        params: list = []
+        if since is not None:
+            clauses.append("detected_at >= ?")
+            params.append(since)
+        if unread_only:
+            clauses.append("acknowledged = 0")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY detected_at DESC LIMIT ?"
+        params.append(limit)
+        try:
+            delivered = {r[1] for r in conn.execute("PRAGMA table_info(monitoring_events)").fetchall()}
+            has_delivered = "delivered_at" in delivered
+        except Exception:
+            has_delivered = False
+        for r in conn.execute(query, params).fetchall():
+            d = dict(r)
+            try:
+                d["diff_data"] = json.loads(d.get("diff_data") or "{}")
+            except Exception:
+                d["diff_data"] = {}
+            d["kind"] = "monitor"
+            d["created_at"] = d.pop("detected_at")
+            if has_delivered:
+                row2 = conn.execute("SELECT delivered_at FROM monitoring_events WHERE id=?", (d["id"],)).fetchone()
+                d["delivered_at"] = row2["delivered_at"] if row2 else None
+            else:
+                d["delivered_at"] = None
+            events.append(d)
+        # Outbox rows (scheduled-job blocked, ...).
+        query2 = ("SELECT id, kind, ref_id, title, summary, diff_data, created_at,"
+                  " delivered_at, acknowledged FROM notification_outbox")
+        clauses2: list[str] = []
+        params2: list = []
+        if since is not None:
+            clauses2.append("created_at >= ?")
+            params2.append(since)
+        if unread_only:
+            clauses2.append("acknowledged = 0")
+        if clauses2:
+            query2 += " WHERE " + " AND ".join(clauses2)
+        query2 += " ORDER BY created_at DESC LIMIT ?"
+        params2.append(limit)
+        for r in conn.execute(query2, params2).fetchall():
+            d = dict(r)
+            try:
+                d["diff_data"] = json.loads(d.get("diff_data") or "{}")
+            except Exception:
+                d["diff_data"] = {}
+            # Stream A: an outbox row of kind "monitor" is the
+            # durable notification record of a monitoring event
+            # already listed above (same ref_id = event id). List
+            # the alert once — skip the duplicate row.
+            if d.get("kind") == "monitor" and any(
+                e.get("id") == d.get("ref_id") for e in events
+            ):
+                continue
+            d["mission_id"] = d.pop("ref_id")
+            d["task_id"] = None
+            d["notification_sent"] = 1 if d.get("delivered_at") else 0
+            d["state_hash"] = ""
+            events.append(d)
+    events.sort(key=lambda e: e.get("created_at") or 0, reverse=True)
+    return events[:limit]
+
+
+def mark_events_delivered(event_ids: list[str], *, db_path: str | None = None) -> None:
+    """Mark events delivered: the missed-event pull returned them.
+
+    Contract §3: an event is not 'delivered' until a client
+    acknowledges it OR the pull returns it. This is the pull half.
+    """
+    if not event_ids:
+        return
+    ensure_stream_c_schema(db_path)
+    now = time.time()
+    with db.get_connection(db_path) as conn:
+        for event_id in event_ids:
+            try:
+                conn.execute(
+                    "UPDATE monitoring_events SET notification_sent=1, delivered_at=? WHERE id=?",
+                    (now, event_id),
+                )
+            except Exception:
+                try:
+                    conn.execute(
+                        "UPDATE monitoring_events SET notification_sent=1 WHERE id=?",
+                        (event_id,),
+                    )
+                except Exception:
+                    pass
+            conn.execute(
+                "UPDATE notification_outbox SET delivered_at=? WHERE id=?",
+                (now, event_id),
+            )
+
+
+def mark_event_read(event_id: str, *, db_path: str | None = None) -> bool:
+    """Mark one event (monitor or outbox) acknowledged/read."""
+    ensure_stream_c_schema(db_path)
+    with db.get_connection(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE monitoring_events SET acknowledged=1 WHERE id=?", (event_id,)
+        )
+        if cur.rowcount:
+            return True
+        cur = conn.execute(
+            "UPDATE notification_outbox SET acknowledged=1 WHERE id=?", (event_id,)
+        )
+        return bool(cur.rowcount)
+
+
+def count_unread_events(*, db_path: str | None = None) -> int:
+    ensure_stream_c_schema(db_path)
+    with db.get_connection(db_path) as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM monitoring_events WHERE acknowledged=0"
+        ).fetchone()[0]
+        # Stream A: outbox rows of kind "monitor" mirror a
+        # monitoring event (same alert) — they are counted via the
+        # events table above, never twice.
+        m = conn.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE acknowledged=0 AND kind != 'monitor'"
+        ).fetchone()[0]
+    return int(n) + int(m)
+
+
 # A watch is not killed by one bad tick. A transient failure (DNS,
 # connect timeout, a site hiccup) keeps the mission active so it
 # retries on its normal cadence; only a permanent refusal, or this
@@ -128,6 +403,7 @@ def next_due_at(trigger: str, cron: str | None, interval: int, now: float) -> fl
 def claim_due(now: float | None = None, limit: int = 5, db_path: str | None = None) -> list[dict]:
     current = time.time() if now is None else now
     db.init_db(db_path)
+    ensure_stream_c_schema(db_path)
     claims: list[dict] = []
     with db.get_connection(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -175,7 +451,18 @@ async def execute_monitor(mission: dict) -> None:
         from .email_intelligence import run_email_mission_tick
         try:
             await run_email_mission_tick(mission["id"])
-        except Exception:
+        except Exception as exc:
+            # Stream C (R-07): a broken email mission used to stay
+            # 'active' forever — the exception only updated last_sync_at,
+            # with no failure counting, no death event. Route it through
+            # the same 5-strike rule as web watches (the mirrored
+            # monitoring_missions row carries the same id).
+            logger.warning("email monitor %s: tick failed: %s", mission["id"], exc)
+            _status, death_event = _record_monitor_failure(mission["id"], str(exc))
+            if death_event:
+                from .change_detector import broadcast_event
+
+                await broadcast_event(death_event)
             with db.get_connection() as conn:
                 conn.execute("UPDATE email_monitoring_missions SET last_sync_at=? WHERE id=?", (time.time(), mission["id"]))
         return
@@ -187,9 +474,14 @@ async def execute_monitor(mission: dict) -> None:
     # existing browser path (it sees rendered/JS content the HTTP
     # fetch cannot). Either way the check is read-only.
     if target_url.startswith(("http://", "https://")) and hub.extension_ws is None:
-        from .monitor_check import _validate_monitor_url, check_monitor_http
+        # Stream C (RC-LIVE-04): the fetch uses the ONE monitoring URL
+        # gate (change_detector.validate_monitor_url) — the same gate
+        # watch creation uses — so a URL the fetch accepts can always
+        # be created, including the 127.0.0.1 fixture host.
+        from .change_detector import validate_monitor_url
+        from .monitor_check import check_monitor_http
 
-        ok, reason = _validate_monitor_url(target_url)
+        ok, reason = validate_monitor_url(target_url)
         if not ok:
             logger.warning("monitor %s: HTTP check refused (%s)", mission["id"], reason)
             # A DNS refusal is transient — the watch survives and
@@ -243,7 +535,16 @@ async def execute_monitor(mission: dict) -> None:
 async def scheduler_loop(stop: asyncio.Event, tick_seconds: float = 10.0) -> None:
     running: set[asyncio.Task] = set()
     while not stop.is_set():
-        for mission in claim_due(limit=max(0, 5 - len(running))):
+        # Stream C (R-02): the claim used to run unguarded — one
+        # claim_due exception (DB locked/corrupt) propagated out of
+        # the loop and ALL monitoring stopped silently for the rest of
+        # the process. Mirror the scheduler loop: log and keep ticking.
+        try:
+            due = claim_due(limit=max(0, 5 - len(running)))
+        except Exception as exc:  # noqa: BLE001 — the loop must survive a bad claim
+            logger.warning("monitoring tick failed: %s", exc)
+            due = []
+        for mission in due:
             task = asyncio.create_task(execute_monitor(mission))
             running.add(task)
             task.add_done_callback(running.discard)

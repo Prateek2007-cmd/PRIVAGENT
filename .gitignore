@@ -1,50 +1,6 @@
-# Dependencies
-node_modules/
-extension/node_modules/
-backend/venv/
-venv/
-
-# Build artifacts
-dist/
-build/
-extension/dist/
-
-# Python cache & test artifacts
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-backend/.pytest_cache/
-
-# Environment variables & secrets
-.env
-*.env
-backend/.env
-backend/*.env
-!backend/.env.example
-
-# OS / Editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
-# Local SQLite databases and runtime artifacts
-backend/data/
-backend/scratch/
-artifact_proof
-*.db
-*.db-wal
-*.db-shm
-
-# Secret material (Task 2/5): already covered by backend/data/ above, but
-# listed explicitly so a future move of these files out of backend/data/
-# does not silently start tracking them. Never commit a real value.
-backend/data/.master.key
-backend/data/.local_token
-backend/data/secrets.enc.json
-backend/data/payments_audit.jsonl
-.local_token
-.master.key
-secrets.enc.json
-
+# Stream B live-verification runtime (never commit)
+/live/venv/
+/live/data/
+/live/backend-copy/
+**/__pycache__/
+*.pyc

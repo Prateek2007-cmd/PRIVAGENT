@@ -1,11 +1,162 @@
 """Conversational Google Calendar integration and schedule queries."""
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import re
 from typing import Any, Optional
 
 from app.connectors.oauth import oauth_manager
+
+
+# --- Stream B (S3-R3): structured cross-app handoff ----------------------
+# The email classifier extracts a deadline as a *display string* that
+# nothing consumed (audit S3-R3): the calendar half only parsed the
+# user's words, so "scan my email for the Microsoft interview and add
+# it to my calendar" failed honestly whenever the time lived in the
+# email. CrossAppContext carries the deadline as a structured value —
+# a real datetime, a title, the source message id — from the email side
+# into the calendar clause. The calendar side never books silently
+# from it: the deadline is presented as a confirmable value
+# ("deadline found in email: X, shall I book that?") and only a
+# confirmed instruction creates the event.
+@dataclasses.dataclass
+class CrossAppContext:
+    """Structured handoff between the email side and the calendar side.
+
+    ``deadline`` is the parsed datetime (IST unless the text names
+    another zone); ``deadline_text`` is the raw string it came from;
+    ``title`` the event title; ``message_id`` the source email's id,
+    so the booking can be traced back to the mail it came from.
+    """
+
+    deadline: datetime.datetime | None = None
+    deadline_text: str | None = None
+    title: str | None = None
+    message_id: str | None = None
+    source: str = "email"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "deadline": self.deadline.isoformat() if self.deadline else None,
+            "deadline_text": self.deadline_text,
+            "title": self.title,
+            "message_id": self.message_id,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "CrossAppContext":
+        data = data or {}
+        deadline = None
+        raw = data.get("deadline")
+        if isinstance(raw, str) and raw:
+            try:
+                deadline = datetime.datetime.fromisoformat(raw)
+            except ValueError:
+                deadline = None
+        return cls(
+            deadline=deadline,
+            deadline_text=data.get("deadline_text"),
+            title=data.get("title"),
+            message_id=data.get("message_id"),
+            source=data.get("source") or "email",
+        )
+
+    def format_for_confirmation(self) -> str:
+        """The confirmable value shown to the operator."""
+        when = (
+            self.deadline.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+            if self.deadline
+            else (self.deadline_text or "unknown time")
+        )
+        title = self.title or "the event"
+        return (
+            f"Deadline found in email: {when} — shall I book '{title}' for that time?"
+        )
+
+
+_DEADLINE_PREFIX_RE = re.compile(
+    r"^\s*(?:deadline|due\s+date|due|by|before|until|expires?\s+on|closes?\s+on)\s*[:=\-–]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _has_date_or_time(text: str) -> bool:
+    """True when the text carries any usable date/time signal.
+
+    Guards parse_deadline_text against _interpret_time_text's silent
+    fallback (tomorrow 10:00): a deadline string with no date, no
+    weekday and no clock is not a deadline, it is noise.
+    """
+    low = (text or "").lower()
+    if _ISO_DATE_RE.search(text) or _DMY_DATE_RE.search(text) or _MDY_DATE_RE.search(text):
+        return True
+    if re.search(r"\b(today|tomorrow)\b", low):
+        return True
+    if re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low):
+        return True
+    return _parse_time_of_day(text) is not None
+
+
+def parse_deadline_text(deadline_text: str, now: datetime.datetime | None = None) -> datetime.datetime | None:
+    """Parse a classifier deadline string into a datetime, or None.
+
+    Accepts the email classifier's display strings ("deadline: Friday,
+    Nov 28, 10am", "by 2026-11-28 14:00", "due tomorrow 10:00 AM IST")
+    and returns an aware datetime via the same interpreter the
+    calendar-create parser uses (IST default, explicit dates,
+    weekdays, 12h/24h clock). Returns None when the string carries no
+    usable date/time — the caller then asks the operator instead of
+    booking a guessed time. A bare date with no clock books 10:00 IST
+    and the confirmation message says so explicitly.
+    """
+    text = (deadline_text or "").strip()
+    if not text:
+        return None
+    text = _DEADLINE_PREFIX_RE.sub("", text).strip()
+    if not _has_date_or_time(text):
+        return None
+    now_utc = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        start, _end = _interpret_time_text(text, now_utc)
+    except Exception:
+        return None
+    return start
+
+
+def build_cross_app_context(deadline_text: str | None, title: str | None,
+                            message_id: str | None, *,
+                            now: datetime.datetime | None = None) -> CrossAppContext:
+    """Build a CrossAppContext from classifier output.
+
+    Called by the email side (the classifier / email-mission tick —
+    that call site lives outside this module) with the deadline string
+    it extracted, the event title and the source message id. A deadline
+    string that does not parse yields a context with ``deadline=None``
+    and the raw text kept, so the calendar side can still show the
+    operator what was found instead of inventing a time.
+    """
+    return CrossAppContext(
+        deadline=parse_deadline_text(deadline_text, now=now) if deadline_text else None,
+        deadline_text=(deadline_text or None),
+        title=(title or None),
+        message_id=(message_id or None),
+    )
+
+
+def format_create_instruction(ctx: CrossAppContext) -> str | None:
+    """The exact create instruction for a confirmed handoff, or None.
+
+    After the operator confirms the presented deadline, the loop books
+    with this instruction — it carries the title and the time in words,
+    so parse_calendar_create handles it through the normal path (and
+    the normal confirmation gate still applies).
+    """
+    if not ctx.deadline or not ctx.title:
+        return None
+    when = ctx.deadline.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+    return f"Create a calendar event for {ctx.title} on {when}"
 
 
 def is_calendar_query(text: str) -> bool:
@@ -544,7 +695,8 @@ def resolve_calendar_event_pronoun(clause: str, instruction: str) -> str:
     )
 
 
-async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = None) -> str | None:
+async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = None,
+                                   cross_app: CrossAppContext | None = None) -> str | None:
     """Handle the calendar half of a compound instruction.
 
     The dispatcher routes a compound instruction to the first matching
@@ -556,6 +708,13 @@ async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = No
     A clause that is present but unparseable, or whose event is still
     a bare pronoun after resolution, gets an honest note instead of a
     silently dropped ask or a nonsense-titled event.
+
+    Stream B (S3-R3): when ``cross_app`` carries a deadline found in
+    the email half, the time no longer has to be in the user's words.
+    The deadline is presented as a confirmable value — never booked
+    silently, never string-concatenated into a create — and the
+    pronoun title resolves from the handoff title when the instruction
+    names no referent.
     """
     if not is_calendar_query(instruction):
         return None
@@ -563,7 +722,41 @@ async def handle_compound_calendar(instruction: str, chat_id: Optional[str] = No
     if clause is None:
         return None
     resolved = resolve_calendar_event_pronoun(clause, instruction)
+    if cross_app is not None and cross_app.title:
+        # The email half named the event ("Microsoft interview") but
+        # the instruction text carries no capitalised referent: the
+        # handoff title is the referent, not a guess.
+        if _PRONOUN_OBJECT_RE.search(resolved):
+            resolved = _PRONOUN_OBJECT_RE.sub(
+                lambda mm: (mm.group(1) or mm.group(3)) + cross_app.title, resolved, count=1
+            )
     parsed = parse_calendar_create(resolved)
+    if parsed is None and cross_app is not None:
+        # The time lives in the email, not the instruction — the old
+        # code failed honestly here. Present the structured deadline
+        # as a confirmable value instead: the operator confirms the
+        # actual time before anything is created.
+        if cross_app.deadline is not None:
+            title = cross_app.title or "the event"
+            create_instruction = format_create_instruction(
+                CrossAppContext(deadline=cross_app.deadline, title=title)
+            )
+            return (
+                "### 📅 Calendar\n\n"
+                f"{cross_app.format_for_confirmation()}\n\n"
+                "I found the time in the email — I haven't booked anything yet. "
+                "Reply 'yes, book it' to create the event"
+                + (f" — or say it as: *'{create_instruction}'*." if create_instruction else ".")
+            )
+        if cross_app.deadline_text:
+            return (
+                "### 📅 Calendar\n\n"
+                f"I found a deadline in the email — '{cross_app.deadline_text}' — "
+                "but I couldn't read a date and time from it. What time should "
+                "I book"
+                + (f" '{cross_app.title}'" if cross_app.title else " the event")
+                + " for?"
+            )
     if parsed is None:
         return (
             "### 📅 Calendar\n\n"

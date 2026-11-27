@@ -8,11 +8,14 @@ from __future__ import annotations
 import asyncio
 import atexit
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import inspect
+import json
 import logging
 import re
 import threading
 import time
+import uuid
 from typing import Any, Callable, Optional
 import urllib.parse
 from urllib.parse import urlsplit
@@ -2215,6 +2218,13 @@ async def _run_loop(
                 "amount": (action.get("params") or {}).get("amount"),
                 "currency": (action.get("params") or {}).get("currency"),
             }
+        elif action.get("type") == "mcp_tool":
+            # Coordinator integration (Stream B, S3-R1): record the
+            # MCP tool route so the workspace can show it.
+            working_memory["route"] = {
+                "via": "mcp_tool",
+                "tool": (action.get("params") or {}).get("tool"),
+            }
         # Task 14: a UCP checkout is executed by the backend, never
         # sent to the extension and never retried — a payment step
         # runs exactly once. The result is shaped like an executor
@@ -2252,6 +2262,112 @@ async def _run_loop(
                     else str(_ucp_err or "UCP checkout failed")
                 )
                 result = {"ok": False, "error": {"message": _ucp_msg}}
+            metrics("act", action_started)
+        elif action.get("type") == "mcp_tool":
+            # Coordinator integration (Stream B, S3-R1): a planned
+            # mcp_tool step runs through the unified tool registry,
+            # never through the extension. Read tools execute here;
+            # consequential tools without an approval token are refused
+            # honestly by the registry (approval is minted via the
+            # MCP /prepare flow, never auto-approved). The result is
+            # appended to working memory so the NEXT planner step can
+            # act on it — the loop continues, it is not a final answer.
+            #
+            # Stream C [C-jobs-mailcal-mcp] dispatch guards (Demo 2
+            # root causes — Task 5b re-fetched the same URLs 5x,
+            # Task 6 fetched 30+ pages and never generated an
+            # artifact):
+            #  * Repeated-call prevention: an identical tool+args
+            #    call returns the cached result instead of executing
+            #    again (per task, capped at 50 entries).
+            #  * Failure recovery: one retry for transient errors
+            #    (timeout / connection / 502 / 503 / 429) only.
+            #  * Collection budget: after 8 fetch_url calls with no
+            #    artifact/render tool called yet, the observation
+            #    tells the planner to stop collecting and generate
+            #    the requested artifact — it never hard-stops a run.
+            #  * Progress tracking: per-task call counts live in
+            #    working_memory["_mcp_stats"].
+            from .tool_registry import (
+                append_tool_result_to_working_memory,
+                execute_planned_mcp_tool,
+            )
+
+            _mcp_params = action.get("params") or {}
+            _mcp_tool_name = str(_mcp_params.get("tool") or "")
+            _mcp_args = _mcp_params.get("arguments") or {}
+            _mcp_cache = working_memory.setdefault("_mcp_call_cache", {})
+            _mcp_stats = working_memory.setdefault(
+                "_mcp_stats", {"total": 0, "ok": 0, "failed": 0, "by_tool": {}})
+            _cache_key = None
+            _tool_result = None
+            try:
+                _cache_key = hashlib.sha256(
+                    json.dumps([_mcp_tool_name, _mcp_args], sort_keys=True, default=str).encode()
+                ).hexdigest()
+            except Exception:
+                _cache_key = None
+            if _cache_key is not None and _cache_key in _mcp_cache:
+                _tool_result = dict(_mcp_cache[_cache_key])
+                _tool_result["output"] = (
+                    f"[repeated call — returning the cached result of the identical "
+                    f"'{_mcp_tool_name}' call instead of executing it again]\n"
+                    f"{_tool_result.get('output') or ''}"
+                )
+            else:
+                _tool_result = await execute_planned_mcp_tool(
+                    action, {"task_id": task_id}
+                )
+                _err_text = str(_tool_result.get("error") or "")
+                if not _tool_result.get("ok") and any(
+                    t in _err_text.lower()
+                    for t in ("timeout", "timed out", "connection", "502", "503", "429")
+                ):
+                    # One bounded retry for a transient failure only.
+                    _tool_result = await execute_planned_mcp_tool(
+                        action, {"task_id": task_id}
+                    )
+                if _cache_key is not None:
+                    if len(_mcp_cache) >= 50:
+                        _mcp_cache.pop(next(iter(_mcp_cache)))
+                    _mcp_cache[_cache_key] = dict(_tool_result)
+            _mcp_stats["total"] = int(_mcp_stats.get("total") or 0) + 1
+            if _tool_result.get("ok"):
+                _mcp_stats["ok"] = int(_mcp_stats.get("ok") or 0) + 1
+            else:
+                _mcp_stats["failed"] = int(_mcp_stats.get("failed") or 0) + 1
+            _by_tool = _mcp_stats.setdefault("by_tool", {})
+            _by_tool[_mcp_tool_name] = int(_by_tool.get(_mcp_tool_name) or 0) + 1
+            # Collection-budget nudge (fetch_url is the runaway tool in
+            # Demo 2: 33 fetches in Task 5b, 48 in Task 6).
+            _fetch_count = int(_mcp_stats["by_tool"].get("mcp.public-fetch.fetch_url", 0)
+                               + _mcp_stats["by_tool"].get("public-fetch.fetch_url", 0))
+            _rendered = any(
+                k.startswith(("mcp.research.render_comparison", "research.render_comparison",
+                              "mcp.jobs.discover_and_rank", "jobs.discover_and_rank"))
+                for k in _mcp_stats["by_tool"])
+            if _fetch_count >= 8 and not _rendered and _tool_result.get("ok"):
+                _tool_result = dict(_tool_result)
+                _tool_result["output"] = (
+                    f"{_tool_result.get('output') or ''}\n\n"
+                    f"[collection budget: {_fetch_count} page fetches so far and no artifact "
+                    "has been generated yet. Stop fetching more pages — use what you have "
+                    "and generate the requested document now with "
+                    "research.render_comparison (or jobs.discover_and_rank for a job "
+                    "spreadsheet). Further fetches of pages you already read add nothing.]"
+                )
+            append_tool_result_to_working_memory(working_memory, _tool_result)
+            if _tool_result.get("ok"):
+                result = {
+                    "ok": True,
+                    "evidence": _tool_result.get("output")
+                    or f"MCP tool {_tool_result.get('tool')} completed",
+                }
+            else:
+                result = {
+                    "ok": False,
+                    "error": {"message": str(_tool_result.get("error") or "MCP tool failed")},
+                }
             metrics("act", action_started)
         else:
             # Task 13: the loop passes its own MAX_RETRIES (a patch point
@@ -2747,10 +2863,989 @@ async def _run_loop(
     return {"final": "budget_exceeded", "steps": steps_done, "summary": _summary(final_obs, history), "history": history}
 
 
+# RC-LIVE-06: the mock provider answers by substring matching, so a
+# non-greeting instruction can come back as the canned greeting
+# ("hi" in "thing"). That must never be marked completed. The greeting
+# is matched verbatim (the mock's exact canned string) and the
+# instruction is a greeting only when a greeting word appears as a
+# whole word — "high" or "thing" do not count.
+_MOCK_CANNED_GREETING = (
+    "Hello! I am PrivAgent, your privacy-preserving AI assistant. "
+    "How can I help you today?"
+)
+_GREETING_WORDS = frozenset({"hi", "hello", "hey", "greetings", "howdy"})
+
+
+def _is_greeting_instruction(instruction: str) -> bool:
+    words = re.findall(r"[a-z]+", (instruction or "").lower())
+    return any(w in _GREETING_WORDS for w in words)
+
+
+def _is_mock_canned_greeting(instruction: str, answer: str) -> bool:
+    """True when *answer* is the mock's canned greeting but the
+    instruction was not a greeting — a false completion, never a
+    real answer."""
+    stripped = (answer or "").strip()
+    if stripped != _MOCK_CANNED_GREETING and not stripped.startswith(_MOCK_CANNED_GREETING + "\n"):
+        return False
+    return not _is_greeting_instruction(instruction)
+
+# ---------------------------------------------------------------------------
+# Ask-user gate (Stream D, RC-1.1 / R5-07, CONTRACTS §2)
+# ---------------------------------------------------------------------------
+# The generic missing-information interaction: pause the task in
+# ``awaiting_input``, ask one structured question, wait for the
+# operator's answer, and resume the SAME task from its checkpoint —
+# without restarting the objective. The planner's SYSTEM_FRAME §15
+# ("assume defaults and start, never stall") is Stream B's rule to
+# change; this gate is the mechanism the loop uses once a question is
+# raised, deterministically (ambiguity, missing slots) or by the
+# planner once B wires the action type.
+#
+# Delivery of the answer: the operator replies in the same chat
+# (``POST /api/chat/{id}/message`` → a new task → the intercept at the
+# top of :func:`run_task` delivers the text to the paused task), or a
+# future REST/WS endpoint calls :func:`answer_ask_user` /
+# :func:`cancel_ask_user` directly (same shape as the confirmation and
+# takeover endpoints in main.py — Stream C to add; the helpers are
+# already here). Sensitive questions (passwords, OTPs, recovery codes,
+# card details) are FORBIDDEN in chat — the gate refuses them and the
+# caller falls back to takeover or fails honestly.
+#
+# State lives on the TaskRecord as dynamic attributes (hub.TaskRecord
+# is a plain dataclass, not Stream D's file, so no schema change):
+# ``pending_ask_user`` (the question dict), ``ask_user_event``
+# (asyncio.Event), ``ask_user_answer`` (str|None),
+# ``ask_user_cancelled`` (bool). The question is also checkpointed
+# before pausing, so the pause itself survives in the checkpoint.
+# ---------------------------------------------------------------------------
+
+ASK_USER_TIMEOUT_S_DEFAULT = 300
+
+
+async def _broadcast_ask_user(record: TaskRecord, pending: dict[str, Any]) -> None:
+    """Send the CONTRACTS §2 ASK_USER event to every client socket."""
+    payload = {
+        "type": "ASK_USER",
+        "task_id": record.task_id,
+        "question_id": pending["question_id"],
+        "question": pending["question"],
+        "kind": pending["kind"],
+        "options": pending.get("options"),
+        "sensitive": False,
+        "timeout_s": pending.get("timeout_s", ASK_USER_TIMEOUT_S_DEFAULT),
+    }
+    for ws in list(getattr(real_hub, "client_sockets", None) or []):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            try:
+                real_hub.client_sockets.remove(ws)
+            except (ValueError, AttributeError):
+                pass
+
+
+def answer_ask_user(task_id: str, answer: str) -> bool:
+    """Deliver an answer to a task paused in ``awaiting_input``.
+
+    Called by the chat-message intercept in :func:`run_task` and (once
+    Stream C adds the endpoint) by ``POST /api/task/{id}/ask-user/answer``.
+    Returns False when there is no such paused task.
+    """
+    record = real_hub.tasks.get(task_id)
+    if record is None or record.state != "awaiting_input":
+        return False
+    event = getattr(record, "ask_user_event", None)
+    if event is None:
+        return False
+    record.ask_user_answer = answer
+    record.ask_user_cancelled = False
+    event.set()
+    return True
+
+
+def cancel_ask_user(task_id: str) -> bool:
+    """Cancel a task paused in ``awaiting_input``. Same contract as
+    :func:`answer_ask_user`; returns False when nothing is paused."""
+    record = real_hub.tasks.get(task_id)
+    if record is None or record.state != "awaiting_input":
+        return False
+    event = getattr(record, "ask_user_event", None)
+    if event is None:
+        return False
+    record.ask_user_answer = None
+    record.ask_user_cancelled = True
+    event.set()
+    return True
+
+
+async def _deliver_pending_ask_user_answer(record: TaskRecord) -> bool:
+    """Chat-message intercept: a message sent while another task in
+    this chat is ``awaiting_input`` IS the answer to its pending
+    question. Delivers it, completes this message as a passthrough,
+    and returns True so the caller returns without starting a new
+    task. The words ``cancel`` / ``stop`` (alone) cancel the paused
+    task instead. Returns False when nothing is paused.
+
+    Trade-off, stated plainly: while a question is pending, the next
+    chat message is always treated as the answer — the ASK_USER event
+    and the paused task's message say so, and the user can still
+    cancel the paused task first.
+    """
+    if not record.chat_id:
+        return False
+    text = (record.instruction or "").strip()
+    if not text:
+        return False
+    for other in list(real_hub.tasks.values()):
+        if other.task_id == record.task_id:
+            continue
+        if getattr(other, "chat_id", None) != record.chat_id:
+            continue
+        if other.state != "awaiting_input":
+            continue
+        pending = getattr(other, "pending_ask_user", None)
+        if not isinstance(pending, dict):
+            continue
+        # The operator's own message belongs in the chat history even
+        # though this task is only a passthrough (run_task's normal
+        # user-message persist happens after this intercept).
+        try:
+            from . import db
+
+            db.add_message(record.chat_id, "user", record.instruction, task_id=record.task_id)
+        except Exception:
+            pass
+        if text.lower() in ("cancel", "stop", "never mind", "nevermind"):
+            cancel_ask_user(other.task_id)
+            record.message = "Cancelled — the paused task was cancelled as you asked."
+        else:
+            answer_ask_user(other.task_id, text)
+            record.message = (
+                "Got it — your answer is on its way back to the paused task "
+                f"('{str(pending.get('question') or '')[:100]}')."
+            )
+        record.state = "completed"
+        record.steps_done = 1
+        record.route = {"via": "ask_user_answer", "for_task": other.task_id}
+        await real_hub.broadcast_progress(record)
+        if record.chat_id:
+            try:
+                _persist_agent_message(
+                    record.chat_id, record.message,
+                    evidence="ask_user_answer", task_id=record.task_id,
+                )
+            except Exception:
+                pass
+        return True
+    return False
+
+
+class _AskUserGate:
+    """Pause a task, ask one structured question, await the answer.
+
+    Mirrors :class:`_ConfirmGate` / :class:`_TakeoverGate` (loop_gates):
+    the wait is an ``asyncio.Event`` on the task record, resolved by
+    :func:`answer_ask_user` / :func:`cancel_ask_user`. The caller
+    checkpoints BEFORE calling :meth:`ask` and resumes in the same
+    coroutine afterwards — no restart, no new task id.
+    """
+
+    def __init__(self, record: TaskRecord) -> None:
+        self._record = record
+
+    async def ask(
+        self,
+        *,
+        question: str,
+        kind: str = "missing_info",
+        options: Optional[list[str]] = None,
+        timeout_s: float = ASK_USER_TIMEOUT_S_DEFAULT,
+    ) -> tuple[str, Optional[str]]:
+        """Returns ("answer", text) | ("cancel", None) |
+        ("timeout", None) | ("refused-sensitive", None)."""
+        from .fast_path import ASK_USER_KINDS, is_sensitive_question
+
+        record = self._record
+        if kind not in ASK_USER_KINDS:
+            kind = "missing_info"
+        if is_sensitive_question(question, kind):
+            return "refused-sensitive", None
+        pending = {
+            "question_id": uuid.uuid4().hex,
+            "question": question,
+            "kind": kind,
+            "options": list(options) if options else None,
+            "sensitive": False,
+            "timeout_s": timeout_s,
+            "asked_at": time.time(),
+        }
+        record.pending_ask_user = pending
+        record.ask_user_event = asyncio.Event()
+        record.ask_user_answer = None
+        record.ask_user_cancelled = False
+        record.state = "awaiting_input"
+        record.message = question
+        await _broadcast_ask_user(record, pending)
+        await real_hub.broadcast_progress(record)
+        try:
+            await asyncio.wait_for(record.ask_user_event.wait(), timeout_s)
+        except asyncio.TimeoutError:
+            record.pending_ask_user = None
+            return "timeout", None
+        if record.ask_user_cancelled:
+            record.pending_ask_user = None
+            return "cancel", None
+        record.pending_ask_user = None
+        return "answer", record.ask_user_answer
+
+
+def _handle_schedule_intent(
+    intent: dict[str, Any], *, allowed_domains: Optional[list[str]] = None
+) -> str:
+    """Create a real scheduled job from a CONTRACTS §4 schedule intent
+    (Stream D routes, Stream C owns the scheduler itself).
+
+    Uses the existing ``scheduler.create_job`` — no parallel path.
+    Replies with the job id, the next run in IST (UTC+5:30, offset
+    stated), and the pause/resume/cancel affordance. One-off jobs
+    ("in N minutes") are created the same way — the scheduler stores
+    them as schedule_kind=once and they run exactly once.
+    """
+    sched = intent.get("schedule") or {}
+    kind = sched.get("kind")
+    instruction = str(intent.get("instruction") or "").strip()
+    if kind == "once":
+        minutes = int(sched.get("in_minutes") or 0)
+        if minutes <= 0:
+            return "I couldn't work out the delay — try 'in 5 minutes' or 'in 2 hours'."
+        schedule_str = f"in {minutes} minutes"
+        when = f"once, in {minutes} minutes"
+    elif kind == "every":
+        minutes = int(sched.get("interval_minutes") or 0)
+        if minutes <= 0:
+            return "I couldn't work out the repeat interval — try 'every 30 minutes' or 'every 6 hours'."
+        if minutes % 1440 == 0:
+            schedule_str = f"every {minutes // 1440}d"
+        elif minutes % 60 == 0:
+            schedule_str = f"every {minutes // 60}h"
+        else:
+            schedule_str = f"every {minutes}m"
+        when = f"every {minutes} minutes"
+    elif kind == "daily":
+        time_utc = str(sched.get("time_utc") or "")
+        time_ist = str(sched.get("time_ist") or "")
+        if not time_utc:
+            return "I couldn't work out the daily time — try 'daily at 8 AM'."
+        schedule_str = f"daily {time_utc}"
+        when = f"daily at {time_ist} IST ({time_utc} UTC)"
+    else:
+        return "I couldn't work out that schedule — try 'every 30 minutes' or 'daily at 8 AM'."
+    try:
+        from .scheduler import create_job
+
+        job = create_job(instruction, schedule_str, allowed_domains=allowed_domains)
+    except ValueError as exc:
+        return f"I couldn't create that schedule: {exc}"
+    except Exception:
+        return "Scheduling isn't available right now — the scheduler failed to create the job."
+    job_id = str(job.get("id") or "")
+    next_run = job.get("next_run_at")
+    try:
+        next_ist = time.strftime("%d %b %Y %H:%M IST", time.gmtime(float(next_run) + 19800))
+    except (TypeError, ValueError):
+        next_ist = "unknown — check the Control Center"
+    return (
+        f"Scheduled ({when}) — job `{job_id}`: '{instruction}'.\n"
+        f"Next run: {next_ist} (IST, UTC+5:30).\n"
+        f"Pause, resume or cancel it from the Control Center (job `{job_id}`), "
+        f"or tell me 'pause job {job_id}'."
+    )
+
+
+async def _run_http_research_path(task_id: str, record: Any, classification: Any,
+                                  initial_memory: dict[str, Any],
+                                  chat_id: str | None) -> bool:
+    """Stream B: run a RESEARCH_TASK over HTTP, without the extension.
+
+    DEMO2 §Task 12a: NL research died at the extension gate because
+    RESEARCH_TASK routed to the browser loop. Research achievable
+    over HTTP/MCP must not require the extension, so NEW_RESEARCH and
+    REFINE run the bounded HTTP pipeline
+    (:mod:`app.research.pipeline`) here instead.
+
+    Returns True when the task was settled here (completed, or failed
+    honestly with the pipeline's diagnosis), False when the caller
+    should fall through to the browser loop — that happens only when
+    the pipeline could not gather enough evidence AND the extension
+    is connected, so a JS-heavy target still gets its old chance.
+    """
+    from .research.models import ResearchKnowledgePackage
+    from .research.pipeline import run_http_research_pipeline
+
+    record.state = "running"
+    record.message = "Researching over HTTP — discovering sources…"
+    await real_hub.broadcast_progress(record)
+
+    seed_pkg: ResearchKnowledgePackage | None = None
+    pkg_data = initial_memory.get("research_knowledge_package")
+    if isinstance(pkg_data, dict):
+        try:
+            seed_pkg = ResearchKnowledgePackage.from_dict(pkg_data)
+        except Exception:
+            seed_pkg = None
+
+    try:
+        provider = _provider_for_config()
+    except Exception as exc:  # noqa: BLE001 — no provider is a failed task, never a mock
+        record.steps_done = 1
+        record.state = "failed"
+        record.message = f"Research failed: no provider is available ({exc}). Configure a real provider and retry."
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+            except Exception:
+                pass
+        return True
+    try:
+        from .providers.mock import MockProvider
+
+        if isinstance(provider, MockProvider):
+            record.steps_done = 1
+            record.state = "failed"
+            record.message = (
+                "Research failed: the configured provider is the mock provider "
+                "(MOCK_GREETING_MISMATCH) — no real answer was produced. "
+                "Configure a real provider and retry."
+            )
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                except Exception:
+                    pass
+            return True
+    except Exception:
+        pass
+
+    result = run_http_research_pipeline(
+        task_id=task_id,
+        instruction=record.instruction,
+        topic=classification.research_topic or initial_memory.get("research_topic"),
+        provider=provider,
+        seed_pkg=seed_pkg,
+        requested_format=classification.requested_format,
+        deliverable_type=classification.deliverable_type,
+    )
+    if not result.ok:
+        if real_hub.extension_sockets:
+            # Browser fallback: the old loop gets its chance.
+            return False
+        record.steps_done = max(1, result.steps_used)
+        record.state = "failed"
+        reasons = "; ".join(
+            f"{(r.get('url') or '')[:50]}: {r.get('reason') or ''}"[:160]
+            for r in (result.rejected or [])[:4]
+        )
+        record.message = (
+            f"Research failed: {result.error} "
+            f"Steps used: {result.steps_used}/40; provider calls: {result.planner_calls}; "
+            f"sources accepted: {len(result.sources)}, rejected: {len(result.rejected)}."
+            + (f" Rejections: {reasons}" if reasons else "")
+        )
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+            except Exception:
+                pass
+        return True
+
+    pkg = result.pkg
+    assert pkg is not None
+    working_memory = dict(initial_memory)
+    working_memory["is_research"] = True
+    working_memory["research_knowledge_package"] = pkg.to_dict()
+    working_memory["research_topic"] = pkg.topic.title
+    working_memory["instruction"] = record.instruction
+    working_memory["requested_format"] = result.formats[0] if result.formats else None
+    working_memory["deliverable_type"] = classification.deliverable_type
+    working_memory["research_plan"] = pkg.metadata.get("research_plan")
+    working_memory["research_stage"] = "completed"
+    summary_msg = pkg.topic.findings_summary or pkg.topic.title
+    final_msg = _finalize_research_summary(task_id, chat_id, working_memory, summary_msg)
+    arts = working_memory.get("artifacts") or []
+    if not arts:
+        errors = working_memory.get("research_artifact_errors") or []
+        detail = "; ".join(
+            f"{e.get('format') or 'render'}: {e.get('error')}" for e in errors
+        ) or "no artifact was produced"
+        record.steps_done = max(1, result.steps_used)
+        record.state = "failed"
+        record.message = (
+            f"Research completed, but deliverable generation failed: {detail}. "
+            "The findings above were collected from "
+            f"{len(result.sources)} source(s) but no verified file could be produced."
+        )
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+            except Exception:
+                pass
+        return True
+
+    record.steps_done = max(1, result.steps_used)
+    record.state = "completed"
+    record.message = final_msg
+    record.route = {
+        "via": "http_research",
+        "planner_calls": result.planner_calls,
+        "steps": result.steps_used,
+        "sources_accepted": len(result.sources),
+        "sources_rejected": len(result.rejected),
+        "synthesis_path": result.synthesis_path,
+    }
+    _save_checkpoint_defensive(
+        task_id=task_id,
+        conversation_id=chat_id,
+        session_id=f"sess_http_research_{task_id}",
+        steps_done=record.steps_done,
+        raw_url="",
+        history=[{"role": "assistant", "content": record.message}],
+        working_memory=working_memory,
+    )
+    await real_hub.broadcast_progress(record)
+    if chat_id:
+        try:
+            _persist_derived_memory(chat_id, "last_deliverable", arts[0]["filename"])
+            _persist_agent_message(chat_id, record.message, evidence="deliverable_exported", task_id=task_id)
+        except Exception:
+            pass
+    return True
+# ---------------------------------------------------------------------------
+# Stream D (CONTRACTS3, DEMO2 §Task 11/12): trip-plan missing-info
+# detection, deterministic reminders, and the shared ask-user gate.
+#
+# fast_path.detect_missing_info is deliberately narrow (reminder with
+# no time, booking with no date, file with no attachment, buy with a
+# budget phrase but no amount) and lives outside this stream's files,
+# so the trip/transport patterns it misses live here:
+#   * "Plan a trip to Bengaluru" — no date, no origin, no budget.
+#     The old path classified it NEW_BROWSER_TASK and died at the
+#     extension gate before any question could be asked (DEMO2 §11b).
+#   * "Book me a train to Bengaluru" — fast_path's booking pattern
+#     does not include trains/buses, so it fell to the LLM, which
+#     asked in prose and completed the task (DEMO2 §11c).
+# Both now pause with one structured question and resume the SAME
+# task (see _ask_missing_info + the pre-extension gate in run_task).
+# ---------------------------------------------------------------------------
+
+_TRIP_PLAN_RE = re.compile(
+    r"\b(plan|planning|organise|organize|arrange|map\s+out)\b"
+    r".{0,50}\b(trip|travel|vacation|holiday|journey|visit|itinerary|tour)\b",
+    re.IGNORECASE,
+)
+_BOOK_TRANSPORT_RE = re.compile(
+    r"\b(book|reserve|schedule)\b.{0,60}\b(flight|train|bus|ticket|taxi|cab)\b",
+    re.IGNORECASE,
+)
+_HAS_DATE_RE = re.compile(
+    r"\b(today|tomorrow|tonight|next\s+(week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?|\d{4}-\d{2}-\d{2}"
+    r"|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}"
+    r"|\d{1,2}\s*(am|pm)\b)",
+    re.IGNORECASE,
+)
+
+
+def _home_origin_from_memory(initial_memory: dict[str, Any]) -> Optional[str]:
+    """Saved home airport/city (e.g. DEL), if the operator stored one.
+
+    Scans the labelled semantic facts first ("home airport is DEL"),
+    then the preferences dict. Returns the stored value, or None.
+    Used only to phrase the trip question — never assumed silently.
+    """
+    for fact in initial_memory.get("semantic_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        key = str(fact.get("key") or "").lower()
+        val = str(fact.get("value") or "").strip()
+        if val and ("airport" in key or "home" in key):
+            return val
+    for key, val in (initial_memory.get("user_preferences") or {}).items():
+        if isinstance(val, str) and val.strip() and ("airport" in str(key).lower() or "home" in str(key).lower()):
+            return val.strip()
+    return None
+
+
+def _detect_trip_missing_info(
+    instruction: str, *, home_origin: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Missing-slot question for trip plans / transport bookings, or None.
+
+    Only fires when the instruction names the trip/booking but no
+    date at all — a dated trip goes straight to execution. The
+    question asks for dates + origin (+ budget as an optional extra)
+    in one go, so one pause covers the missing slots; the saved home
+    origin, when present, is offered as the default to confirm, never
+    assumed.
+    """
+    text = (instruction or "").strip()
+    if not text or _HAS_DATE_RE.search(text):
+        return None
+    if _TRIP_PLAN_RE.search(text):
+        origin_hint = (
+            f" I have {home_origin} saved as your home airport — should I start from there?"
+            if home_origin
+            else ""
+        )
+        return {
+            "kind": "date_time",
+            "question": (
+                "Which dates are you travelling, and from where?"
+                f"{origin_hint}"
+                " For example 'Delhi, 12–14 Dec' — add a budget too if you have one, e.g. 'under ₹10,000'."
+            ),
+            "options": None,
+        }
+    if _BOOK_TRANSPORT_RE.search(text):
+        return {
+            "kind": "date_time",
+            "question": "Which date should I book for? For example 'tomorrow' or '12 Dec'.",
+            "options": None,
+        }
+    return None
+
+
+async def _ask_missing_info(
+    record: TaskRecord,
+    initial_memory: dict[str, Any],
+    chat_id: Optional[str],
+    missing: dict[str, Any],
+) -> bool:
+    """Pause for one missing-info question; resume the SAME task.
+
+    Returns True when the operator answered (the answer is appended
+    to the instruction and to ``ask_user_answers``; the caller
+    continues). Returns False when the task ended (cancel / timeout /
+    refused-sensitive) — the terminal state + message are already
+    recorded and the caller must return.
+    """
+    from .fast_path import is_sensitive_question
+
+    task_id = record.task_id
+    question = str(missing.get("question") or "")
+    kind = str(missing.get("kind") or "missing_info")
+    options = missing.get("options")
+    if is_sensitive_question(question, kind):
+        record.state = "failed"
+        record.message = (
+            "I need that detail to proceed, but I can't ask for it in chat — "
+            "passwords, codes and card details go through takeover in your browser only."
+        )
+        return False
+    _save_checkpoint_defensive(
+        task_id, chat_id, None, 0, "",
+        [{"role": "user", "content": record.instruction}],
+        {**initial_memory, "pending_ask_user": {"question": question, "kind": kind}},
+    )
+    outcome, answer = await _AskUserGate(record).ask(
+        question=question, kind=kind, options=options
+    )
+    if outcome == "answer" and answer:
+        initial_memory.setdefault("ask_user_answers", []).append(
+            {"question": question, "answer": answer}
+        )
+        record.instruction = (
+            f"{record.instruction}\n[Operator's answer to '{question}': {answer}]"
+        )
+        record.message = "Thinking..."
+        await real_hub.broadcast_progress(record)
+        return True
+    if outcome == "cancel":
+        record.state = "cancelled"
+        record.message = "Cancelled — you didn't answer the question, so I stopped."
+    elif outcome == "timeout":
+        record.state = "failed"
+        record.message = (
+            "ASK_USER_TIMEOUT: no answer within 300 seconds — "
+            "I stopped instead of guessing."
+        )
+    else:  # refused-sensitive (cannot happen for these questions)
+        record.state = "failed"
+        record.message = "I can't ask for that detail in chat."
+    await real_hub.broadcast_progress(record)
+    if chat_id:
+        try:
+            _persist_agent_message(
+                chat_id, record.message,
+                evidence="ask_user_cancelled" if outcome == "cancel" else "failed",
+                task_id=task_id,
+            )
+        except Exception:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Deterministic reminders (Stream D, DEMO2 §11d).
+#
+# The old path let the model answer a reminder in prose and claim a
+# Google Calendar write that left no record anywhere — no calendar
+# table, no scheduled job, no outbox row, no connected account. A
+# reminder is now a real one-off (or daily) scheduled job with a
+# receipt, and the fire-time instruction is a marker the loop handles
+# deterministically (see _fire_scheduled_reminder in run_task): at
+# fire time it posts a notification-outbox row + live broadcast and
+# completes with that receipt. No calendar event is ever claimed —
+# PrivAgent has no calendar account connected in this setup.
+# ---------------------------------------------------------------------------
+
+REMINDER_JOB_PREFIX = "[scheduled-reminder] "
+
+_REMIND_RE = re.compile(r"\bremind\s+me\b", re.IGNORECASE)
+_REMIND_IN_RE = re.compile(
+    r"\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE)
+_REMIND_DAY_TIME_RE = re.compile(
+    r"\b(tomorrow|today)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+    re.IGNORECASE)
+_REMIND_TIME_DAY_RE = re.compile(
+    r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s+(tomorrow|today)\b",
+    re.IGNORECASE)
+_REMIND_DAY_ONLY_RE = re.compile(r"\b(tomorrow|today)\b", re.IGNORECASE)
+_REMIND_DAILY_RE = re.compile(
+    r"\b(?:daily|every\s+day)\b(?:\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+    re.IGNORECASE)
+
+_IST_OFFSET_S = 19800  # UTC+5:30, stated wherever it is used.
+
+
+def _parse_reminder_time(text: str) -> Optional[dict[str, Any]]:
+    """Parse the WHEN of a reminder into a scheduler form, or None.
+
+    Returns ``{"kind": "once", "delay_minutes": int, "label": str}``
+    or ``{"kind": "daily", "utc_hhmm": "HH:MM", "label": str}``.
+    None means no time expression was found at all — the caller lets
+    the ask-user gate ask for it. Times are the operator's (IST);
+    "tomorrow 9" means 09:00 IST, "tomorrow" alone means 09:00 IST.
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    raw = text or ""
+    m = _REMIND_IN_RE.search(raw)
+    if m:
+        amount, unit = int(m.group(1)), m.group(2).lower()
+        minutes = amount * 60 if unit.startswith(("hour", "hr")) else amount
+        if minutes < 1 or minutes > 7 * 24 * 60:
+            return {"kind": "unparseable",
+                    "reason": "that delay is outside the 1 minute – 7 day range"}
+        return {"kind": "once", "delay_minutes": minutes,
+                "label": f"in {minutes} minutes" if minutes < 60 else f"in {minutes // 60}h {minutes % 60}m"}
+    m = _REMIND_DAY_TIME_RE.search(raw)
+    day_first = True
+    if m is None:
+        m = _REMIND_TIME_DAY_RE.search(raw)
+        day_first = False
+    day_word = hour_s = minute_s = marker = None
+    if m:
+        if day_first:
+            day_word, hour_s, minute_s, marker = m.group(1), m.group(2), m.group(3), m.group(4)
+        else:
+            hour_s, minute_s, marker, day_word = m.group(1), m.group(2), m.group(3), m.group(4)
+    else:
+        m2 = _REMIND_DAY_ONLY_RE.search(raw)
+        if m2:
+            day_word, hour_s, minute_s, marker = m2.group(1), "9", "00", "am"
+    if day_word is None:
+        m3 = _REMIND_DAILY_RE.search(raw)
+        if m3:
+            hour = int(m3.group(1))
+            minute = int(m3.group(2) or 0)
+            mk = (m3.group(3) or "").lower()
+            if mk == "pm" and hour != 12:
+                hour += 12
+            elif mk == "am" and hour == 12:
+                hour = 0
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                return {"kind": "unparseable", "reason": "that daily time is not a valid clock time"}
+            utc_total = (hour * 60 + minute - 330) % (24 * 60)
+            return {"kind": "daily",
+                    "utc_hhmm": f"{utc_total // 60:02d}:{utc_total % 60:02d}",
+                    "label": f"daily at {hour % 12 or 12}:{minute:02d} {'PM' if hour >= 12 else 'AM'} IST"}
+        return None
+    try:
+        hour = int(hour_s or 9)
+        minute = int(minute_s or 0)
+    except (TypeError, ValueError):
+        return {"kind": "unparseable", "reason": "that time is not a valid clock time"}
+    mk = (marker or "").lower()
+    if mk == "pm" and hour != 12:
+        hour += 12
+    elif mk == "am" and hour == 12:
+        hour = 0
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return {"kind": "unparseable", "reason": "that time is not a valid clock time"}
+    ist = ZoneInfo("Asia/Kolkata")
+    now = datetime.now(ist)
+    day = now.date() + timedelta(days=1 if day_word.lower() == "tomorrow" else 0)
+    target = datetime(day.year, day.month, day.day, hour, minute, tzinfo=ist)
+    if target <= now:
+        target += timedelta(days=1)
+    delay = int(-(-(target - now).total_seconds() // 60))  # ceil minutes
+    if delay < 1 or delay > 7 * 24 * 60:
+        return {"kind": "unparseable",
+                "reason": "that time is more than 7 days away"}
+    label = target.strftime("%A, %d %b %Y, %I:%M %p IST")
+    return {"kind": "once", "delay_minutes": max(1, delay), "label": label,
+            "run_at": target.astimezone(timezone.utc).timestamp()}
+
+
+def _parse_reminder(instruction: str) -> Optional[dict[str, Any]]:
+    """Split a reminder instruction into WHAT + WHEN, or None.
+
+    None means "not a reminder, or no time expression yet" — the
+    caller lets the normal path (ask-user gate, then the model) have
+    it. A dict with ``time`` None means a time-like phrase was seen
+    but could not be parsed — the caller fails honestly instead of
+    letting the model invent a calendar write.
+    """
+    text = (instruction or "").strip()
+    if not _REMIND_RE.search(text):
+        return None
+    # If an ask-user answer is appended, the time lives in the ANSWER
+    # only — never in the question text. The question itself contains
+    # example times ("...or 'in 30 minutes'") and the old code matched
+    # the example first, so "in 2 minutes" created a 30-minute job
+    # (caught live 2026-11-27). Parse the answer alone when present.
+    _am = re.search(r"\[Operator's answer to '.*?': (.*)\]\s*$", text, re.DOTALL)
+    parsed_time = _parse_reminder_time(_am.group(1).strip() if _am else text)
+    if parsed_time is None:
+        return None
+    m = _REMIND_RE.search(text)
+    rest = text[m.end():].strip()
+    # The ask-user answer is appended after the instruction; it is
+    # time, not content — cut it (and any other bracket) out of WHAT.
+    rest = rest.split("[Operator's answer")[0]
+    for pat in (_REMIND_IN_RE, _REMIND_DAY_TIME_RE, _REMIND_TIME_DAY_RE,
+               _REMIND_DAY_ONLY_RE, _REMIND_DAILY_RE):
+        rest = pat.sub(" ", rest)
+    rest = re.sub(r"\s+", " ", rest).strip(" .,-")
+    rest = re.sub(r"^(to|that|about|for)\s+", "", rest, flags=re.IGNORECASE)
+    rest = re.sub(r"\s+(to|that|about|for)$", "", rest, flags=re.IGNORECASE)
+    what = rest or "reminder"
+    return {"what": what, "time": parsed_time}
+
+
+def _create_reminder_job(
+    record: TaskRecord, parsed: dict[str, Any]
+) -> tuple[str, bool]:
+    """Create the scheduled job for a parsed reminder.
+
+    Returns ``(answer, True)`` with the job receipt on success, or
+    ``(failure_text, False)`` when the job cannot be created — the
+    caller fails the task honestly with that text. The job
+    instruction is the ``REMINDER_JOB_PREFIX`` marker, so the fire
+    time delivers a notification receipt instead of re-running the
+    reminder as a fresh conversational task.
+    """
+    what = parsed["what"]
+    when = parsed["time"]
+    try:
+        from .scheduler import create_job
+
+        if when["kind"] == "daily":
+            job = create_job(
+                f"{REMINDER_JOB_PREFIX}{what}",
+                f"daily {when['utc_hhmm']}",
+                allowed_domains=record.allowed_domains,
+            )
+            when_text = when["label"]
+        else:
+            job = create_job(
+                f"{REMINDER_JOB_PREFIX}{what}",
+                f"in {when['delay_minutes']} minutes",
+                allowed_domains=record.allowed_domains,
+            )
+            when_text = when["label"]
+    except ValueError as exc:
+        return (f"I couldn't set that reminder: {exc}. "
+                "No reminder was set and nothing was written to any calendar.", False)
+    except Exception:
+        return ("The reminder scheduler isn't available right now — "
+                "no reminder was set and nothing was written to any calendar.", False)
+    job_id = str(job.get("id") or "")
+    record.route = {"via": "reminder_job", "job_id": job_id,
+                    "kind": when["kind"]}
+    try:
+        next_ist = time.strftime(
+            "%d %b %Y %H:%M IST",
+            time.gmtime(float(job.get("next_run_at")) + _IST_OFFSET_S))
+    except (TypeError, ValueError):
+        next_ist = "unknown — check the Control Center"
+    once_or_daily = "daily scheduled job" if when["kind"] == "daily" else "one-off scheduled job"
+    answer = (
+        f"Reminder set: {what} — {when_text} ({once_or_daily} `{job_id}`, "
+        f"next run {next_ist}).\n"
+        "No calendar event was created: PrivAgent has no calendar account connected here, "
+        "so this reminder lives as a scheduled job and will arrive as a notification when it fires.\n"
+        f"Receipt: scheduled job `{job_id}`."
+    )
+    return (answer, True)
+
+
+async def _fire_scheduled_reminder(record: TaskRecord) -> None:
+    """Deliver a fired reminder job: notification receipt, then done.
+
+    The job instruction is ``REMINDER_JOB_PREFIX + what``. Delivery
+    is an outbox row (durable + pulled on reconnect) plus a live WS
+    broadcast — the same contract §3 channel as watch alerts. The
+    scheduler records the outcome from this task's terminal state.
+    """
+    what = (record.instruction or "")[len(REMINDER_JOB_PREFIX):].strip() or "reminder"
+    note_id = ""
+    try:
+        from . import db as _db_mod
+        from .monitoring_scheduler import (
+            broadcast_outbox_notification,
+            post_outbox_notification,
+        )
+
+        # Pass the resolved DB path explicitly: the scheduler's
+        # schema cache is keyed by the db_path argument (None), so a
+        # bare call after another database was used in this process
+        # would skip creating the outbox table here.
+        try:
+            _db_path: Optional[str] = str(_db_mod.get_default_db_path())
+        except Exception:
+            _db_path = None
+        note_id = post_outbox_notification(
+            "reminder", record.task_id,
+            f"Reminder: {what}",
+            f"Reminder: {what} — due now.",
+            diff_data={"task_id": record.task_id, "kind": "reminder"},
+            db_path=_db_path,
+        )
+        try:
+            await broadcast_outbox_notification(note_id, db_path=_db_path)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    record.steps_done = 1
+    record.state = "completed"
+    record.message = (
+        f"Reminder delivered: {what}."
+        + (f" Notification receipt `{note_id}`." if note_id else
+           " (Notification outbox was unavailable — check the Control Center.)")
+    )
+    await real_hub.broadcast_progress(record)
+
+
+# ---------------------------------------------------------------------------
+# Durable task records (Stream D, RC-LIVE-05).
+# ---------------------------------------------------------------------------
+
+def _persist_task_record(task_id: str) -> None:
+    """Persist one task's durable record at run_task exit.
+
+    Writes the task_records row (queryable outcome) and a terminal
+    checkpoint carrying ``final_state`` so main._require can restore
+    the record after a backend restart — conversational tasks used to
+    leave neither, so a restart 404'd them. Merges with any existing
+    checkpoint instead of overwriting its history. Never raises: a
+    persistence failure must not fail the task itself. Under zero
+    retention no durable record is written, by design.
+    """
+    record = real_hub.tasks.get(task_id)
+    if record is None:
+        return
+    try:
+        from .zero_retention import checkpoints_allowed
+
+        if not checkpoints_allowed():
+            return
+    except Exception:
+        pass
+    try:
+        from . import db
+
+        db.init_db()
+        db.save_task_record(
+            task_id,
+            chat_id=record.chat_id,
+            instruction=record.instruction,
+            state=record.state,
+            steps_done=record.steps_done,
+            message=record.message,
+            intent=record.intent,
+        )
+    except Exception:
+        pass
+    try:
+        from . import db
+
+        cp = db.get_task_checkpoint(task_id)
+        wm = dict((cp or {}).get("working_memory") or {})
+        if record.state in ("completed", "failed", "cancelled", "blocked"):
+            wm["final_state"] = record.state
+        wm.setdefault("instruction", record.instruction)
+        if record.allowed_domains is not None:
+            wm.setdefault("allowed_domains", list(record.allowed_domains))
+        wm.setdefault("long_horizon", bool(record.long_horizon))
+        wm.setdefault("background", bool(record.background))
+        if isinstance(record.tabs, list) and record.tabs:
+            wm.setdefault("tabs", [dict(t) for t in record.tabs if isinstance(t, dict)])
+        history = list((cp or {}).get("history") or [])
+        if not history and record.message:
+            history = [{"role": "assistant", "content": record.message}]
+        _save_checkpoint_defensive(
+            task_id, record.chat_id, record.session_id,
+            max(int((cp or {}).get("step_index") or 0), int(record.steps_done or 0)),
+            str((cp or {}).get("last_url") or ""),
+            history, wm,
+        )
+    except Exception:
+        pass
+
+
+
 async def run_task(task_id: str) -> None:
+    """Production entrypoint — wires real hub, real planner, live observation.
+
+    Stream D (RC-LIVE-05): the durable task record is persisted on
+    exit, whatever the outcome — see :func:`_persist_task_record`.
+    The wrapper keeps the public name (tests and main._run_task_later
+    monkeypatch/call ``run_task``); the body lives in
+    :func:`_run_task_impl`, including the recursive compound-part
+    calls, which therefore persist each part too.
+    """
+    try:
+        await _run_task_impl(task_id)
+    finally:
+        _persist_task_record(task_id)
+
+
+async def _run_task_impl(task_id: str) -> None:
     """Production entrypoint — wires real hub, real planner, live observation."""
     record: TaskRecord = real_hub.tasks[task_id]
     chat_id = record.chat_id
+    # Stream D: a chat message sent while another task in this chat is
+    # awaiting_input IS the answer to its pending question. Deliver it
+    # and return — no new task is started for the answer itself.
+    if await _deliver_pending_ask_user_answer(record):
+        return
+
+    # Stream D (DEMO2 §11d): a fired reminder job carries a marker
+    # instruction — deliver it as a notification receipt, never as a
+    # fresh conversational task (which would re-ask for the time and
+    # time out after 300 s with no chat to answer in).
+    if (record.instruction or "").startswith(REMINDER_JOB_PREFIX):
+        await _fire_scheduled_reminder(record)
+        return
+
     latest_cp: Optional[dict[str, Any]] = None
 
     initial_memory: dict[str, Any] = {}
@@ -2763,8 +3858,12 @@ async def run_task(task_id: str) -> None:
         from .memory import SemanticMemory
         facts = SemanticMemory().recall()
         if facts:
+            # Stream D (R4-4): label the store on every fact, so the
+            # planner prompt's working-memory dump carries provenance
+            # instead of unlabelled text.
             initial_memory["semantic_facts"] = [
-                {"category": f["category"], "key": f["fact_key"], "value": f["fact_value"]}
+                {"category": f["category"], "key": f["fact_key"], "value": f["fact_value"],
+                 "provenance": "semantic store — operator-stated"}
                 for f in facts
             ]
     except Exception:
@@ -2832,6 +3931,22 @@ async def run_task(task_id: str) -> None:
         except Exception:
             pass
 
+    # A whole-instruction schedule ("In 1 minute, research ...") must
+    # NOT be split into compound parts: the split regex cuts at
+    # ", research", leaving a bare "In 1 minute" part that "completes"
+    # without creating any job while the research part runs immediately
+    # instead of being scheduled (seen live 2026-11-27: Phase C
+    # created no job and the research ran at once). If the full
+    # instruction parses as a schedule, skip splitting and let the
+    # single-task schedule path create the job.
+    _whole_schedule = None
+    try:
+        from .intent_router import detect_schedule_intent as _detect_schedule
+
+        _whole_schedule = _detect_schedule(record.instruction)
+    except Exception:
+        _whole_schedule = None
+
     # Compound instructions: run each clause as its own mission, in
     # order, threading earlier parts' results into later ones ("it" =
     # the research summary, "him" = the last named recipient, "the
@@ -2856,7 +3971,7 @@ async def run_task(task_id: str) -> None:
         )
 
         _parts = split_compound_instruction(record.instruction)
-        if len(_parts) > 1:
+        if len(_parts) > 1 and _whole_schedule is None:
             record.intent = "COMPOUND"
             _ctx: dict[str, Any] = {}
             _outcomes: list[tuple[str, str, str]] = []
@@ -2935,6 +4050,17 @@ async def run_task(task_id: str) -> None:
         except Exception:
             pass
 
+    # Stream D: freshness verdict for the same-conversation package
+    # (R4-6, partial — reuse itself is the existing EXPORT/RESUME
+    # path; this only records whether that reuse is fresh or needs
+    # re-verification, and the RESUME branch below says so).
+    try:
+        from .fast_path import package_freshness
+
+        initial_memory["research_package_freshness"] = package_freshness(latest_pkg_record)
+    except Exception:
+        pass
+
     intent_context = {
         "active_session": active_session,
         "conversation_history": initial_memory.get("conversation_history", []),
@@ -2980,8 +4106,22 @@ async def run_task(task_id: str) -> None:
             record.state = "running"
             record.message = f"Routing {_route.label}…"
             await real_hub.broadcast_progress(record)
-            _outcome = await run_connector_route(
-                _route, task_id=task_id, instruction=record.instruction, record=record
+            # Coordinator integration (Stream B, S3-R2): the connector
+            # outcome is ALSO appended to working memory as a sanitised
+            # <tool_result> observation, so the planner and any later
+            # step in this task can consume the connector's data. The
+            # terminal completion below is kept deliberately: the
+            # conversational path would discard the connector result,
+            # so full fall-through is deferred — the observation is
+            # what makes the result reusable instead of a dead end.
+            from .connector_runner import run_connector_route_as_observation
+
+            _outcome, _connector_obs = await run_connector_route_as_observation(
+                _route,
+                task_id=task_id,
+                instruction=record.instruction,
+                record=record,
+                working_memory=initial_memory,
             )
             # The runner's ok flag IS the outcome — no completion
             # verifier here. The verifier's navigation rule requires a
@@ -3002,6 +4142,55 @@ async def run_task(task_id: str) -> None:
                 except Exception:
                     pass
             return
+
+    # -- Stream C: job-discovery NL intercept ---------------------------
+    # A resume + jobs + spreadsheet ask classifies RESEARCH_TASK (a
+    # browser task) and would die at the extension gate / burn the
+    # planner loop fetching listing pages one by one (Demo 2: refused
+    # click, then the 360 s timeout, no XLSX). It is intercepted here
+    # — before the browser gate — and runs the EXISTING deterministic
+    # job-discovery pipeline (fetch -> rank -> verify every URL ->
+    # XLSX -> monitoring mission) in a worker thread, bounded to
+    # ~300 s. No browser, no clicks, no planner fetch loop.
+    try:
+        from .research.job_discovery import (
+            handle_job_discovery_instruction,
+            is_job_discovery_instruction,
+        )
+
+        _is_job = is_job_discovery_instruction(record.instruction)
+    except Exception:
+        _is_job = False
+    if _is_job:
+        record.state = "running"
+        record.message = "Analysing your resume and searching public listings…"
+        await real_hub.broadcast_progress(record)
+        try:
+            _job_answer = await asyncio.to_thread(
+                handle_job_discovery_instruction,
+                record.instruction,
+                file_token=getattr(record, "file_token", None),
+                chat_id=chat_id,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            _job_answer = (
+                "The job discovery run failed with an internal error: "
+                f"{exc}. No spreadsheet was created and no monitor was set up."
+            )
+        record.steps_done = 1
+        # The handler's message says explicitly whether the XLSX and
+        # the monitor exist; "completed" here means the run finished
+        # and reported honestly, not that listings were found.
+        record.state = "completed"
+        record.message = _job_answer
+        await real_hub.broadcast_progress(record)
+        if chat_id:
+            try:
+                _persist_agent_message(chat_id, record.message, evidence="job_discovery", task_id=task_id)
+            except Exception:
+                pass
+        return
 
     # -----------------------------------------------------------------------
     # Explicit Operation Dispatch:
@@ -3198,6 +4387,21 @@ async def run_task(task_id: str) -> None:
                     record.state = "completed"
                     deliv_info = f" and deliverable **{last_deliv}** are" if last_deliv else " is"
                     record.message = f"The research on **{topic_title}**{deliv_info} already completed. What would you like to explore next?"
+                    # Stream D (R4-6): say whether the reused package
+                    # is fresh or stale — never silently reuse a stale
+                    # package. Time-sensitive claims still need a
+                    # re-verification run.
+                    _fresh = initial_memory.get("research_package_freshness") or {}
+                    if _fresh.get("stale"):
+                        record.message += (
+                            f"\n\nNote: this research is {_fresh.get('age_hours')}h old — "
+                            "ask me to re-verify it if you need fresh sources."
+                        )
+                    elif _fresh.get("fresh"):
+                        record.message += (
+                            f"\n\nNote: reusing the stored research from this conversation "
+                            f"({_fresh.get('age_hours')}h old, fresh)."
+                        )
                     await real_hub.broadcast_progress(record)
                     if chat_id:
                         try:
@@ -3308,6 +4512,27 @@ async def run_task(task_id: str) -> None:
                     pass
             return
 
+        # Stream D: deterministic fast path (Atticus T1) — a bare
+        # greeting is answered with 0 planner calls and 0 provider
+        # tokens. The reply is canned, so the route is labelled
+        # deterministic on the record instead of presented as model
+        # output.
+        from .fast_path import answer_greeting, is_greeting
+
+        if is_greeting(record.instruction):
+            record.route = {"via": "fast_path", "path": "fast",
+                            "deterministic": True, "planner_calls": 0}
+            record.steps_done = 1
+            record.state = "completed"
+            record.message = answer_greeting()
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(chat_id, record.message, evidence="fast_path", task_id=task_id)
+                except Exception:
+                    pass
+            return
+
         record.state = "running"
         record.message = "Thinking..."
         await real_hub.broadcast_progress(record)
@@ -3344,6 +4569,42 @@ async def run_task(task_id: str) -> None:
 
             is_dispatch, dispatch_recip = is_email_dispatch_instruction(record.instruction)
 
+            # Stream D (CONTRACTS §4): NL schedule intent — "summarise
+            # this daily at 8 AM" creates a real job via the existing
+            # scheduler, with the job id + next run (IST) in the reply.
+            from .intent_router import detect_schedule_intent
+
+            _schedule_intent = detect_schedule_intent(record.instruction)
+
+            # Stream D (DEMO2 §11d): a reminder with a usable time is
+            # handled deterministically — the schedule branch would
+            # store the bare "Remind me to call mom" as the job
+            # instruction, and at fire time that instruction re-asks
+            # for the time and dies on the 300 s ask-user timeout
+            # with no chat to answer in. This pre-chain step only
+            # PARSES (no side effect): an unparseable time fails
+            # honestly here; job creation happens in the reminder
+            # branch below (or after the ask-user gate, when the time
+            # arrives as the answer). None means no time is present
+            # yet — the gate in the else branch asks for it.
+            _reminder_parsed = _parse_reminder(record.instruction)
+            _reminder_failed = False
+            if _reminder_parsed is not None and _reminder_parsed["time"].get("kind") == "unparseable":
+                record.steps_done = 1
+                record.state = "failed"
+                record.message = (
+                    f"I couldn't work out when to remind you "
+                    f"({_reminder_parsed['time'].get('reason') or 'that time didn’t parse'}) — "
+                    "try 'tomorrow 9am' or 'in 30 minutes'. No reminder was set and nothing was written to any calendar."
+                )
+                await real_hub.broadcast_progress(record)
+                if chat_id:
+                    try:
+                        _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                    except Exception:
+                        pass
+                return
+
             # Chat control for an ACTIVE email mission, handled
             # deterministically (not by the LLM): interval changes,
             # deletion receipts, pause/resume, dry-run, authorize,
@@ -3376,6 +4637,18 @@ async def run_task(task_id: str) -> None:
                         answer = f"{answer}\n\n---\n\n{cal_section}"
             elif is_calendar_query(record.instruction):
                 answer = await handle_calendar_instruction(record.instruction, chat_id=chat_id)
+            elif _reminder_parsed is not None:
+                # Deterministic reminder: the scheduled job + receipt
+                # is the answer. The model never gets a chance to
+                # claim a calendar write. A creation failure is
+                # recorded and failed honestly after the chain.
+                _rem_answer, _rem_ok = _create_reminder_job(record, _reminder_parsed)
+                answer = _rem_answer
+                _reminder_failed = not _rem_ok
+            elif _schedule_intent is not None:
+                answer = _handle_schedule_intent(
+                    _schedule_intent, allowed_domains=record.allowed_domains
+                )
             elif is_continuous_monitoring_directive(
                 record.instruction,
                 history=initial_memory.get("conversation_history", []),
@@ -3400,6 +4673,113 @@ async def run_task(task_id: str) -> None:
             elif is_capability_query(record.instruction):
                 answer = format_capability_overview()
             else:
+                # Stream D (RC-1.1): deterministic missing-info check —
+                # pause and ask instead of letting the model guess a
+                # date, a file, or a budget. The task resumes in this
+                # same coroutine once the answer arrives.
+                from .fast_path import detect_missing_info, is_sensitive_question
+
+                _missing = detect_missing_info(
+                    record.instruction, has_attachment=bool(record.file_token)
+                )
+                # Stream D (DEMO2 §11c): fast_path misses trip plans
+                # and train/bus bookings — ask here too, so the LLM
+                # cannot ask in prose and complete the task.
+                if _missing is None:
+                    _missing = _detect_trip_missing_info(
+                        record.instruction,
+                        home_origin=_home_origin_from_memory(initial_memory),
+                    )
+                if _missing is not None:
+                    _ask_q = _missing["question"]
+                    _ask_kind = _missing["kind"]
+                    _ask_opts = _missing.get("options")
+                    if is_sensitive_question(_ask_q, _ask_kind):
+                        _outcome, _answer = "refused-sensitive", None
+                    else:
+                        _save_checkpoint_defensive(
+                            task_id, chat_id, None, 0, "",
+                            [{"role": "user", "content": record.instruction}],
+                            {**initial_memory,
+                             "pending_ask_user": {"question": _ask_q, "kind": _ask_kind}},
+                        )
+                        _outcome, _answer = await _AskUserGate(record).ask(
+                            question=_ask_q, kind=_ask_kind, options=_ask_opts
+                        )
+                    if _outcome == "answer" and _answer:
+                        initial_memory.setdefault("ask_user_answers", []).append(
+                            {"question": _ask_q, "answer": _answer}
+                        )
+                        record.instruction = (
+                            f"{record.instruction}\n"
+                            f"[Operator's answer to '{_ask_q}': {_answer}]"
+                        )
+                        record.message = "Thinking..."
+                        await real_hub.broadcast_progress(record)
+                    else:
+                        if _outcome == "cancel":
+                            record.state = "cancelled"
+                            record.message = "Cancelled — you didn't answer the question, so I stopped."
+                        elif _outcome == "timeout":
+                            record.state = "failed"
+                            record.message = (
+                                "ASK_USER_TIMEOUT: no answer within 300 seconds — "
+                                "I stopped instead of guessing."
+                            )
+                        else:  # refused-sensitive
+                            record.state = "failed"
+                            record.message = (
+                                "I need that detail to proceed, but I can't ask for it in chat — "
+                                "passwords, codes and card details go through takeover in your browser only."
+                            )
+                        await real_hub.broadcast_progress(record)
+                        if chat_id:
+                            try:
+                                _persist_agent_message(
+                                    chat_id, record.message,
+                                    evidence="ask_user_cancelled" if _outcome == "cancel" else "failed",
+                                    task_id=task_id,
+                                )
+                            except Exception:
+                                pass
+                        return
+                # Stream D (DEMO2 §11d): the time just arrived as the
+                # ask-user answer — create the reminder job now, with
+                # its receipt, instead of letting the model below
+                # claim a calendar write. _parse_reminder returns None
+                # when this is not a reminder at all; an unparseable
+                # time fails honestly.
+                _gated_reminder = _parse_reminder(record.instruction)
+                _gated_reminder_answer = None
+                if _gated_reminder is not None:
+                    if _gated_reminder["time"].get("kind") == "unparseable":
+                        record.steps_done = 1
+                        record.state = "failed"
+                        record.message = (
+                            f"I couldn't work out when to remind you "
+                            f"({_gated_reminder['time'].get('reason') or 'that time didn’t parse'}) — "
+                            "try 'tomorrow 9am' or 'in 30 minutes'. No reminder was set and nothing was written to any calendar."
+                        )
+                        await real_hub.broadcast_progress(record)
+                        if chat_id:
+                            try:
+                                _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                            except Exception:
+                                pass
+                        return
+                    _gated_answer, _gated_ok = _create_reminder_job(record, _gated_reminder)
+                    if not _gated_ok:
+                        record.steps_done = 1
+                        record.state = "failed"
+                        record.message = _gated_answer
+                        await real_hub.broadcast_progress(record)
+                        if chat_id:
+                            try:
+                                _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                            except Exception:
+                                pass
+                        return
+                    _gated_reminder_answer = _gated_answer
                 provider = _provider_for_config()
                 history = initial_memory.get("conversation_history", [])
                 # Recall: the operator's stored facts must reach the
@@ -3416,23 +4796,50 @@ async def run_task(task_id: str) -> None:
                 prefs = initial_memory.get("user_preferences") or {}
                 if prefs:
                     mem_lines.append(f"Operator preferences: {json.dumps(prefs)}")
+                # Stream D (R4-4): BOTH fact stores are recallable
+                # here, each labelled with its provenance — never
+                # dumped unlabelled. Semantic facts come from the
+                # semantic store; long-memory facts/skills from the
+                # long-term store with their stored source.
                 facts = initial_memory.get("semantic_facts") or []
                 if facts:
-                    mem_lines.append("Facts the operator asked you to remember:")
+                    mem_lines.append("Facts the operator asked you to remember [semantic store — operator-stated]:")
                     for f in facts:
                         mem_lines.append(
                             f"- {f.get('category', '')}: {f.get('key', '')} = {f.get('value', '')}"
+                        )
+                _long_mem = initial_memory.get("long_memory") or {}
+                _lm_facts = _long_mem.get("facts") or []
+                if _lm_facts:
+                    mem_lines.append("Facts from long-term memory [long-term store — operator-stated or confirmed task outcomes]:")
+                    for _f in _lm_facts:
+                        _src = _f.get("source") or "operator"
+                        mem_lines.append(
+                            f"- ({_f.get('category', 'general')}, source: {_src}): {_f.get('text', '')}"
+                        )
+                _lm_skills = _long_mem.get("skills") or []
+                if _lm_skills:
+                    mem_lines.append("Learned procedures [long-term memory — skills; executable ones were verified on a real run]:")
+                    for _s in _lm_skills:
+                        mem_lines.append(
+                            f"- {_s.get('name', '')} (v{_s.get('version', 1)}, executable: {bool(_s.get('executable'))}, "
+                            f"verified runs: {_s.get('verified_runs', 0)}): {_s.get('steps', '')}"
                         )
                 if mem_lines:
                     from .capabilities import SYSTEM_CAPABILITY_PROMPT
 
                     sys_prompt = (
                         SYSTEM_CAPABILITY_PROMPT
-                        + "\n\n<remembered-facts (operator-stated, trusted)>\n"
+                        + "\n\n<remembered-facts (operator-stated, trusted; each line labelled with its store)>\n"
                         + "\n".join(mem_lines)
                         + "\nAnswer recall questions from these facts. If the fact is not listed, say you do not remember it — do not invent one.\n</remembered-facts>"
                     )
-                if hasattr(provider, "chat_call"):
+                if _gated_reminder_answer is not None:
+                    # Deterministic reminder (see above): the job
+                    # receipt is the answer — no provider call, so the
+                    # model cannot claim a calendar write.
+                    answer = _gated_reminder_answer
+                elif hasattr(provider, "chat_call"):
                     try:
                         answer = provider.chat_call(record.instruction, history=history, system_prompt=sys_prompt)
                     except Exception:
@@ -3485,6 +4892,43 @@ async def run_task(task_id: str) -> None:
                     if ALERT_OFFER_MARKER not in answer:
                         answer = f"{answer}\n\n{ALERT_OFFER_TEXT}"
 
+            # Stream D: a reminder whose job creation failed is a
+            # failure, not a completed answer (the failure text is
+            # already in `answer` from the reminder branch).
+            if _reminder_failed:
+                record.steps_done = 1
+                record.state = "failed"
+                record.message = answer
+                await real_hub.broadcast_progress(record)
+                if chat_id:
+                    try:
+                        _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                    except Exception:
+                        pass
+                return
+
+            # RC-LIVE-06: a mock canned greeting must never complete a
+            # non-greeting instruction ("Do the thing with the stuff"
+            # came back as a greeting, marked completed, because the
+            # mock matches "hi" inside "thing"). Fail honestly with a
+            # named cause instead.
+            if _is_mock_canned_greeting(record.instruction, answer):
+                record.steps_done = 1
+                record.state = "failed"
+                record.message = (
+                    "Task failed: the mock provider returned a canned greeting "
+                    "for a non-greeting instruction (MOCK_GREETING_MISMATCH) — "
+                    "no real answer was produced. Configure a real provider "
+                    "and retry."
+                )
+                await real_hub.broadcast_progress(record)
+                if chat_id:
+                    try:
+                        _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                    except Exception:
+                        pass
+                return
+
             verified = verify_task_completion(
                 instruction=record.instruction,
                 candidate_state="completed",
@@ -3515,37 +4959,169 @@ async def run_task(task_id: str) -> None:
                     pass
             return
 
+    # Stream D (CONTRACTS3 §Ask-user, DEMO2 §11b): the missing-
+    # information gate runs BEFORE the extension-connectivity check.
+    # "Plan a trip to Bengaluru" used to die here with
+    # EXTENSION_DISCONNECTED before any question could be asked. The
+    # pause checkpoints the task (id + instruction + working memory)
+    # and resumes this SAME task in this same coroutine once the
+    # answer arrives; only then does the extension check below run —
+    # and when Chrome is not connected it now reports blocked, not
+    # failed, with the reason.
+    from .fast_path import detect_missing_info as _detect_missing_info
+
+    _browser_missing = _detect_missing_info(
+        record.instruction, has_attachment=bool(record.file_token)
+    )
+    if _browser_missing is None:
+        _browser_missing = _detect_trip_missing_info(
+            record.instruction,
+            home_origin=_home_origin_from_memory(initial_memory),
+        )
+    if _browser_missing is not None:
+        if not await _ask_missing_info(record, initial_memory, chat_id, _browser_missing):
+            return
+        # Answered — fall through to the extension check below with
+        # the clarified instruction.
+    # Stream B: HTTP research path (DEMO2 §Task 12a). RESEARCH_TASK
+    # must not die at the extension gate when the work is achievable
+    # over HTTP/MCP — NEW_RESEARCH and REFINE run the bounded HTTP
+    # pipeline here (EXPORT/RESUME already returned above). The
+    # helper returns False only when the pipeline could not gather
+    # enough evidence AND the extension is connected, in which case
+    # the browser loop below gets its old chance.
+    if classification.intent == TaskIntent.RESEARCH_TASK:
+        # ...unless the instruction is a SCHEDULE ("In 1 minute,
+        # research ..."): section 2's schedule branch is unreachable
+        # for RESEARCH_TASK because classification.is_browser is
+        # True (pinned by tests), so without this the job is never
+        # created and the research runs immediately instead (seen
+        # live 2026-11-27, Phase C: 91.8 s research run, no job).
+        # Schedule it here via the same handler section 2 uses; at
+        # run time the scheduler re-enters this intercept with the
+        # bare research instruction and the pipeline runs then.
+        try:
+            from .intent_router import detect_schedule_intent as _detect_sched
+
+            _sched = _detect_sched(record.instruction)
+        except Exception:
+            _sched = None
+        if _sched is not None:
+            _answer = _handle_schedule_intent(
+                _sched, allowed_domains=record.allowed_domains
+            )
+            record.steps_done = 1
+            record.state = "completed" if _answer.startswith("Scheduled (") else "failed"
+            record.message = _answer
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(
+                        chat_id, _answer,
+                        evidence="scheduled" if record.state == "completed" else "failed",
+                        task_id=task_id,
+                    )
+                except Exception:
+                    pass
+            return
+        if await _run_http_research_path(task_id, record, classification, initial_memory, chat_id):
+            return
+
     # 3. BROWSER Tasks (NEW_BROWSER_TASK, CONTINUE_BROWSER_TASK, USE_EXISTING_USER_TAB)
     if not real_hub.extension_sockets:
-        record.state = "failed"
-        record.message = "EXTENSION_DISCONNECTED: Chrome extension is not connected."
+        record.state = "blocked"
+        record.message = (
+            "Blocked: the Chrome extension is not connected, so this browser task cannot start. "
+            "Connect the extension and retry — the task itself did not fail, and nothing was attempted in the browser."
+        )
         await real_hub.broadcast_progress(record)
         if chat_id:
             try:
-                _persist_agent_message(chat_id, "Error: Chrome extension is not connected.", evidence="failed", task_id=task_id)
+                _persist_agent_message(chat_id, record.message, evidence="blocked", task_id=task_id)
             except Exception:
                 pass
         return
 
     # Check for ambiguous user tab request or ambiguous destination entity
+    # Stream D (RC-1.1 / R5-07): ambiguity PAUSES and asks instead of
+    # terminating with failed. The task checkpoints before pausing and
+    # resumes in this same coroutine once the answer arrives — the
+    # clarified destination is appended to the instruction and the
+    # browser loop below runs with it. Cancel / timeout fail honestly.
     if classification.is_ambiguous:
         from .website_resolver import is_ambiguous_entity, format_ambiguity_clarification
         entity_hint = classification.target_tab_hint or record.instruction
         is_ambig, term, candidates = is_ambiguous_entity(entity_hint)
         if is_ambig and candidates:
             clarification_msg = format_ambiguity_clarification(term or entity_hint, candidates)
-            record.state = "failed"
-            record.message = clarification_msg
+            options = [str(c.get("name") or "") for c in candidates if c.get("name")]
+            question = f"Which site did you mean by '{term or entity_hint}'? Reply with the number or the name."
         else:
-            record.state = "failed"
-            record.message = "AMBIGUOUS_TAB: Cannot determine target tab. Please specify a specific site or tab."
-        await real_hub.broadcast_progress(record)
+            clarification_msg = (
+                "AMBIGUOUS_TAB: Cannot determine target tab. Please specify a specific site or tab."
+            )
+            options = None
+            question = f"Which site did you mean by '{entity_hint}'? Please name the site or paste its URL."
+        _save_checkpoint_defensive(
+            task_id, chat_id, None, 0, "",
+            [{"role": "user", "content": record.instruction}],
+            {**initial_memory, "pending_ask_user": {"question": question, "kind": "preference"}},
+        )
         if chat_id:
             try:
-                _persist_agent_message(chat_id, record.message, evidence="ambiguity_refusal", task_id=task_id)
+                _persist_agent_message(chat_id, clarification_msg, evidence="ambiguity_clarification", task_id=task_id)
             except Exception:
                 pass
-        return
+        _outcome, _answer = await _AskUserGate(record).ask(
+            question=question, kind="preference", options=options
+        )
+        if _outcome == "answer" and _answer:
+            _chosen = None
+            _a = _answer.strip().lower()
+            if candidates:
+                if _a.isdigit():
+                    _idx = int(_a) - 1
+                    if 0 <= _idx < len(candidates):
+                        _chosen = candidates[_idx]
+                if _chosen is None:
+                    for _c in candidates:
+                        _name = str(_c.get("name") or "").lower()
+                        _url = str(_c.get("url") or "").lower()
+                        if (_name and (_name in _a or _a in _name)) or (_url and _url in _a):
+                            _chosen = _c
+                            break
+            if _chosen is not None:
+                _clarified = f"{_chosen.get('name')} ({_chosen.get('url')})"
+            else:
+                _clarified = _answer.strip()
+            initial_memory.setdefault("ask_user_answers", []).append(
+                {"question": question, "answer": _answer}
+            )
+            record.instruction = f"{record.instruction} [clarified destination: {_clarified}]"
+            record.state = "running"
+            record.message = f"Continuing with {_clarified}…"
+            await real_hub.broadcast_progress(record)
+            # Fall through to discovery + the browser loop below.
+        else:
+            if _outcome == "cancel":
+                record.state = "cancelled"
+                record.message = "Cancelled — you didn't pick a destination, so I stopped."
+            elif _outcome == "timeout":
+                record.state = "failed"
+                record.message = (
+                    "ASK_USER_TIMEOUT: no answer within 300 seconds — "
+                    "I stopped instead of guessing a destination."
+                )
+            else:  # refused-sensitive (cannot happen for this question, kept for completeness)
+                record.state = "failed"
+                record.message = clarification_msg
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(chat_id, record.message, evidence="ask_user_timeout" if _outcome == "timeout" else "failed", task_id=task_id)
+                except Exception:
+                    pass
+            return
 
     # Autonomous Website Discovery initialization (Scenario A vs B)
     try:
@@ -3624,6 +5200,73 @@ async def run_task(task_id: str) -> None:
     if primary_tab_id:
         session_manager.pin_primary_tab(session.session_id, primary_tab_id)
         record.primary_tab_id = primary_tab_id
+        await real_hub.broadcast_progress(record)
+
+    # Stream D: learned executable skill replay (CONTRACTS §5, Atticus
+    # T2) — a matching verified skill runs with per-step verification
+    # and ZERO planner calls. Any failure escalates to the planner
+    # loop below, exactly once; a replay never retries blindly and
+    # never replays a consequential step.
+    try:
+        from .long_memory import extract_skill_inputs, match_executable_skill, record_skill_verified, replay_skill_steps
+
+        _skill = match_executable_skill(record.instruction)
+    except Exception:
+        _skill = None
+    if _skill is not None:
+        _steps = _skill.get("parsed_steps") or []
+        _obs_factory = _live_observation_factory(record)
+
+        async def _replay_observe() -> dict[str, Any]:
+            return await _obs_factory()
+
+        _replay = await replay_skill_steps(
+            _steps,
+            send_action=lambda act: real_hub.send_action(task_id, act),
+            observe=_replay_observe,
+            task_id=task_id,
+            session_id=session.session_id,
+            # Stream D: parameterized skills substitute their inputs
+            # (extracted deterministically — see
+            # long_memory.extract_skill_inputs); a skill whose inputs
+            # cannot be extracted fails fast to the planner instead
+            # of replaying the original run's literal values.
+            inputs=extract_skill_inputs(record.instruction, _skill.get("params") or []),
+        )
+        if _replay.get("ok"):
+            try:
+                record_skill_verified(_skill["id"])
+            except Exception:
+                pass
+            record.route = {"via": "skill_replay", "skill": _skill.get("name"),
+                            "planner_calls": 0, "steps": _replay.get("steps_done")}
+            record.steps_done = int(_replay.get("steps_done") or 0)
+            record.state = "completed"
+            record.message = (
+                f"Done by replaying the learned skill '{_skill.get('name')}' "
+                f"({_replay.get('steps_done')} verified steps, 0 planner calls)."
+            )
+            _replay_wm = dict(initial_memory)
+            _replay_wm["final_state"] = "completed"
+            _replay_wm["skill_replay"] = {
+                "skill": _skill.get("name"),
+                "steps_done": _replay.get("steps_done"),
+                "planner_calls": 0,
+            }
+            _save_checkpoint_defensive(
+                task_id, chat_id, session.session_id, record.steps_done, "", [], _replay_wm
+            )
+            session_manager.update_status(session.session_id, "active")
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(chat_id, record.message, evidence="skill_replay", task_id=task_id)
+                except Exception:
+                    pass
+            return
+        # Replay failed — escalate once to the planner loop below.
+        record.route = {"via": "skill_replay_failed", "skill": _skill.get("name"),
+                        "planner_calls": 0, "error": _replay.get("error")}
         await real_hub.broadcast_progress(record)
 
     def on_step_progress(steps: int = 0, msg: str = "", screenshot: Optional[str] = None,
@@ -3798,6 +5441,9 @@ async def run_task(task_id: str) -> None:
                 task_id, record.instruction,
                 state.get("summary") or "",
                 state.get("history") or [],
+                # Stream D save gate (CONTRACTS §5): only a completed,
+                # verified run may propose a replayable skill.
+                verified=(final_state == "completed"),
             )
             if _proposals:
                 save_proposals(task_id, _proposals)
@@ -3805,9 +5451,21 @@ async def run_task(task_id: str) -> None:
             pass
     except Exception as exc:
         cancelled = record.cancelled or is_cancelled(task_id)
+        # Stream D: losing the extension mid-task is a blocked run,
+        # not a failed one — the dependency went away; the objective
+        # is unchanged and can proceed once Chrome reconnects.
+        _ext_gone = (not cancelled) and "EXTENSION_DISCONNECTED" in str(exc)
         if record.state != "cancelled":
-            record.state = "cancelled" if cancelled else "failed"  # type: ignore[assignment]
-        record.message = "" if cancelled else f"loop error: {exc}"
+            record.state = "cancelled" if cancelled else ("blocked" if _ext_gone else "failed")  # type: ignore[assignment]
+        if cancelled:
+            record.message = ""
+        elif _ext_gone:
+            record.message = (
+                "Blocked: the Chrome extension disconnected mid-task, so the browser run stopped. "
+                "Reconnect the extension and retry — the task itself did not fail."
+            )
+        else:
+            record.message = f"loop error: {exc}"
         session_manager.update_status(session.session_id, "cancelled" if cancelled else "failed")
         await real_hub.broadcast_progress(record)
 

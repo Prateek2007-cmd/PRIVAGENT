@@ -1,0 +1,13 @@
+{
+  "generated": "2026-11-26",
+  "provider": "mock",
+  "command": "/home/hatch/workspace/navigator-audit/PRIVAGENT/worktrees/A/backend/scripts/eval_live.py --suite privacy",
+  "suites": {
+    "privacy_leak": {
+      "n_total": 24,
+      "leaked": 1,
+      "leak_rate": 0.0417
+    }
+  },
+  "elapsed_s": 0.84
+}

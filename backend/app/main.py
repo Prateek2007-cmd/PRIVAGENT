@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 import re
@@ -15,7 +16,7 @@ if sys.platform == "win32":
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.responses import RedirectResponse
@@ -76,6 +77,16 @@ async def _lifespan(app_instance):
             )
     except Exception as exc:
         logger.warning("Could not prepare isolated agent profile dir: %s", exc)
+    # Coordinator integration (Stream B, S3-R4): restore persisted
+    # MCP servers at startup so specs are registered before the first
+    # request. Best-effort — a failure just means lazy restore on
+    # first API/registry use, as before.
+    try:
+        from .mcp.api import restore_servers
+
+        restore_servers()
+    except Exception as exc:
+        logger.warning("MCP server restore at startup failed (continuing): %s", exc)
     async with monitoring_lifespan(app_instance):
         # Task 9: the in-process scheduler for scheduled tasks. It is
         # best-effort (a restart re-claims due jobs from SQLite); a
@@ -501,16 +512,42 @@ async def get_chat_session(chat_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/chat/{chat_id}/message")
-async def post_chat_message(chat_id: str, body: ChatMessageInput) -> dict[str, Any]:
+async def post_chat_message(chat_id: str, body: ChatMessageInput, request: Request) -> dict[str, Any]:
     chat = db.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="chat not found")
     if body.file_token and not file_uploads.get(body.file_token):
         raise HTTPException(status_code=422, detail="attachment expired")
+    # Stream D (RC-LIVE-04): ChatMessageInput has no `text` field —
+    # a {"text": "..."} body used to parse with instruction/content
+    # both None, and body.text then raised ValueError inside the
+    # handler, surfacing as a bare 500. Accept `text` (the shape the
+    # frontend and the demo drivers actually send) alongside
+    # `instruction` / `content`, and fail with a meaningful 422 when
+    # no usable text is present at all.
+    text: Optional[str] = None
+    try:
+        text = body.text
+    except ValueError:
+        text = None
+    if text is None:
+        try:
+            raw = await request.json()
+        except Exception:
+            raw = None
+        if isinstance(raw, dict):
+            candidate = raw.get("text")
+            if isinstance(candidate, str) and candidate.strip():
+                text = candidate.strip()
+    if text is None:
+        raise HTTPException(
+            status_code=422,
+            detail="message text must not be blank — send {\"text\": \"...\"} or {\"instruction\": \"...\"}",
+        )
     # Task 3: chat messages inherit the global allow-list (no per-task
     # list is available on this route); None when unconfigured.
     task = hub.new_task(
-        body.text,
+        text,
         chat_id=chat_id,
         allowed_domains=list(config.ALLOWED_DOMAINS) if config.ALLOWED_DOMAINS else None,
     )
@@ -807,6 +844,35 @@ async def confirm_task(task_id: str, body: ConfirmInput) -> dict[str, str]:
     return {"received": "ok"}
 
 
+# --- Ask-user (Stream D, RC-1.1 / CONTRACTS §2) ---------------------------
+# A task paused in awaiting_input waits for the operator's answer to
+# one structured question. These endpoints deliver the answer (or a
+# cancel) to the paused task, which resumes from its checkpoint.
+# Same auth guard as the confirmation/takeover endpoints above.
+class AskUserAnswerInput(BaseModel):
+    answer: str
+
+
+@app.post("/api/task/{task_id}/ask-user/answer")
+async def answer_ask_user_endpoint(task_id: str, body: AskUserAnswerInput) -> dict[str, Any]:
+    _require(task_id)
+    from .agentLoop import answer_ask_user
+
+    if not answer_ask_user(task_id, body.answer):
+        raise HTTPException(404, f"task {task_id} is not paused awaiting an answer")
+    return {"ok": True, "taskId": task_id}
+
+
+@app.post("/api/task/{task_id}/ask-user/cancel")
+async def cancel_ask_user_endpoint(task_id: str) -> dict[str, Any]:
+    _require(task_id)
+    from .agentLoop import cancel_ask_user
+
+    if not cancel_ask_user(task_id):
+        raise HTTPException(404, f"task {task_id} is not paused awaiting an answer")
+    return {"ok": True, "taskId": task_id, "cancelled": True}
+
+
 # --- Task 4: takeover -------------------------------------------------------
 # When the loop reaches a login / payment / OTP / CAPTCHA / 2FA surface it
 # stops observing and hands the browser to the operator. These endpoints
@@ -987,7 +1053,7 @@ async def create_scheduled_job(body: ScheduledJobInput) -> dict[str, Any]:
 async def list_scheduled_jobs() -> dict[str, Any]:
     from .scheduler import list_jobs
 
-    return {"jobs": list_jobs()}
+    return {"jobs": [_public_job(job) for job in list_jobs()]}
 
 
 @app.delete("/api/scheduled/{job_id}")
@@ -1011,6 +1077,152 @@ async def run_scheduled_job_now(job_id: str) -> dict[str, Any]:
     if record is not None:
         await hub.broadcast_progress(record)
     return {"taskId": task_id}
+
+
+@app.patch("/api/scheduled/{job_id}")
+async def update_scheduled_job(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Edit / pause / resume / cancel a scheduled job (Stream C, task 6).
+
+    Body: {"instruction"?, "schedule"?, "status"?} — status is
+    active | paused | cancelled. A new schedule recomputes next_run_at.
+    """
+    from .scheduler import get_job, set_job_status, update_job
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="scheduled job not found")
+    try:
+        if isinstance(body, dict) and body.get("status"):
+            set_job_status(job_id, str(body["status"]))
+        if isinstance(body, dict) and (body.get("instruction") is not None or body.get("schedule") is not None):
+            updated = update_job(
+                job_id,
+                instruction=body.get("instruction"),
+                schedule=body.get("schedule"),
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="scheduled job not found")
+            job = updated
+        else:
+            job = get_job(job_id) or job
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _public_job(job)
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    """A scheduled job with IST display times (Stream C, R-11).
+
+    Storage stays UTC epoch; every display time is IST with the offset
+    stated, per contract §3.
+    """
+    from .monitoring_scheduler import format_ist_short
+
+    out = dict(job)
+    out["next_run_ist"] = format_ist_short(job.get("next_run_at"))
+    out["last_run_ist"] = format_ist_short(job.get("last_run_at"))
+    out["last_outcome_at_ist"] = format_ist_short(job.get("last_run_outcome_at"))
+    return out
+
+
+# --- Stream C: monitoring events (missed-event pull + outbox) ---------
+# Contract §3: GET /api/monitoring/events?since=&unread=true returns
+# stored events; the frontend calls it on connect and marks them read
+# via POST /api/monitoring/events/{id}/read. An event is not
+# "delivered" until a client acknowledges it or this pull returns it —
+# the pull marks the returned rows delivered (notification_sent=1,
+# delivered_at=now); `acknowledged` stays 0 until read, which is what
+# the unread badge counts.
+@app.get("/api/monitoring/events")
+async def list_monitoring_events(since: Optional[str] = None, unread: bool = False,
+                                 limit: int = 100) -> dict[str, Any]:
+    from .monitoring_scheduler import (
+        count_unread_events,
+        list_unread_events,
+        mark_events_delivered,
+    )
+
+    since_ts: float | None = None
+    if since:
+        try:
+            since_ts = float(since)
+        except ValueError:
+            try:
+                from datetime import datetime
+
+                since_ts = datetime.fromisoformat(since.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                raise HTTPException(status_code=422, detail="since must be an epoch or ISO-8601 time") from None
+    events = list_unread_events(
+        since=since_ts, unread_only=unread, limit=max(1, min(int(limit), 500)),
+    )
+    # The pull itself counts as delivery (contract §3).
+    mark_events_delivered([e["id"] for e in events])
+    return {"events": events, "unread": count_unread_events()}
+
+
+@app.post("/api/monitoring/events/{event_id}/read")
+async def mark_monitoring_event_read(event_id: str) -> dict[str, bool]:
+    from .monitoring_scheduler import mark_event_read
+
+    if not mark_event_read(event_id):
+        raise HTTPException(status_code=404, detail="event not found")
+    return {"ok": True}
+
+
+@app.get("/api/monitoring/missions/{mission_id}")
+async def get_monitoring_mission(mission_id: str) -> dict[str, Any]:
+    """Full watch detail for the watch card (Stream C, task 6).
+
+    Source URL, condition, next check (UTC + IST), baseline
+    observation, latest observation, alert history. Baseline is the
+    earliest stored observation excerpt; latest is the stored state
+    from the most recent check.
+    """
+    from .monitoring_scheduler import format_ist_short
+
+    db.init_db()
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="mission not found")
+        mission = dict(row)
+        events = [
+            {**dict(r), "diff_data": json.loads(r["diff_data"] or "{}"),
+             "detected_ist": format_ist_short(r["detected_at"])}
+            for r in conn.execute(
+                "SELECT * FROM monitoring_events WHERE mission_id=? ORDER BY detected_at DESC LIMIT 20",
+                (mission_id,),
+            ).fetchall()
+        ]
+    mission["condition_params"] = json.loads(mission.get("condition_params") or "{}")
+    try:
+        latest_state = json.loads(mission.pop("last_state_json") or "{}")
+    except Exception:
+        latest_state = {}
+    mission.pop("last_state_hash", None)
+    mission["next_run_ist"] = format_ist_short(mission.get("next_run_at"))
+    mission["last_run_ist"] = format_ist_short(mission.get("last_run_at"))
+    mission["last_alert_ist"] = format_ist_short(mission.get("last_alert_at"))
+    # Baseline: the earliest event's before-excerpt, else the latest
+    # state (a watch that never alerted has only ever seen one state).
+    baseline_text = ""
+    baseline_price = None
+    if events:
+        earliest = events[-1]
+        baseline_text = (earliest.get("diff_data") or {}).get("before") or ""
+        baseline_price = (earliest.get("diff_data") or {}).get("old_price")
+    latest = {
+        "text": (latest_state.get("text") or "")[:500],
+        "price": latest_state.get("price"),
+        "elements": (latest_state.get("elements") or [])[:10],
+    }
+    mission["baseline"] = {"text": (baseline_text or latest["text"])[:500], "price": baseline_price}
+    mission["latest"] = latest
+    mission["events"] = events
+    return mission
 
 
 def _require(task_id: str):
@@ -1050,7 +1262,7 @@ def _require(task_id: str):
             # tab registry the loop checkpointed — without the
             # allow-list a resumed task would run unrestricted.
             final_state = wm.get("final_state")
-            if final_state in ("completed", "failed", "cancelled"):
+            if final_state in ("completed", "failed", "cancelled", "blocked"):
                 state = final_state
                 message = (
                     f"Task {final_state} before the backend restarted; "

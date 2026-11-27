@@ -1161,6 +1161,54 @@ def _validate_step(
                     "PLAN_INVALID: webmcp tool asks for credentials or a payment — "
                     "it must be risk=sensitive so the operator takes over first"
                 )
+    elif a.type == "mcp_tool":
+        # Coordinator integration (Stream B, S3-R1): an mcp_tool step
+        # is only valid for a tool the unified registry actually lists,
+        # with arguments matching its JSON Schema. The tool description
+        # and arguments are scanned by the isolation checker, exactly
+        # like webmcp_tool. A consequential tool must be risk=write
+        # (or sensitive) — the loop refuses it without an approval
+        # token, so a plan that under-risks it is invalid, not merely
+        # unlucky.
+        from .tool_registry import get_tool_spec
+
+        _tool_name = getattr(p, "tool", None) if p is not None else None
+        _args = getattr(p, "arguments", None) if p is not None else None
+        if not _tool_name:
+            raise ValueError("PLAN_INVALID: mcp_tool requires params.tool")
+        if _args is None:
+            _args = {}
+        _spec = get_tool_spec(str(_tool_name))
+        if _spec is None:
+            raise ValueError(f"PLAN_INVALID: mcp_tool tool {_tool_name!r} is not in the tool registry")
+        _schema = _spec.get("parameters") or {}
+        if _schema:
+            from jsonschema import ValidationError as _JSVE
+            from jsonschema import validate as _js_validate
+
+            try:
+                _js_validate(_args, _schema)
+            except _JSVE as exc:
+                raise ValueError(f"PLAN_INVALID: mcp_tool arguments do not match the tool schema: {exc.message}")
+        if _spec.get("permission") == "consequential" and a.risk not in {"write", "sensitive"}:
+            raise ValueError(
+                "PLAN_INVALID: mcp_tool on a consequential tool must be risk=write "
+                "(or sensitive) so the operator approves it first"
+            )
+        from .checker import scan_page_text
+
+        _scan_text = f"{_spec.get('name', '')} {_spec.get('description', '')} {json.dumps(_args, default=str)}"
+        _findings = scan_page_text(_scan_text)
+        _bad = {
+            "ignore_instructions", "reveal_system_prompt",
+            "exfiltrate_secret", "otp_exfiltration", "credential_harvest",
+        }
+        _hit = sorted({f.rule for f in _findings} & _bad)
+        if _hit:
+            raise ValueError(
+                "PLAN_INVALID: mcp tool description/arguments look like a "
+                f"prompt-injection lure ({', '.join(_hit)}) — the tool is uncallable"
+            )
     elif a.type == "ucp_checkout":
         # Task 14: a UCP checkout is only valid against the profile
         # this observation's merchant actually published, and only

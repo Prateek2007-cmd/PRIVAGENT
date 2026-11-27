@@ -29,6 +29,7 @@ describe("contracts", () => {
       // ucp_checkout is backend-executed, never sent here).
       "webmcp_tool",
       "ucp_checkout",
+      "mcp_tool",
     ]);
   });
 

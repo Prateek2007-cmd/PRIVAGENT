@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShopSphere — Demo Sandbox</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#111827;--muted:#6b7280;--line:#e5e7eb;
+--accent:#0f766e;--accent2:#f59e0b;--danger:#dc2626;--radius:12px}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+.banner{background:#fef3c7;color:#92400e;text-align:center;padding:8px 12px;font-size:13px;font-weight:600}
+header{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+.wrap{max-width:1100px;margin:0 auto;padding:0 16px}
+.bar{display:flex;gap:16px;align-items:center;padding:14px 0;flex-wrap:wrap}
+.logo{font-size:22px;font-weight:800;color:var(--accent)} .logo span{color:var(--accent2)}
+.search{flex:1;display:flex;gap:8px;min-width:220px}
+.search input{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:15px}
+button{cursor:pointer;border:0;border-radius:8px;padding:10px 16px;font-size:14px;font-weight:600}
+.btn{background:var(--accent);color:#fff}.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-ghost{background:#fff;border:1px solid var(--line);color:var(--ink)}
+.cart-btn{position:relative}
+.cart-count{position:absolute;top:-6px;right:-6px;background:var(--accent2);color:#111827;border-radius:50%;min-width:20px;height:20px;font-size:12px;display:flex;align-items:center;justify-content:center;padding:0 4px}
+.cats{display:flex;gap:8px;overflow-x:auto;padding:0 0 12px}
+.cat{white-space:nowrap;padding:6px 12px;border:1px solid var(--line);background:#fff;border-radius:999px;font-size:13px}
+.cat[aria-pressed="true"]{background:var(--accent);color:#fff;border-color:var(--accent)}
+main{padding:20px 0 60px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column}
+.thumb{height:150px;display:flex;align-items:center;justify-content:center;font-size:64px;color:#fff}
+.card-body{padding:14px;display:flex;flex-direction:column;gap:6px;flex:1}
+.card-body h3{margin:0;font-size:16px}
+.price{font-size:18px;font-weight:800}.muted{color:var(--muted);font-size:13px}
+.stock-ok{color:#047857;font-weight:600;font-size:13px}.stock-out{color:var(--danger);font-weight:600;font-size:13px}
+.card-body .btn{margin-top:auto}
+#status{margin:12px 0;color:var(--muted)}
+.skeleton{height:220px;background:linear-gradient(90deg,#eee,#f7f7f7,#eee);border-radius:var(--radius);animation:pulse 1.2s infinite}
+@keyframes pulse{50%{opacity:.6}}
+.error{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px;border-radius:8px}
+dialog{border:1px solid var(--line);border-radius:14px;max-width:640px;width:calc(100vw - 32px);padding:0}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+.dlg-body{padding:20px}.dlg-body h2{margin-top:0}
+.sellers{width:100%;border-collapse:collapse;margin:12px 0}
+.sellers th,.sellers td{border-bottom:1px solid var(--line);padding:8px;text-align:left;font-size:14px}
+.specs{width:100%;border-collapse:collapse;margin:12px 0}
+.specs td{border-bottom:1px solid var(--line);padding:6px 8px;font-size:14px}
+.specs td:first-child{color:var(--muted);width:40%}
+label{display:block;font-size:13px;font-weight:600;margin:10px 0 4px}
+input[type=text],input[type=number]{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:15px}
+.cart-line{display:flex;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);font-size:14px}
+.qty button{padding:4px 10px;margin:0 2px}
+.notice{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;padding:12px;border-radius:8px}
+footer{border-top:1px solid var(--line);padding:20px;text-align:center;color:var(--muted);font-size:13px;background:#fff}
+@media(max-width:600px){.bar{gap:8px}.thumb{height:120px}}
+</style>
+</head>
+<body>
+<div class="banner" role="note">Demo Sandbox — not the real site. No real purchases. Payment is disabled.</div>
+<header><div class="wrap">
+  <div class="bar">
+    <div class="logo" data-testid="site-logo">Shop<span>Sphere</span></div>
+    <form class="search" id="search-form" role="search">
+      <label class="sr-only" for="q" style="position:absolute;left:-9999px">Search products</label>
+      <input id="q" data-testid="search-input" type="text" placeholder="Search products, e.g. Amazfit Bip 5" autocomplete="off">
+      <button class="btn" type="submit" data-testid="search-button">Search</button>
+    </form>
+    <button class="btn-ghost cart-btn" id="cart-open" data-testid="cart-button" aria-label="Open cart">🛒 Cart <span class="cart-count" id="cart-count" data-testid="cart-count">0</span></button>
+  </div>
+  <nav class="cats" id="cats" aria-label="Categories" data-testid="category-list"></nav>
+</div></header>
+<main><div class="wrap">
+  <div id="status" role="status" aria-live="polite"></div>
+  <div id="error" hidden></div>
+  <div class="grid" id="grid" data-testid="product-grid"></div>
+</div></main>
+<footer>ShopSphere Demo Sandbox · Synthetic catalogue for the NAVIGATOR demo · Prices in INR · No real orders are placed</footer>
+
+<dialog id="detail" aria-label="Product details"><div class="dlg-body" id="detail-body"></div></dialog>
+<dialog id="cartdlg" aria-label="Cart and checkout"><div class="dlg-body" id="cart-body"></div></dialog>
+
+<script>
+const API="/api/v1";
+let sessionId=localStorage.getItem("shopsphere-session");
+if(!sessionId){sessionId="sess-"+Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem("shopsphere-session",sessionId);}
+let activeCategory="",activeQuery="";
+const $=s=>document.querySelector(s);
+const inr=n=>"₹"+Number(n).toLocaleString("en-IN");
+function showError(msg){const e=$("#error");e.hidden=false;e.innerHTML='<div class="error" role="alert">'+msg+'</div>';}
+function clearError(){$("#error").hidden=true;}
+function skeleton(n){$("#grid").innerHTML=Array.from({length:n},()=>'<div class="skeleton" aria-hidden="true"></div>').join("");}
+async function api(path,opts){const r=await fetch(API+path,opts);const j=await r.json().catch(()=>({ok:false,error:"bad json"}));if(!r.ok&&!j.error)j.error="HTTP "+r.status;return {status:r.status,data:j};}
+
+async function loadCategories(){
+  const {data}=await api("/categories");
+  if(!data.ok)return;
+  const nav=$("#cats");
+  nav.innerHTML='<button class="cat" data-cat="" aria-pressed="true">All</button>'+
+    data.categories.map(c=>'<button class="cat" data-cat="'+c+'" aria-pressed="false">'+c+'</button>').join("");
+  nav.querySelectorAll(".cat").forEach(b=>b.onclick=()=>{activeCategory=b.dataset.cat;
+    nav.querySelectorAll(".cat").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));loadProducts();});
+}
+async function loadProducts(){
+  clearError();skeleton(6);
+  $("#status").textContent="Loading products…";
+  const params=new URLSearchParams();if(activeQuery)params.set("q",activeQuery);if(activeCategory)params.set("category",activeCategory);
+  try{
+    const {data}=await api("/products?"+params.toString());
+    if(!data.ok)throw new Error(data.error||"Failed to load products");
+    $("#status").textContent=data.count+" product"+(data.count===1?"":"s")+(activeQuery?(' for “'+activeQuery+'”'):"")+(activeCategory?(" in "+activeCategory):"");
+    if(!data.count){$("#grid").innerHTML='<p class="muted">No products match. Try another search.</p>';return;}
+    $("#grid").innerHTML=data.products.map(p=>{
+      const low=p.lowest_price,stock=p.in_stock;
+      return '<article class="card" data-testid="product-card" data-product-id="'+p.id+'">'
+      +'<div class="thumb" style="background:'+p.colour+'" aria-hidden="true">'+p.icon+'</div>'
+      +'<div class="card-body"><h3>'+p.name+'</h3>'
+      +'<div class="muted">'+p.category+'</div>'
+      +'<div class="price" data-testid="product-price">'+inr(low)+'</div>'
+      +'<div class="'+(stock?"stock-ok":"stock-out")+'">'+(stock?"In stock":"Out of stock")+'</div>'
+      +'<div class="muted">'+p.sellers.length+' sellers · from '+inr(low)+'</div>'
+      +'<button class="btn" data-testid="view-product" data-id="'+p.id+'">View details</button></div></article>';
+    }).join("");
+    document.querySelectorAll("[data-testid=view-product]").forEach(b=>b.onclick=()=>openDetail(+b.dataset.id));
+  }catch(e){$("#grid").innerHTML="";$("#status").textContent="";showError("Could not load products: "+e.message+" — please retry.");}
+}
+async function openDetail(id){
+  const body=$("#detail-body");body.innerHTML="<p>Loading product…</p>";$("#detail").showModal();
+  const {status,data}=await api("/products/"+id);
+  if(!data.ok){body.innerHTML='<div class="error">Product not found (HTTP '+status+').</div><p><button class="btn-ghost" onclick="document.getElementById(\'detail\').close()">Close</button></p>';return;}
+  const p=data.product;
+  body.innerHTML='<h2 data-testid="product-name">'+p.name+'</h2>'
+    +'<div class="thumb" style="background:'+p.colour+';border-radius:8px" aria-hidden="true">'+p.icon+'</div>'
+    +'<p>'+p.description+'</p>'
+    +'<h3>Specifications</h3><table class="specs">'+Object.entries(p.specs).map(([k,v])=>'<tr><td>'+k+'</td><td>'+v+'</td></tr>').join("")+'</table>'
+    +'<h3>Sellers</h3><table class="sellers"><thead><tr><th>Seller</th><th>Price</th><th>Stock</th><th></th></tr></thead><tbody>'
+    +p.sellers.map(s=>'<tr data-testid="seller-row"><td>'+s.name+'</td><td data-testid="seller-price">'+inr(s.price)+'</td><td>'+(s.stock>0?s.stock+" left":"Out of stock")+'</td>'
+      +'<td><button class="btn" data-testid="add-to-cart" data-seller="'+s.id+'" '+(s.stock>0?"":"disabled")+'>Add to cart</button></td></tr>').join("")+'</tbody></table>'
+    +'<details><summary>Price history (per seller)</summary>'+p.sellers.map(s=>'<p><strong>'+s.name+':</strong> '+s.price_history.map(h=>inr(h.price)+" · "+new Date(h.changed_at).toLocaleString()).join(" → ")+'</p>').join("")+'</details>'
+    +'<p><button class="btn-ghost" onclick="document.getElementById(\'detail\').close()">Close</button></p>';
+  body.querySelectorAll("[data-testid=add-to-cart]").forEach(b=>b.onclick=async()=>{
+    b.disabled=true;b.textContent="Adding…";
+    const {data}=await api("/cart/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session_id:sessionId,product_id:p.id,seller_id:+b.dataset.seller,qty:1})});
+    if(data.ok){await refreshCart();$("#detail").close();openCart();}
+    else{alert("Could not add to cart: "+(data.error||data.detail||"error"));b.disabled=false;b.textContent="Add to cart";}
+  });
+}
+async function refreshCart(){
+  const {data}=await api("/cart?session_id="+encodeURIComponent(sessionId));
+  if(data.ok)$("#cart-count").textContent=data.count;
+  return data;
+}
+function openCart(){renderCart();$("#cartdlg").showModal();}
+async function renderCart(){
+  const body=$("#cart-body");body.innerHTML="<p>Loading cart…</p>";
+  const data=await refreshCart();
+  if(!data.ok){body.innerHTML='<div class="error">Could not load cart.</div>';return;}
+  if(!data.items.length){body.innerHTML="<h2>Your cart</h2><p>Your cart is empty.</p><p><button class='btn-ghost' onclick=\"document.getElementById('cartdlg').close()\">Continue shopping</button></p>";return;}
+  body.innerHTML="<h2>Your cart</h2>"+data.items.map(i=>'<div class="cart-line"><div><strong>'+i.product_name+'</strong><br><span class="muted">'+i.seller_name+' · '+inr(i.unit_price)+' each</span></div>'
+    +'<div class="qty"><button data-act="dec" data-p="'+i.product_id+'" data-s="'+i.seller_id+'">−</button> '+i.qty+' <button data-act="inc" data-p="'+i.product_id+'" data-s="'+i.seller_id+'">+</button> <button data-act="rm" data-p="'+i.product_id+'" data-s="'+i.seller_id+'">Remove</button></div>'
+    +'<div><strong>'+inr(i.line_total)+'</strong></div></div>').join("")
+    +'<p style="text-align:right;font-size:18px">Total: <strong data-testid="cart-total">'+inr(data.total)+'</strong></p>'
+    +'<h3>Checkout — delivery address</h3>'
+    +'<form id="checkout-form"><label for="c-name">Full name</label><input id="c-name" type="text" required autocomplete="name">'
+    +'<label for="c-addr">Address</label><input id="c-addr" type="text" required autocomplete="street-address">'
+    +'<label for="c-city">City</label><input id="c-city" type="text" required>'
+    +'<label for="c-pin">PIN code</label><input id="c-pin" type="text" required pattern="[0-9]{6}" title="6-digit PIN code">'
+    +'<p class="muted">Payment is disabled in this demo sandbox. Checkout prepares the order only — no charge, no order placed.</p>'
+    +'<div id="checkout-result"></div>'
+    +'<p><button class="btn" type="submit" data-testid="checkout-button">Prepare order (payment disabled)</button> '
+    +'<button class="btn-ghost" type="button" onclick="document.getElementById(\'cartdlg\').close()">Close</button></p></form>';
+  body.querySelectorAll("[data-act]").forEach(b=>b.onclick=async()=>{
+    const p=+b.dataset.p,s=+b.dataset.s;
+    const cur=data.items.find(i=>i.product_id===p&&i.seller_id===s);
+    const qty=b.dataset.act==="inc"?cur.qty+1:b.dataset.act==="dec"?cur.qty-1:0;
+    await api("/cart/update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session_id:sessionId,product_id:p,seller_id:s,qty})});
+    renderCart();
+  });
+  $("#checkout-form").onsubmit=async (e) => {
+    e.preventDefault();
+    const btn=e.target.querySelector("[data-testid=checkout-button]");btn.disabled=true;btn.textContent="Preparing…";
+    const {status,data}=await api("/checkout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session_id:sessionId,name:$("#c-name").value,address:$("#c-addr").value,city:$("#c-city").value,pincode:$("#c-pin").value})});
+    const res=$("#checkout-result");
+    if(status===402&&data.state==="PREPARED"){
+      res.innerHTML='<div class="notice" role="status"><strong>Order PREPARED — payment disabled.</strong><br>No charge was made and no order was placed. Total '+inr(data.order_summary.total)+' for '+data.order_summary.items.length+' line(s).</div>';
+    }else{res.innerHTML='<div class="error">Checkout failed: '+(data.error||data.detail||"error")+'</div>';}
+    btn.disabled=false;btn.textContent="Prepare order (payment disabled)";
+  };
+}
+$("#search-form").addEventListener("submit",e=>{e.preventDefault();activeQuery=$("#q").value.trim();loadProducts();});
+$("#cart-open").onclick=openCart;
+loadCategories();loadProducts();refreshCart();
+</script>
+</body>
+</html>

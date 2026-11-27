@@ -1711,3 +1711,186 @@ def classify_intent(
         confidence=0.8,
         reason="general knowledge/conversational request without browsing directives",
     )
+
+# ---------------------------------------------------------------------------
+# Monitoring / scheduling NL intents (Stream D routes, Stream C creates)
+# CONTRACTS §4. Pure parsers — no side effects, no job/watch creation
+# here. The conversational path in agentLoop.py calls these and hands
+# the shape to the existing backend functions (scheduler.create_job /
+# the monitoring companion); a shape this module cannot map to a real
+# backend call returns None instead of a half-built intent.
+# ---------------------------------------------------------------------------
+
+_MONITOR_WORDS_RE = re.compile(
+    r"\b(watch|monitor|alert|track|notify|price|stock|availability)\b",
+    re.IGNORECASE,
+)
+
+_SCHEDULE_EVERY_RE = re.compile(
+    r"\bevery\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?)\b", re.IGNORECASE
+)
+_SCHEDULE_DAILY_RE = re.compile(
+    r"\bdaily\b.{0,20}\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_ONCE_RE = re.compile(
+    r"\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE
+)
+# A schedule phrase only counts when the instruction is a *task* to
+# repeat, not a watch: page/price watches belong to the monitoring
+# directive, and "check every 5 minutes" with no task is a watch.
+_SCHEDULE_TASK_VERB_RE = re.compile(
+    r"\b(summari[sz]e|research|send|email|message|remind|check|do|run|"
+    r"give|tell|fetch|get|prepare|create|generate)\b",
+    re.IGNORECASE,
+)
+
+
+def _to_ist_hhmm(hour: int, minute: int, ampm: Optional[str]) -> tuple[int, int]:
+    if ampm:
+        ampm = ampm.lower()
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    return hour % 24, minute % 60
+
+
+def _ist_to_utc_hhmm(hour: int, minute: int) -> tuple[int, int]:
+    """IST (UTC+5:30) wall time → UTC wall time for scheduler.create_job,
+    which stores daily times as UTC (see R-11). The reply states both."""
+    total = (hour * 60 + minute) - 330
+    total %= 24 * 60
+    return total // 60, total % 60
+
+
+def detect_schedule_intent(text: str) -> Optional[dict[str, Any]]:
+    """Parse a scheduling instruction into the CONTRACTS §4 shape.
+
+    Returns ``{"intent": "create_schedule", "instruction": ...,
+    "schedule": {"kind": "every"|"daily"|"once", ...}}`` or None.
+    "once" (``in N minutes``) is a real one-off job: ``create_job``
+    stores it as schedule_kind=once and it runs exactly once.
+    """
+    raw = (text or "").strip()
+    if not raw or _MONITOR_WORDS_RE.search(raw):
+        return None
+    if not _SCHEDULE_TASK_VERB_RE.search(raw):
+        return None
+
+    m = _SCHEDULE_EVERY_RE.search(raw)
+    if m:
+        amount, unit = int(m.group(1)), m.group(2).lower()
+        minutes = amount * {"minute": 1, "minutes": 1, "min": 1, "mins": 1,
+                            "hour": 60, "hours": 60, "hr": 60, "hrs": 60,
+                            "day": 1440, "days": 1440}[unit]
+        if minutes < 1:
+            return None
+        instruction = _SCHEDULE_EVERY_RE.sub("", raw).strip(" ,.")
+        if len(instruction.split()) < 2:
+            # A bare "check every 5 minutes" is a watch, not a job —
+            # it must fall through to the monitoring directive.
+            return None
+        return {
+            "intent": "create_schedule",
+            "instruction": instruction or raw,
+            "schedule": {"kind": "every", "interval_minutes": minutes,
+                         "in_minutes": None, "time_ist": None},
+        }
+    m = _SCHEDULE_DAILY_RE.search(raw)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        hour, minute = _to_ist_hhmm(hour, minute, m.group(3))
+        uh, um = _ist_to_utc_hhmm(hour, minute)
+        instruction = _SCHEDULE_DAILY_RE.sub("", raw).strip(" ,.")
+        if len(instruction.split()) < 2:
+            return None
+        return {
+            "intent": "create_schedule",
+            "instruction": instruction or raw,
+            "schedule": {"kind": "daily", "time_ist": f"{hour:02d}:{minute:02d}",
+                         "time_utc": f"{uh:02d}:{um:02d}",
+                         "in_minutes": None, "interval_minutes": None},
+        }
+    m = _SCHEDULE_ONCE_RE.search(raw)
+    if m:
+        amount, unit = int(m.group(1)), m.group(2).lower()
+        minutes = amount * (60 if unit.startswith(("hour", "hr")) else 1)
+        instruction = _SCHEDULE_ONCE_RE.sub("", raw).strip(" ,.")
+        if len(instruction.split()) < 2:
+            return None
+        return {
+            "intent": "create_schedule",
+            "instruction": instruction or raw,
+            "schedule": {"kind": "once", "in_minutes": minutes,
+                         "interval_minutes": None, "time_ist": None},
+        }
+    return None
+
+
+_PRICE_RE = re.compile(
+    r"(?:price|₹|rs\.?|\$).{0,25}?\b(below|under|less than|above|over|more than|drops?|falls?|rises?)\b.{0,12}?(?:₹|rs\.?|\$)?\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_MONITOR_TARGET_RE = re.compile(
+    r"\b(?:watch|monitor|track|alert\s+me(?:\s+when|if)?|notify\s+me(?:\s+when|if)?)\b.{0,80}?(https?://\S+|\S+\.(?:com|in|org|net|co\.uk|io)\S*)?",
+    re.IGNORECASE,
+)
+
+
+def detect_monitor_intent(text: str) -> Optional[dict[str, Any]]:
+    """Parse a monitoring instruction into the CONTRACTS §4 shape.
+
+    Returns ``{"intent": "create_monitor", "url": ..., "condition":
+    {...}, "interval_minutes": int, "label": ...}`` or None when the
+    text is not a watch request or has no usable target. URL
+    validation itself is NOT done here — the creation path validates
+    with the same gate the fetch path uses (CONTRACTS §4 / RC-LIVE-04).
+    """
+    raw = (text or "").strip()
+    if not raw or not _MONITOR_WORDS_RE.search(raw):
+        return None
+    if not _MONITOR_TARGET_RE.search(raw):
+        return None
+    # A URL is required for a real watch: prefer an explicit URL,
+    # else a bare domain. (The target regex above only decides that
+    # this IS a watch request; the URL itself is extracted here so a
+    # non-greedy optional group cannot silently match empty.)
+    url = ""
+    um = re.search(r"https?://\S+", raw)
+    if um:
+        url = um.group(0).rstrip(".,;!?)")
+    else:
+        dm = re.search(r"\b(?:[a-z0-9-]+\.)+(?:com|in|org|net|co\.uk|io)\S*", raw, re.IGNORECASE)
+        if dm:
+            url = "https://" + dm.group(0).rstrip(".,;!?)")
+    interval = 60
+    im = re.search(r"\bevery\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b", raw, re.IGNORECASE)
+    if im:
+        amount, unit = int(im.group(1)), im.group(2).lower()
+        interval = amount * (60 if unit.startswith(("hour", "hr")) else 1)
+    condition: dict[str, Any] = {"kind": "any_change", "value": None}
+    pm = _PRICE_RE.search(raw)
+    if pm:
+        try:
+            value = float(pm.group(2).replace(",", ""))
+        except ValueError:
+            value = None
+        if value is not None:
+            word = (pm.group(1) or "").lower()
+            kind = "price_below" if word in ("below", "under", "less than", "drops", "drop", "falls", "fall") else "price_above"
+            condition = {"kind": kind, "value": value}
+    if not url:
+        # No usable target: not a creatable watch (the creation path
+        # would reject it — say so here instead of emitting a shape
+        # with an empty URL).
+        return None
+    label = raw[:80]
+    return {
+        "intent": "create_monitor",
+        "url": url or "",
+        "condition": condition,
+        "interval_minutes": interval,
+        "label": label,
+    }

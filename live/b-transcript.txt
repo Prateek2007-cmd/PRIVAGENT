@@ -1,0 +1,63 @@
+[2026-11-27 04:23:49 UTC] == PHASE A: NL research (exact brief prompt) ==
+[2026-11-27 04:23:49 UTC] PROMPT: Research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations.
+[2026-11-27 04:23:49 UTC] chat: 1e229b7e5dfb4b1789125fa07be99157
+[2026-11-27 04:23:49 UTC] task A: 62d3a1a2d434424cb7b03ba27517648c
+[2026-11-27 04:25:31 UTC] task A settled in 102.4s: state=completed stepsDone=26 intent=RESEARCH_TASK route={"via": "http_research", "planner_calls": 2, "steps": 26, "sources_accepted": 8, "sources_rejected": 7, "synthesis_path": "provider"}
+[2026-11-27 04:25:31 UTC] task A message (first 800): ## Architecture
+The evidence describes three distinct architectural approaches to on-device AI agents. Agent-X is presented as a software-only, accuracy-preserving framework that accelerates both the prefill and decode stages of on-device agent workloads, and is described as seamlessly integrable into existing on-device AI agents [1]. A second approach, Division-of-Thoughts (DoT), is a collaborative reasoning framework that leverages the synergy between locally deployed Smaller-scale Language Models (SLMs) and cloud-based LLMs, using an adapter for task allocation that is trained via a self-reinforced method relying solely on task execution feedback [2]. A third line of work centres on NNStreamer, a stream pipeline framework for on-device AI systems that handles neural networks with comple
+[2026-11-27 04:25:31 UTC] artifacts for task A: HTTP 200 -> [{"artifact_id": "art_62d3a1a2d434424cb7b03ba27517648c_xlsx", "task_id": "62d3a1a2d434424cb7b03ba27517648c", "conversation_id": "1e229b7e5dfb4b1789125fa07be99157", "filename": "on-device_AI_agents_using_five_credible_.xlsx", "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/62d3a1a2d434424cb7b03ba27517648c/on-device_AI_agents_using_five_credible_.xlsx", "file_format": "xlsx", "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "file_size_bytes": 13964, "title": "on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional and sheet (XLSX)", "summary": "Autonomous research deliverable in XLSX format.", "metadat
+[2026-11-27 04:25:31 UTC] downloaded on-device_AI_agents_using_five_credible_.xlsx: 13964 bytes -> /home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/verify/on-device_AI_agents_using_five_credible_.xlsx
+[2026-11-27 04:25:32 UTC] XLSX read-back: sheets=['Executive Summary', 'Comparison & Metrics', 'Verified Claims', 'Sources & Provenance'] rows={'Executive Summary': 14, 'Comparison & Metrics': 5, 'Verified Claims': 23, 'Sources & Provenance': 12} domains=['arxiv.org']
+[2026-11-27 04:25:32 UTC] downloaded on-device_AI_agents_using_five_credible_.pdf: 202788 bytes -> /home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/verify/on-device_AI_agents_using_five_credible_.pdf
+[2026-11-27 04:25:32 UTC] PDF read-back: 8 page(s), 15622 chars, source domains in text: ['arxiv.org']
+[2026-11-27 04:25:32 UTC] package row present but unparsable: Expecting value: line 1 column 1 (char 0)
+[2026-11-27 04:25:32 UTC] == PHASE A done ==
+[2026-11-27 04:25:32 UTC] == PHASE B: NL daily 9 AM summary job ==
+[2026-11-27 04:25:37 UTC] task B settled in 5.0s: state=completed message=### 📅 Scheduled job created
+
+I'll run **Give me a summary of my watches and jobs at 9am** daily at 9:00 AM IST.
+
+• **Job ID:** `e28e78d4015c4ae2822c22411109ded8`
+• **Next run:** 28 Nov 2026, 9:00 AM IST
+• **Status:** Active
+
+Manage it in chat: `pause scheduled job e28e78d4`, `resume scheduled job e28e78d4`, or `cancel scheduled job e28e78d4`. The job keeps running even with the frontend closed, as
+[2026-11-27 04:25:37 UTC] job B: id=e28e78d4015c4ae2822c22411109ded8 schedule=30 3 * * * kind=cron next_run_ist=28 Nov 2026, 9:00 AM IST status=active
+[2026-11-27 04:25:37 UTC] job B objective: Give me a summary of my watches and jobs at 9am
+[2026-11-27 04:25:37 UTC] job B instruction: List my watches with their latest observations and list my scheduled jobs with their statuses and last outcomes, and present it as a short daily summary. Do not ask clarifying questions; if there are no watches or jobs, say so explicitly.
+[2026-11-27 04:25:37 UTC] run-now task: 64cf688f554a44b2b4ae56088f50c68b
+[2026-11-27 04:25:37 UTC] run-now settled in 0.0s: state=completed message=### 📅 Scheduled jobs
+
+• `e28e78d4` — List my watches with their latest observations and list my scheduled jobs with t — 30 3 * * * — active — next: 28 Nov 2026, 9:00 AM IST — last run: —
+[2026-11-27 04:25:40 UTC] job B after run-now: last_outcome=completed last_run_ist=27 Nov 2026, 9:55 AM IST last_task_id=64cf688f554a44b2b4ae56088f50c68b summary=Completed. ### 📅 Scheduled jobs  • `e28e78d4` — List my watches with their latest observations and list my scheduled jobs with t — 30 3 * * * — active — next: 28 Nov 2026, 9:00 AM IST — last run: —
+[2026-11-27 04:25:40 UTC] unread events for job B: [{"id": "2402b87c-7b81-4f0f-80c8-31d622c8307c", "kind": "scheduled_completed", "title": "Scheduled job completed", "summary": "Scheduled job completed: Give me a summary of my watches and jobs at 9am. Completed. ### \ud83d\udcc5 Scheduled jobs  \u2022 `e28e78d4` \u2014 List my watches with their latest observations and list my scheduled jobs with t \u2014 30 3 * * * \u2014 active \u2014 next: 28 Nov 2026, 9:00 AM IST \u2014 last run: \u2014", "diff_data": {"task_id": "64cf688f554a44b2b4ae56088f50c68b", "outcome": "completed", "artifacts": []}, "created_at": 1795753537.66896, "delivered_at": null, "acknowledged": 0, "mission_id": "e28e78d4015c4ae2822c22411109ded8", "task_id": null, "notification_sent": 0, "state_hash": ""}]
+[2026-11-27 04:25:40 UTC] == PHASE B done ==
+[2026-11-27 04:25:40 UTC] == PHASE C: real 1-minute scheduled research (NL, backend-only, natural run) ==
+[2026-11-27 04:25:45 UTC] schedule-creation task settled in 5.0s: state=completed message=Scheduled (once, in 1 minutes) — job `f216768216944b6aa5c74e70506720fc`: 'research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations'.
+Next run: 27 Nov 2026 09:56 IST (IST, UTC+5:30).
+Pause, resume or cancel it from the Control Center (job `f216768216944b6aa5c74e70506720fc`), or tell me 'pause job f216768216944b6aa5c74e70506720fc'.
+[2026-11-27 04:25:45 UTC] job C: id=f216768216944b6aa5c74e70506720fc schedule=in 1 minutes kind=once next_run_ist=27 Nov 2026, 9:56 AM IST status=active
+[2026-11-27 04:25:45 UTC] job C objective: research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations
+[2026-11-27 04:25:45 UTC] frontend state: NO frontend process running (backend-only by construction); waiting for the natural scheduled run...
+[2026-11-27 04:27:54 UTC] job C outcome arrived after 128.3s: last_outcome=completed last_run_ist=27 Nov 2026, 9:57 AM IST last_task_id=a8dde5222a31483799a8245b8f0afd30 summary=Completed; produced 2 artifact(s): on-device_AI_agents_using_five_credible_.xlsx, on-device_AI_agents_using_five_credible_.pdf. artifacts=[{"artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_xlsx", "filename": "on-device_AI_agents_using_five_credible_.xlsx", "file_format": "xlsx", "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/a8dde5222a31483799a8245b8f0afd30/on-device_AI_agents_using_five_credible_.xlsx", "file_size_bytes": 14124}, {"artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_pdf", "filename": "on-device_AI_agents_using_five_credible_.pdf", "file_format": "pdf", "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifa
+[2026-11-27 04:27:54 UTC] scheduled run task: {"state": "completed", "stepsDone": 26, "intent": "RESEARCH_TASK", "route": {"via": "http_research", "planner_calls": 2, "steps": 26, "sources_accepted": 9, "sources_rejected": 6, "synthesis_path": "provider"}, "message": "## Architecture\nThe evidence describes three distinct architectural approaches to on-device AI agents. Agent-X is a software-only, accuracy-preserving framework that accelerates both the prefill and decode stages of on-device agent workloads, and is described as seamlessly integrable into existing on-device AI agents [1, 8]. A second approach, Division-of-Thoughts (DoT), is a collaborative reasoning framework that leverages the synergy between locally deployed Smaller-scale Language Models (SLMs) and cloud-based LLMs [2]; to boost the adapter's task allocation capabilit
+[2026-11-27 04:27:54 UTC] scheduled-run artifacts: [{"artifact_id": "art_a8dde5222a31483799a8245b8f0afd30_xlsx", "task_id": "a8dde5222a31483799a8245b8f0afd30", "conversation_id": "default", "filename": "on-device_AI_agents_using_five_credible_.xlsx", "filepath": "/home/hatch/workspace/navigator-audit/worktrees3/stream-B/live/backend-copy/data/artifacts/a8dde5222a31483799a8245b8f0afd30/on-device_AI_agents_using_five_credible_.xlsx", "file_format": "xlsx", "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "file_size_bytes": 14124, "title": "on-device AI agents using five credible academic or official sources. Comp
+[2026-11-27 04:27:54 UTC] downloaded scheduled on-device_AI_agents_using_five_credible_.xlsx: 14124 bytes
+[2026-11-27 04:27:54 UTC] scheduled XLSX read-back: {'sheets': ['Executive Summary', 'Comparison & Metrics', 'Verified Claims', 'Sources & Provenance'], 'rows_per_sheet': {'Executive Summary': 14, 'Comparison & Metrics': 5, 'Verified Claims': 23, 'Sources & Provenance': 13}}
+[2026-11-27 04:27:54 UTC] downloaded scheduled on-device_AI_agents_using_five_credible_.pdf: 203278 bytes
+[2026-11-27 04:27:54 UTC] scheduled PDF read-back: 8 page(s), 16376 chars
+[2026-11-27 04:27:54 UTC] reconnect pull: unread events for job C: [{"id": "56a0f905-fa24-4233-ab03-d1133d5dcc87", "kind": "scheduled_completed", "title": "Scheduled job completed", "summary": "Scheduled job completed: research on-device AI agents using five credible academic or official sources. Compare their architecture, performance, privacy and limitations. Generate a professional PDF report and Excel comparison sheet with citations. Completed; produced 2 artifact(s): on-device_AI_agents_using_five_credible_.xlsx, on-device_AI_agents_using_five_credible_.pdf.", "diff_data": {"task_id": "a8dde5222a31483799a8245b8f0afd30", "outcome": "completed", "artifacts": ["on-device_AI_agents_using_five_credible_.xlsx", "on-device_AI_agents_using_five_credible_.pdf"]}, "created_at": 1795753674.0643632, "delivered_at": null, "acknowledged": 0, "mission_id": "f216768216944b6aa5c74e70506720fc", "task_id": null, "notification_sent": 0, "state_hash": ""}]
+[2026-11-27 04:27:54 UTC] ack first notification: HTTP 200 -> {"ok": true}
+[2026-11-27 04:27:54 UTC] == PHASE C done ==
+[2026-11-27 04:27:54 UTC] == PHASE D: one-off + pause/resume/cancel cycle ==
+[2026-11-27 04:27:54 UTC] job D created: id=e88663d5243a47aa85048ec803603c3c next_run_at=1795753734.4456062
+[2026-11-27 04:27:54 UTC] job D paused: status=paused
+[2026-11-27 04:27:54 UTC] waiting 75s past the due time while paused...
+[2026-11-27 04:29:09 UTC] job D while paused: status=paused last_run_at=None last_outcome=None
+[2026-11-27 04:29:09 UTC] job D resumed
+[2026-11-27 04:29:19 UTC] job D after resume: outcome=completed after 10.2s summary=Completed. Hey! 👋 Good to see you — but I've got to be straight with you: **the actual task didn't come through.** Your message has the instruction ("execute directly, don't ask questions") but no payload tellin
+[2026-11-27 04:29:20 UTC] job E created then cancelled: id=44513c262b6e4cb7b95de13490bd17e0 status=cancelled
+[2026-11-27 04:29:20 UTC] waiting 75s past the due time while cancelled...
+[2026-11-27 04:30:35 UTC] job E after due: status=cancelled last_run_at=None last_outcome=None
+[2026-11-27 04:30:35 UTC] == PHASE D done ==
+[2026-11-27 04:30:35 UTC] ALL PHASES DONE — evidence in b-evidence.json

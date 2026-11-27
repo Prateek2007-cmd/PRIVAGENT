@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo Mail &amp; Calendar — Sandbox</title>
+<style>
+  :root { --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; --bg:#f8fafc; --card:#ffffff;
+          --accent:#0f766e; --accent-soft:#ccfbf1; --amber:#b45309; --amber-soft:#fef3c7; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header.banner { background:#fef3c7; border-bottom:1px solid #fcd34d; padding:8px 16px; font-size:14px; color:#92400e; }
+  header.banner strong { color:#78350f; }
+  .topbar { display:flex; gap:16px; align-items:center; padding:12px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  .topbar h1 { font-size:18px; margin:0; }
+  .topbar h1 span { color:var(--accent); }
+  .topbar .account { margin-left:auto; font-size:13px; color:var(--muted); }
+  nav.tabs { display:flex; gap:4px; padding:8px 16px 0; }
+  nav.tabs button { border:1px solid var(--line); border-bottom:none; background:#eef2f7; padding:8px 14px; border-radius:8px 8px 0 0; cursor:pointer; font-size:14px; }
+  nav.tabs button[aria-selected="true"] { background:var(--card); font-weight:600; color:var(--accent); }
+  main { max-width:960px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:12px; }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  input[type="search"], input[type="text"], input[type="datetime-local"], textarea { border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:14px; width:100%; }
+  textarea { min-height:120px; resize:vertical; }
+  button.primary { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:8px 14px; cursor:pointer; font-size:14px; }
+  button.ghost { background:#fff; border:1px solid var(--line); border-radius:8px; padding:8px 14px; cursor:pointer; font-size:14px; }
+  button:disabled { opacity:.55; cursor:wait; }
+  label { font-size:13px; color:var(--muted); display:block; margin:10px 0 4px; }
+  ul.msglist { list-style:none; margin:0; padding:0; }
+  ul.msglist li { border-bottom:1px solid var(--line); padding:12px 4px; cursor:pointer; }
+  ul.msglist li:hover { background:#f0fdfa; }
+  ul.msglist li.unread { font-weight:600; }
+  .meta { font-size:12px; color:var(--muted); font-weight:400; }
+  .badge { display:inline-block; font-size:11px; font-weight:600; border-radius:999px; padding:2px 8px; margin-left:6px; }
+  .badge.unread { background:#dbeafe; color:#1e40af; }
+  .badge.deadline { background:var(--amber-soft); color:var(--amber); }
+  .badge.draft { background:#e0e7ff; color:#3730a3; }
+  .badge.pending { background:var(--amber-soft); color:var(--amber); }
+  .badge.accepted, .badge.confirmed { background:#dcfce7; color:#166534; }
+  .badge.declined, .badge.cancelled { background:#fee2e2; color:#991b1b; }
+  .badge.tentative { background:#f3f4f6; color:#4b5563; }
+  #status { font-size:13px; margin:8px 0; min-height:18px; }
+  #status.loading { color:var(--accent); }
+  #status.error { color:#b91c1c; }
+  .empty { color:var(--muted); font-size:14px; padding:16px 4px; }
+  .msgbody { white-space:pre-wrap; font-size:14px; line-height:1.6; margin-top:12px; }
+  .thread-msg { border-left:3px solid var(--accent-soft); padding-left:12px; margin:12px 0; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:640px){ .grid { grid-template-columns:1fr; } }
+  footer { text-align:center; font-size:12px; color:var(--muted); padding:16px; }
+  .hint { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header class="banner" data-testid="sandbox-banner">
+  <strong>Demo Sandbox — not the real site.</strong>
+  All messages, events and amounts are synthetic test data from <code>@demo.test</code> senders.
+  Nothing here is real mail or a real calendar. Drafts are stored only and are never sent.
+</header>
+<div class="topbar">
+  <h1>Demo Mail <span>&amp;</span> Calendar</h1>
+  <div class="account" data-testid="account-label">Not signed in</div>
+</div>
+<nav class="tabs" role="tablist" aria-label="Mailbox sections">
+  <button role="tab" data-testid="tab-inbox" data-view="inbox" aria-selected="true">Inbox</button>
+  <button role="tab" data-testid="tab-drafts" data-view="drafts" aria-selected="false">Drafts</button>
+  <button role="tab" data-testid="tab-calendar" data-view="calendar" aria-selected="false">Calendar</button>
+  <button role="tab" data-testid="tab-invitations" data-view="invitations" aria-selected="false">Invitations</button>
+</nav>
+<main>
+  <div id="status" role="status" aria-live="polite"></div>
+
+  <section id="view-login" class="card" data-testid="login-card">
+    <h2>Demo sign-in</h2>
+    <p>Test account: <code>demo@demo.test</code>. Any non-empty password works — this is a demo only.</p>
+    <label for="login-email">Email</label>
+    <input type="text" id="login-email" data-testid="login-email" value="demo@demo.test">
+    <label for="login-password">Password</label>
+    <input type="text" id="login-password" data-testid="login-password" value="demo-password" autocomplete="off">
+    <p><button class="primary" id="login-btn" data-testid="login-button">Sign in to demo mailbox</button></p>
+    <p class="hint">The demo token is kept in memory for this page only. Real Gmail/Calendar are not connected.</p>
+  </section>
+
+  <section id="view-inbox" class="card" hidden data-testid="inbox-view">
+    <div class="toolbar">
+      <input type="search" id="search" data-testid="search-box" placeholder="Search messages…" aria-label="Search messages" style="flex:2; min-width:200px">
+      <button class="ghost" id="search-btn" data-testid="search-button">Search</button>
+      <button class="ghost" id="unread-btn" data-testid="unread-filter" aria-pressed="false">Unread only</button>
+      <button class="ghost" id="refresh-btn" data-testid="refresh-button">Refresh</button>
+    </div>
+    <p class="hint" data-testid="inbox-count"></p>
+    <ul class="msglist" id="msglist" data-testid="message-list"></ul>
+    <div id="msgdetail" data-testid="message-detail"></div>
+  </section>
+
+  <section id="view-drafts" class="card" hidden data-testid="drafts-view">
+    <h2>Drafts <span class="badge draft">never sent</span></h2>
+    <p class="hint">Drafts are stored in the sandbox database only. There is no send button and no send endpoint.</p>
+    <ul class="msglist" id="draftlist" data-testid="draft-list"></ul>
+    <h3>New draft</h3>
+    <label for="draft-to">To</label>
+    <input type="text" id="draft-to" data-testid="draft-to" value="mentor@demo.test">
+    <label for="draft-subject">Subject</label>
+    <input type="text" id="draft-subject" data-testid="draft-subject" placeholder="Subject">
+    <label for="draft-body">Body</label>
+    <textarea id="draft-body" data-testid="draft-body" placeholder="Write a test draft…"></textarea>
+    <p><button class="primary" id="draft-save" data-testid="draft-save-button">Save draft</button></p>
+  </section>
+
+  <section id="view-calendar" class="card" hidden data-testid="calendar-view">
+    <h2>Calendar</h2>
+    <ul class="msglist" id="eventlist" data-testid="event-list"></ul>
+    <h3>New event</h3>
+    <div class="grid">
+      <div><label for="event-title">Title</label><input type="text" id="event-title" data-testid="event-title" placeholder="Test event title"></div>
+      <div><label for="event-location">Location</label><input type="text" id="event-location" data-testid="event-location" placeholder="Demo Room 1"></div>
+      <div><label for="event-start">Start</label><input type="datetime-local" id="event-start" data-testid="event-start"></div>
+      <div><label for="event-end">End</label><input type="datetime-local" id="event-end" data-testid="event-end"></div>
+    </div>
+    <label for="event-desc">Description</label>
+    <textarea id="event-desc" data-testid="event-desc" placeholder="Test description…"></textarea>
+    <p><button class="primary" id="event-save" data-testid="event-save-button">Create event</button></p>
+  </section>
+
+  <section id="view-invitations" class="card" hidden data-testid="invitations-view">
+    <h2>Invitations</h2>
+    <p class="hint">Accepting adds the event to your demo calendar; declining cancels it. The change persists in the sandbox database.</p>
+    <ul class="msglist" id="invlist" data-testid="invitation-list"></ul>
+  </section>
+</main>
+<footer>MailCal Demo Sandbox · synthetic data only · port 8126 · no real email is sent or read here</footer>
+
+<script>
+let token = null, account = null, unreadOnly = false, currentView = "inbox";
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+function setStatus(msg, kind) { statusEl.textContent = msg; statusEl.className = kind || ""; }
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json", ...(opts.headers || {}) } });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON (download) */ }
+  if (!res.ok) throw new Error((data && data.detail) || ("HTTP " + res.status));
+  return data;
+}
+function showView(name) {
+  currentView = name;
+  for (const v of ["inbox","drafts","calendar","invitations"]) $("view-" + v).hidden = v !== name;
+  document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.view === name)));
+  if (name === "inbox") loadInbox();
+  if (name === "drafts") loadDrafts();
+  if (name === "calendar") loadEvents();
+  if (name === "invitations") loadInvitations();
+}
+document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
+
+$("login-btn").addEventListener("click", async () => {
+  setStatus("Signing in…", "loading"); $("login-btn").disabled = true;
+  try {
+    const res = await fetch("/api/v1/auth/login", { method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ email: $("login-email").value, password: $("login-password").value }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    token = data.token; account = data.account;
+    document.querySelector('[data-testid="account-label"]').textContent = "Signed in as " + account + " (demo)";
+    $("view-login").hidden = true; $("view-inbox").hidden = false;
+    setStatus("Signed in to the demo mailbox.", "");
+    loadInbox();
+  } catch (e) { setStatus("Sign-in failed: " + e.message, "error"); }
+  finally { $("login-btn").disabled = false; }
+});
+
+async function loadInbox() {
+  setStatus("Loading inbox…", "loading");
+  try {
+    const q = $("search").value.trim();
+    const params = new URLSearchParams({ limit: "50" });
+    if (unreadOnly) params.set("unread", "true");
+    if (q) params.set("q", q);
+    const data = await api("/api/v1/messages?" + params);
+    setStatus("", "");
+    $('[data-testid="inbox-count"]').textContent = data.total + " messages · " + data.unread_count + " unread (synthetic test data)";
+    const list = $("msglist"); list.innerHTML = "";
+    if (!data.messages.length) { list.innerHTML = '<li class="empty">No messages match. Try clearing the search.</li>'; return; }
+    for (const m of data.messages) {
+      const li = document.createElement("li");
+      li.className = m.is_read ? "" : "unread";
+      li.dataset.testid = "message-" + m.id;
+      li.innerHTML = '<span data-testid="message-subject">' + esc(m.subject) + '</span>' +
+        (m.is_read ? "" : '<span class="badge unread">unread</span>') +
+        (m.deadline ? '<span class="badge deadline">deadline ' + esc(m.deadline) + ' (' + esc(m.deadline_kind || "") + ')</span>' : "") +
+        '<br><span class="meta">' + esc(m.sender_name) + ' &lt;' + esc(m.from) + '&gt; · ' + esc(m.received_at) + '</span>' +
+        '<br><span class="meta">' + esc(m.snippet) + '</span>';
+      li.addEventListener("click", () => openMessage(m.id));
+      list.appendChild(li);
+    }
+  } catch (e) { setStatus("Could not load inbox: " + e.message, "error"); }
+}
+async function openMessage(id) {
+  setStatus("Loading message…", "loading");
+  try {
+    const data = await api("/api/v1/messages/" + encodeURIComponent(id));
+    const m = data.message;
+    const thread = await api("/api/v1/threads/" + encodeURIComponent(m.thread_id));
+    let html = '<h3 data-testid="detail-subject">' + esc(m.subject) + '</h3>' +
+      '<p class="meta">From ' + esc(m.sender_name) + ' &lt;' + esc(m.from) + '&gt; · ' + esc(m.received_at) +
+      (m.deadline ? ' · <span class="badge deadline">deadline ' + esc(m.deadline) + ' (' + esc(m.deadline_kind || "") + ')</span>' : "") + '</p>' +
+      '<p class="meta">Thread ' + esc(m.thread_id) + ' · ' + thread.messages.length + ' message(s)</p>';
+    for (const tm of thread.messages) {
+      html += '<div class="thread-msg"><p class="meta">' + esc(tm.sender_name) + ' · ' + esc(tm.received_at) + '</p><div class="msgbody">' + esc(tm.body) + '</div></div>';
+    }
+    if (m.attachments && m.attachments.length) {
+      html += '<h4>Attachments</h4><ul>';
+      for (const a of m.attachments) {
+        html += '<li><button class="ghost" data-testid="attachment-' + esc(a.id) + '" data-att="' + esc(a.id) + '">' + esc(a.filename) + '</button> <span class="meta">(' + esc(a.mime) + ', synthetic text file)</span></li>';
+      }
+      html += '</ul>';
+    }
+    html += '<p><button class="ghost" data-testid="mark-read-button">Mark as read</button></p>';
+    $("msgdetail").innerHTML = html;
+    setStatus("", "");
+    // Attachment downloads need the Bearer token, so fetch with auth and
+    // trigger a blob download instead of a plain <a href>.
+    document.querySelectorAll('#msgdetail [data-att]').forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          const res = await fetch("/api/v1/messages/" + encodeURIComponent(m.id) + "/attachments/" + encodeURIComponent(btn.dataset.att) + "/download",
+            { headers: { "Authorization": "Bearer " + token } });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const blob = await res.blob();
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob); a.download = btn.textContent.trim();
+          document.body.appendChild(a); a.click(); a.remove();
+          setStatus("Downloaded " + btn.textContent.trim() + " (synthetic test file).", "");
+        } catch (e) { setStatus("Download failed: " + e.message, "error"); }
+      });
+    });
+    document.querySelector('[data-testid="mark-read-button"]').addEventListener("click", async () => {
+      try { await api("/api/v1/messages/" + encodeURIComponent(id) + "/read", { method: "POST" }); setStatus("Marked as read.", ""); loadInbox(); }
+      catch (e) { setStatus("Could not mark as read: " + e.message, "error"); }
+    });
+  } catch (e) { setStatus("Could not open message: " + e.message, "error"); }
+}
+$("search-btn").addEventListener("click", loadInbox);
+$("search").addEventListener("keydown", (e) => { if (e.key === "Enter") loadInbox(); });
+$("refresh-btn").addEventListener("click", loadInbox);
+$("unread-btn").addEventListener("click", () => { unreadOnly = !unreadOnly; $("unread-btn").setAttribute("aria-pressed", String(unreadOnly)); loadInbox(); });
+
+async function loadDrafts() {
+  setStatus("Loading drafts…", "loading");
+  try {
+    const data = await api("/api/v1/drafts");
+    setStatus("", "");
+    const list = $("draftlist"); list.innerHTML = "";
+    if (!data.drafts.length) { list.innerHTML = '<li class="empty">No drafts yet.</li>'; return; }
+    for (const d of data.drafts) {
+      const li = document.createElement("li");
+      li.innerHTML = '<span data-testid="draft-subject">' + esc(d.subject) + '</span> <span class="badge draft">draft — never sent</span>' +
+        '<br><span class="meta">To ' + esc(d.to) + ' · updated ' + esc(d.updated_at) + '</span>' +
+        '<br><span class="meta">' + esc(d.body.slice(0, 120)) + '</span>';
+      list.appendChild(li);
+    }
+  } catch (e) { setStatus("Could not load drafts: " + e.message, "error"); }
+}
+$("draft-save").addEventListener("click", async () => {
+  setStatus("Saving draft…", "loading");
+  try {
+    await api("/api/v1/drafts", { method: "POST", body: JSON.stringify({ to: $("draft-to").value, subject: $("draft-subject").value, body: $("draft-body").value }) });
+    setStatus("Draft saved. It was NOT sent — this sandbox cannot send mail.", "");
+    $("draft-subject").value = ""; $("draft-body").value = ""; loadDrafts();
+  } catch (e) { setStatus("Could not save draft: " + e.message, "error"); }
+});
+
+async function loadEvents() {
+  setStatus("Loading calendar…", "loading");
+  try {
+    const data = await api("/api/v1/events");
+    setStatus("", "");
+    const list = $("eventlist"); list.innerHTML = "";
+    if (!data.events.length) { list.innerHTML = '<li class="empty">No events.</li>'; return; }
+    for (const ev of data.events) {
+      const li = document.createElement("li");
+      li.innerHTML = '<span data-testid="event-title">' + esc(ev.title) + '</span> <span class="badge ' + esc(ev.status) + '">' + esc(ev.status) + '</span>' +
+        '<br><span class="meta">' + esc(ev.start) + ' → ' + esc(ev.end) + (ev.location ? ' · ' + esc(ev.location) : "") + '</span>' +
+        (ev.description ? '<br><span class="meta">' + esc(ev.description) + '</span>' : "");
+      list.appendChild(li);
+    }
+  } catch (e) { setStatus("Could not load calendar: " + e.message, "error"); }
+}
+$("event-save").addEventListener("click", async () => {
+  setStatus("Creating event…", "loading");
+  try {
+    const start = $("event-start").value, end = $("event-end").value;
+    await api("/api/v1/events", { method: "POST", body: JSON.stringify({ title: $("event-title").value,
+      start: start ? start + ":00+05:30" : "", end: end ? end + ":00+05:30" : "",
+      location: $("event-location").value, description: $("event-desc").value }) });
+    setStatus("Event created on the demo calendar.", "");
+    $("event-title").value = ""; $("event-location").value = ""; $("event-desc").value = ""; loadEvents();
+  } catch (e) { setStatus("Could not create event: " + e.message, "error"); }
+});
+
+async function loadInvitations() {
+  setStatus("Loading invitations…", "loading");
+  try {
+    const data = await api("/api/v1/invitations");
+    setStatus("", "");
+    const list = $("invlist"); list.innerHTML = "";
+    if (!data.invitations.length) { list.innerHTML = '<li class="empty">No invitations.</li>'; return; }
+    for (const inv of data.invitations) {
+      const li = document.createElement("li");
+      li.innerHTML = '<span data-testid="invitation-title">' + esc(inv.title) + '</span> <span class="badge ' + esc(inv.status) + '">' + esc(inv.status) + '</span>' +
+        '<br><span class="meta">From ' + esc(inv.from) + ' · ' + esc(inv.start) + ' → ' + esc(inv.end) + (inv.location ? ' · ' + esc(inv.location) : "") + '</span>';
+      if (inv.status === "pending") {
+        const acc = document.createElement("button"); acc.className = "primary"; acc.textContent = "Accept";
+        acc.dataset.testid = "accept-" + inv.id;
+        const dec = document.createElement("button"); dec.className = "ghost"; dec.textContent = "Decline";
+        dec.dataset.testid = "decline-" + inv.id;
+        acc.addEventListener("click", () => respond(inv.id, "accepted"));
+        dec.addEventListener("click", () => respond(inv.id, "declined"));
+        li.appendChild(document.createElement("br")); li.appendChild(acc); li.appendChild(document.createTextNode(" ")); li.appendChild(dec);
+      }
+      list.appendChild(li);
+    }
+  } catch (e) { setStatus("Could not load invitations: " + e.message, "error"); }
+}
+async function respond(id, status) {
+  setStatus("Updating invitation…", "loading");
+  try {
+    await api("/api/v1/invitations/" + encodeURIComponent(id) + "/respond", { method: "POST", body: JSON.stringify({ status }) });
+    setStatus("Invitation " + status + ". Calendar updated.", ""); loadInvitations();
+  } catch (e) { setStatus("Could not update invitation: " + e.message, "error"); }
+}
+</script>
+</body>
+</html>

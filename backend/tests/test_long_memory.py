@@ -222,8 +222,13 @@ def test_propose_from_task_uses_operator_words_and_verified_steps(tmp_path):
 def test_confirm_proposals_stores_only_accepted(tmp_path):
     path = str(tmp_path / "lm.db")
     db.init_db(path)
+    # Stream D: the checkpoint carries final_state="completed" — the
+    # marker the loop writes for a finished run — so the skill
+    # proposal's source task counts as verified (see
+    # create_executable_skill's save gate).
     db.save_task_checkpoint(task_id="task-1", conversation_id="c1", session_id=None,
-                            step_index=2, last_url="", history=[], working_memory={}, db_path=path)
+                            step_index=2, last_url="", history=[],
+                            working_memory={"final_state": "completed"}, db_path=path)
     proposals = propose_from_task("task-1", "I prefer window seats. Book a flight to Goa",
                                   "done", _history_with_success())
     save_proposals("task-1", proposals, db_path=path)

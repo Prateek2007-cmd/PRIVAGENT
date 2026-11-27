@@ -1,0 +1,66 @@
+{
+  "suite": "mock_benchmark",
+  "mode": "deterministic_fixture",
+  "note": "Mock fixtures only, explicitly NOT live autonomy metrics.",
+  "passed": 8,
+  "total": 8,
+  "average_fixture_duration_ms": 171.58,
+  "scenarios": [
+    {
+      "scenario": "Google search fixture",
+      "passed": true,
+      "duration_ms": 382.92,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Search and comparison fixture",
+      "passed": true,
+      "duration_ms": 158.72,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Zoom fixture",
+      "passed": true,
+      "duration_ms": 155.52,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Multi-tab fixture",
+      "passed": true,
+      "duration_ms": 207.66,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Form fixture",
+      "passed": true,
+      "duration_ms": 167.95,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Dynamic recovery fixture",
+      "passed": true,
+      "duration_ms": 130.43,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Privacy fixture",
+      "passed": true,
+      "duration_ms": 2.34,
+      "error": null,
+      "mode": "deterministic_fixture"
+    },
+    {
+      "scenario": "Approval fixture",
+      "passed": true,
+      "duration_ms": 167.08,
+      "error": null,
+      "mode": "deterministic_fixture"
+    }
+  ]
+}

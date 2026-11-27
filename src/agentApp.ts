@@ -374,7 +374,10 @@ function initWorkspaceElements(): void {
           // Unconditional: a screenshot-less task must clear the frame
           // rather than keep the previous chat's image.
           updateVisualFrame(t.screenshot ?? null, t.message || "", t.taskState);
-          if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+          // Stream D: "blocked" is terminal too — a run stopped on a
+          // missing dependency must render its completion, not poll
+          // forever as if it were still working.
+          if (["completed", "failed", "cancelled", "blocked"].includes(t.taskState)) {
             stopFallbackPolling();
             renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
             loadChatList();
@@ -559,6 +562,12 @@ function setTaskState(state: string): void {
   } else if (state === "awaiting_takeover") {
     // Task 4: takeover is not an error — terracotta amber, distinct
     // from the confirmation gate's default styling.
+    stateBadge.style.color = "var(--gate)";
+    stateBadge.style.background = "var(--gate-soft)";
+  } else if (state === "blocked") {
+    // Stream D: blocked is not failed — a missing dependency (e.g.
+    // the Chrome extension is not connected), not an error in the
+    // task itself. Amber like takeover, not danger red.
     stateBadge.style.color = "var(--gate)";
     stateBadge.style.background = "var(--gate-soft)";
   } else if (["failed", "cancelled"].includes(state)) {
@@ -971,21 +980,60 @@ function stripWatchMarker(message: string): { text: string; watchId: string | nu
   return { text: (message || "").replace(WATCH_MARKER_RE, "").replace(/\n{3,}/g, "\n\n").trim(), watchId: match[1] };
 }
 
-async function fetchWatch(missionId: string): Promise<{ id: string; title: string; status: string; condition_type?: string; target_url?: string } | null> {
+interface WatchDetail {
+  id: string;
+  title: string;
+  status: string;
+  target_url?: string;
+  trigger_type?: string;
+  interval_seconds?: number;
+  schedule_cron?: string | null;
+  condition_type?: string;
+  condition_params?: Record<string, unknown>;
+  next_run_at?: number | null;
+  next_run_ist?: string | null;
+  last_run_ist?: string | null;
+  last_alert_ist?: string | null;
+  consecutive_failures?: number;
+  baseline?: { text?: string; price?: number | null };
+  latest?: { text?: string; price?: number | null; elements?: string[] };
+  events?: Array<{ title?: string; summary?: string; detected_ist?: string }>;
+}
+
+async function fetchWatchDetail(missionId: string): Promise<WatchDetail | null> {
   try {
-    const res = await apiFetch(`${API}/api/control/missions`);
+    const res = await apiFetch(`${API}/api/monitoring/missions/${encodeURIComponent(missionId)}`);
     if (!res.ok) return null;
-    const missions = (await res.json()) as Array<{ id: string; title: string; status: string; condition_type?: string; target_url?: string }>;
-    return missions.find(m => m.id === missionId) || null;
+    return (await res.json()) as WatchDetail;
   } catch {
     return null;
+  }
+}
+
+function describeWatchCondition(mission: WatchDetail): string {
+  const params = mission.condition_params || {};
+  switch (mission.condition_type) {
+    case "below_price":
+      return `Alert when price falls below ₹${params.threshold ?? "?"}`;
+    case "price_drop":
+      return `Alert when price drops ${params.min_percent ?? 0}% or more`;
+    case "daily_price":
+      return "Daily price report";
+    case "new_listings":
+      return "Alert on new listings";
+    case "regex":
+      return `Alert when the page mentions '${params.pattern ?? ""}'`;
+    case "element":
+      return `Alert when '${params.name ?? ""}' appears`;
+    default:
+      return "Alert when the page content changes";
   }
 }
 
 async function hydrateWatchCard(card: HTMLElement): Promise<void> {
   const missionId = card.dataset.watchId;
   if (!missionId) return;
-  const mission = await fetchWatch(missionId);
+  const mission = await fetchWatchDetail(missionId);
   if (!mission) {
     card.querySelector<HTMLElement>(".watch-card__title")!.textContent = "Watch not found";
     card.querySelector<HTMLElement>(".watch-card__note")!.textContent = "This watch may have been cancelled already.";
@@ -1001,6 +1049,34 @@ async function hydrateWatchCard(card: HTMLElement): Promise<void> {
     pauseBtn.textContent = status === "active" ? "Pause" : "Resume";
   };
   applyStatus(mission.status);
+  // Stream C (task 6): the card shows source, condition, next check
+  // (IST), baseline + latest observation, and alert history — not
+  // just a status word. All times are IST, as the backend reports.
+  const detailsEl = card.querySelector<HTMLElement>(".watch-card__details");
+  if (detailsEl) {
+    const cadence = mission.trigger_type === "cron"
+      ? "Daily"
+      : mission.interval_seconds
+        ? `Every ${mission.interval_seconds >= 3600 ? `${mission.interval_seconds / 3600} hour${mission.interval_seconds >= 7200 ? "s" : ""}` : `${mission.interval_seconds / 60} minute${mission.interval_seconds >= 120 ? "s" : ""}`}`
+        : "—";
+    const baseline = mission.baseline?.price != null
+      ? `₹${escapeHtml(String(mission.baseline.price))}`
+      : (mission.baseline?.text ? escapeHtml(mission.baseline.text.slice(0, 120)) : "—");
+    const latest = mission.latest?.price != null
+      ? `₹${escapeHtml(String(mission.latest.price))}`
+      : (mission.latest?.text ? escapeHtml(mission.latest.text.slice(0, 120)) : "—");
+    const alertCount = (mission.events || []).length;
+    detailsEl.innerHTML = `
+      <dl class="watch-card__facts">
+        <div><dt>Source</dt><dd><a href="${escapeHtml(mission.target_url || "")}" target="_blank" rel="noreferrer">${escapeHtml(mission.target_url || "")}</a></dd></div>
+        <div><dt>Condition</dt><dd>${escapeHtml(describeWatchCondition(mission))}</dd></div>
+        <div><dt>Cadence</dt><dd>${escapeHtml(cadence)}</dd></div>
+        <div><dt>Next check</dt><dd>${escapeHtml(mission.status === "active" ? (mission.next_run_ist || "—") : "Paused")}</dd></div>
+        <div><dt>Baseline</dt><dd>${baseline}</dd></div>
+        <div><dt>Latest</dt><dd>${latest}</dd></div>
+        <div><dt>Alerts</dt><dd>${alertCount}${mission.last_alert_ist ? ` · last ${escapeHtml(mission.last_alert_ist)}` : ""}</dd></div>
+      </dl>`;
+  }
 }
 
 function isMessageInTimeline(message: string): boolean {
@@ -1056,6 +1132,7 @@ function addCompletionStepItem(taskState: string, message: string): void {
         </div>
         <div class="watch-card__body">
           <p class="watch-card__note">This watch lives in this conversation. I'll alert you here the moment anything changes.</p>
+          <div class="watch-card__details"></div>
         </div>
         <div class="watch-card__actions">
           <button type="button" class="watch-card__btn watch-card__btn--pause" data-watch-pause>Pause</button>
@@ -1139,7 +1216,7 @@ async function syncActiveTask(taskId: string): Promise<boolean> {
     }
     // Task 12: task timeline from the loop timings + history steps.
     renderTaskTimeline(t);
-    if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+    if (["completed", "failed", "cancelled", "blocked"].includes(t.taskState)) {
       renderCompletion(t.taskState, t.message || "", true, t.stepsDone);
       loadChatList();
       return true;
@@ -1216,8 +1293,7 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
 
     if (taskState === "completed") {
       resultCard.classList.remove("is-failed");
-      resultBadge.textContent = "✓ Mission Completed";
-      // The reply already lives in the timeline (the Mission Result
+      resultBadge.textContent = "✓ Mission Completed";      // The reply already lives in the timeline (the Mission Result
       // item addCompletionStepItem just added, or the progress step
       // that carried it): do not repeat it in the result card. The
       // card keeps the showcase + next moves; the reply appears once.
@@ -1225,7 +1301,11 @@ function renderCompletion(taskState: string, message: string, appendToTimeline =
       resultContent.innerHTML = formatResultHtml(message || "The autonomous task completed successfully.", showRaw);
     } else {
       resultCard.classList.add("is-failed");
-      resultBadge.textContent = "✗ Task Blocked / Incomplete";
+      // Stream D: a blocked run says so — it is a missing
+      // dependency, not a failure of the task itself.
+      resultBadge.textContent = taskState === "blocked"
+        ? "⛔ Blocked — dependency missing"
+        : "✗ Task Blocked / Incomplete";
       resultContent.innerHTML = `<div class="result-raw-text md-body">${renderMarkdown(stripWatchMarker(message).text || "Task stopped before completing all steps.")}</div>`;
     }
     resultCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1862,6 +1942,150 @@ document.addEventListener("click", event => {
 
 
 // ----------------------------------------------------
+// Stream C: monitor-alert delivery (R-01 / R-04)
+//
+// The backend broadcasts MISSION_EVENT_TRIGGERED when a watch fires,
+// but every consumer used to drop it (`if (env.type !== "PROGRESS")
+// return`). These helpers render a live alert (toast + timeline item
+// + watch-card refresh) and pull missed alerts on connect
+// (GET /api/monitoring/events?unread=true), with an unread badge
+// until each event is marked read. Times the backend sends are UTC;
+// the timeline shows them in the browser's local time with the
+// mission's IST next-check shown on the watch card itself.
+// ----------------------------------------------------
+
+const renderedAlertIds = new Set<string>();
+let alertBadgeEl: HTMLButtonElement | null = null;
+let alertToastEl: HTMLElement | null = null;
+let alertToastTimer: number | undefined;
+
+interface MonitorAlert {
+  id?: string;
+  event_id?: string;
+  kind?: string;
+  mission_id?: string | null;
+  title?: string;
+  message?: string;
+  summary?: string;
+  created_at?: number | string | null;
+  detected_at?: number | null;
+}
+
+function alertEventId(ev: MonitorAlert): string {
+  return ev.event_id || ev.id || `${ev.mission_id || "?"}-${ev.created_at || ""}-${ev.title || ""}`;
+}
+
+function alertEventText(ev: MonitorAlert): string {
+  return ev.message || ev.summary || "";
+}
+
+function alertEventTime(ev: MonitorAlert): string {
+  const raw = ev.created_at ?? ev.detected_at;
+  if (typeof raw === "number") return new Date(raw * 1000).toLocaleString();
+  if (typeof raw === "string") {
+    const d = new Date(raw);
+    return isNaN(d.getTime()) ? raw : d.toLocaleString();
+  }
+  return "";
+}
+
+function showAlertToast(title: string, message: string): void {
+  if (!alertToastEl) {
+    alertToastEl = document.createElement("div");
+    alertToastEl.id = "monitorAlertToast";
+    alertToastEl.setAttribute("role", "status");
+    alertToastEl.style.cssText = "position:fixed;right:16px;bottom:64px;z-index:9999;max-width:min(360px,90vw);padding:12px 14px;border-radius:10px;background:var(--accent-soft,#fff3e0);color:var(--text,#222);border:1px solid var(--accent,#e8590c);box-shadow:0 6px 24px rgba(0,0,0,.18);cursor:pointer;font-size:14px;line-height:1.4;";
+    alertToastEl.addEventListener("click", () => {
+      if (alertToastEl) alertToastEl.hidden = true;
+    });
+    document.body.appendChild(alertToastEl);
+  }
+  alertToastEl.innerHTML = `<strong>${escapeHtml(title || "Watch alert")}</strong><br>${escapeHtml(message || "")}`;
+  alertToastEl.hidden = false;
+  if (alertToastTimer !== undefined) window.clearTimeout(alertToastTimer);
+  alertToastTimer = window.setTimeout(() => {
+    if (alertToastEl) alertToastEl.hidden = true;
+  }, 10000);
+}
+
+function setUnreadBadge(count: number): void {
+  if (count <= 0) {
+    if (alertBadgeEl) alertBadgeEl.hidden = true;
+    return;
+  }
+  if (!alertBadgeEl) {
+    alertBadgeEl = document.createElement("button");
+    alertBadgeEl.id = "monitorAlertBadge";
+    alertBadgeEl.type = "button";
+    alertBadgeEl.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:9999;padding:8px 14px;border-radius:999px;background:var(--danger,#c92a2a);color:#fff;border:none;box-shadow:0 4px 16px rgba(0,0,0,.2);cursor:pointer;font-size:14px;font-weight:600;";
+    alertBadgeEl.addEventListener("click", async () => {
+      // The alerts were already rendered in the timeline by the pull;
+      // clicking the badge marks them read and clears the badge.
+      const ids = Array.from(renderedAlertIds);
+      await Promise.all(ids.map(id => markMonitorEventRead(id)));
+      renderedAlertIds.clear();
+      setUnreadBadge(0);
+    });
+    document.body.appendChild(alertBadgeEl);
+  }
+  alertBadgeEl.textContent = `🔔 ${count} unread alert${count === 1 ? "" : "s"}`;
+  alertBadgeEl.hidden = false;
+}
+
+async function markMonitorEventRead(eventId: string): Promise<void> {
+  try {
+    await apiFetch(`${API}/api/monitoring/events/${encodeURIComponent(eventId)}/read`, { method: "POST" });
+  } catch { /* offline — the badge recounts on the next pull */ }
+}
+
+function renderMonitorAlert(ev: MonitorAlert, opts?: { toast?: boolean; markRead?: boolean }): void {
+  const id = alertEventId(ev);
+  if (renderedAlertIds.has(id)) return;
+  renderedAlertIds.add(id);
+  const title = ev.title || (ev.kind === "scheduled_blocked" ? "Scheduled job blocked" : "Watch alert");
+  const text = alertEventText(ev);
+  const when = alertEventTime(ev);
+  if (stepsList) {
+    const placeholder = stepsList.querySelector(".agent-step-placeholder");
+    if (placeholder) placeholder.remove();
+    const li = document.createElement("li");
+    li.className = "agent-step-item agent-step-item--alert";
+    li.dataset.eventKey = `alert:${id}`;
+    li.innerHTML = `
+      <span class="agent-step-item__icon">🔔</span>
+      <div class="agent-step-item__text">
+        <div class="agent-step-item__label"><strong>${escapeHtml(title)}</strong>${when ? ` <span style="opacity:.7">· ${escapeHtml(when)}</span>` : ""}</div>
+        <div class="md-body">${escapeHtml(text)}</div>
+      </div>`;
+    stepsList.appendChild(li);
+    li.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+  // If the watch's card is on screen, refresh it so its details and
+  // alert history show the new event without a reload.
+  if (ev.mission_id) {
+    const card = document.querySelector<HTMLElement>(`.watch-card[data-watch-id="${CSS.escape(ev.mission_id)}"]`);
+    if (card) void hydrateWatchCard(card);
+  }
+  if (opts?.toast !== false) showAlertToast(title, text);
+  if (opts?.markRead && ev.id) void markMonitorEventRead(ev.id);
+  else if (opts?.markRead && ev.event_id) void markMonitorEventRead(ev.event_id);
+}
+
+async function pullMissedEvents(): Promise<void> {
+  try {
+    const res = await apiFetch(`${API}/api/monitoring/events?unread=true`);
+    if (!res.ok) return;
+    const data = (await res.json()) as { events?: MonitorAlert[]; unread?: number };
+    const events = data.events || [];
+    // No toast storm on reconnect: missed alerts render quietly in
+    // the timeline and the badge carries the count.
+    for (const ev of events) renderMonitorAlert(ev, { toast: false });
+    setUnreadBadge(typeof data.unread === "number" ? data.unread : events.length);
+  } catch { /* offline — the next reconnect retries */ }
+}
+
+
+// ----------------------------------------------------
 // WebSocket Client
 // ----------------------------------------------------
 
@@ -1887,6 +2111,10 @@ function connectWebSocket(): void {
 
   ws.onopen = () => {
     setConnectionStatus(true, "Online");
+    // Stream C (R-04): missed alerts are pulled on every connect —
+    // an alert generated while the frontend was closed shows up
+    // here without manual navigation.
+    void pullMissedEvents();
     if (currentTaskId && isWorking) {
       syncActiveTask(currentTaskId);
     }
@@ -1915,6 +2143,30 @@ function connectWebSocket(): void {
           takeover?: { kind?: string; reason?: string; url?: string } | null;
         };
       };
+      // Stream C (R-01): MISSION_EVENT_TRIGGERED used to arrive at
+      // the browser and be discarded by the line below. Handle it:
+      // toast + timeline alert + watch-card refresh. A scheduled job
+      // blocked on confirmation/takeover arrives as
+      // SCHEDULED_JOB_BLOCKED (same treatment). CONTROL_STATE
+      // refreshes watch cards and the unread badge.
+      if (env.type === "MISSION_EVENT_TRIGGERED" || env.type === "SCHEDULED_JOB_BLOCKED" || env.type === "NOTIFICATION") {
+        renderMonitorAlert({
+          id: (env as { event_id?: string }).event_id,
+          event_id: (env as { event_id?: string }).event_id,
+          kind: env.type === "MISSION_EVENT_TRIGGERED" ? "monitor" : "scheduled_blocked",
+          mission_id: (env as { mission_id?: string }).mission_id || (env as { payload?: { mission_id?: string } }).payload?.mission_id,
+          title: (env as { title?: string }).title || (env as { payload?: { title?: string } }).payload?.title,
+          message: (env as { message?: string }).message || (env as { payload?: { summary?: string } }).payload?.summary,
+          created_at: (env as { created_at?: string }).created_at,
+        }, { markRead: true });
+        return;
+      }
+      if (env.type === "CONTROL_STATE") {
+        const payload = (env as { payload?: { unread_alerts?: number } }).payload;
+        if (payload && typeof payload.unread_alerts === "number") setUnreadBadge(payload.unread_alerts);
+        document.querySelectorAll<HTMLElement>(".watch-card").forEach(card => void hydrateWatchCard(card));
+        return;
+      }
       if (env.type !== "PROGRESS") return;
       if (!currentTaskId || env.taskId !== currentTaskId) {
         if (activeChatId && env.payload.chatId === activeChatId) {
@@ -1946,7 +2198,7 @@ function connectWebSocket(): void {
         }
       }
 
-      if (["completed", "failed", "cancelled"].includes(p.taskState)) {
+      if (["completed", "failed", "cancelled", "blocked"].includes(p.taskState)) {
         stopFallbackPolling();
         renderCompletion(p.taskState, p.message, true, p.stepsDone);
         loadChatList();
@@ -1982,6 +2234,16 @@ function connectWebSocket(): void {
         }
       } else if (takeoverBanner && !takeoverBanner.hidden) {
         hideTakeover();
+      }
+
+      if (p.taskState === "awaiting_input") {
+        // Stream D: the task paused for one question (ask-user gate).
+        // The answer path is a reply in this chat — say so plainly,
+        // or the paused task looks stalled. The question itself
+        // arrives as the progress message step.
+        if (missionSubtext) {
+          missionSubtext.innerHTML = `<span style="color: var(--gate); font-weight: 500;">⏸ Waiting for your answer — reply in this chat to continue the same task.</span>`;
+        }
       }
     } catch {
       // non-JSON frame
@@ -2414,11 +2676,49 @@ async function initLlmSettings(): Promise<void> {
   await refreshLlmSettings();
 }
 
+// ---------------------------------------------------------------------------
+// Mock-provider banner (RC-1.5 / RC-LIVE-06). With no LLM key the whole
+// product runs on the canned mock provider; that must be unmissable in
+// the UI, never a silent default. The banner is created once, pinned
+// above the header, and shown whenever GET /api/llm/config reports
+// provider "mock" (keyConfigured false). Server-side switch:
+// PRIVAGENT_MOCK_PROVIDER_BANNER in backend/app/config.py (default on).
+// It is refreshed by refreshLlmSettings(), which runs at startup and
+// after every provider save — no other code path needs to touch it.
+// ---------------------------------------------------------------------------
+
+function refreshMockProviderBanner(cfg: LlmConfig): void {
+  const isMock = cfg.provider === "mock";
+  let banner = document.getElementById("mockProviderBanner");
+  if (!isMock) {
+    banner?.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "mockProviderBanner";
+    banner.setAttribute("role", "alert");
+    banner.textContent =
+      "MOCK PROVIDER — not real AI: answers are canned test responses. " +
+      "Configure a real provider in LLM settings before the demo — do not present mock output as AI.";
+    banner.style.cssText =
+      "background:#b91c1c;color:#fff;font-weight:700;text-align:center;" +
+      "padding:10px 16px;font-size:14px;line-height:1.4;position:relative;z-index:1000;";
+    const header = document.querySelector(".agent-header");
+    if (header && header.parentNode) {
+      header.parentNode.insertBefore(banner, header);
+    } else {
+      document.body.prepend(banner);
+    }
+  }
+}
+
 async function refreshLlmSettings(): Promise<void> {
   try {
     const res = await apiFetch(`${API}/api/llm/config`);
     if (!res.ok) return;
     const cfg = (await res.json()) as LlmConfig;
+    refreshMockProviderBanner(cfg);
     const providerSelect = $("llmProviderSelect") as HTMLSelectElement | null;
     if (providerSelect) {
       providerSelect.value = cfg.provider;

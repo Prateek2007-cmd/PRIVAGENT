@@ -86,9 +86,14 @@ def generate_chart_from_table(
             values.append(val)
 
     if not values:
-        # Fallback dummy single point if no numbers could be parsed
-        labels = [str(r[0])[:25] for r in table.rows[:5]]
-        values = [float(i + 1) for i in range(len(labels))]
+        # R4-8: refuse to chart when no numeric column parses. The old
+        # fallback plotted dummy values 1, 2, 3, ... under real row
+        # labels — fabricated data in a chart. Callers (loop_research)
+        # treat this as "no chart for this table", not as an error.
+        raise ValueError(
+            f"Refusing to chart table {table.title!r}: no numeric column "
+            "could be parsed, so chart values would be fabricated."
+        )
 
     # Limit to top 10 items for visual clarity
     if len(labels) > 10:

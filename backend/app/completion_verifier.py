@@ -308,10 +308,15 @@ def verify_navigation_destination(
             return True, f"Observed intended destination matching '{target_host}'."
         return False, f"Did not observe intended destination '{target_host}'. Visited: {visited_hosts or 'none'}."
 
-    # Direct URL navigation
+    # Direct URL navigation (integration fix, E defect D3): strip the
+    # port — urlsplit().hostname already excludes it for visited hosts,
+    # so a target like 127.0.0.1:8124 never matched visited 127.0.0.1
+    # and every sandbox loop task failed verification after 50 steps.
     url_m = re.search(r"https?://([^\s/]+)", text)
     if url_m:
-        raw_target = url_m.group(1).lower().replace("www.", "")
+        raw_target = (
+            urllib.parse.urlsplit(url_m.group(0)).hostname or ""
+        ).lower().replace("www.", "")
         if any(raw_target in vh for vh in visited_hosts):
             return True, f"Observed target host '{raw_target}'."
         return False, f"Did not observe target host '{raw_target}'. Visited: {visited_hosts or 'none'}."

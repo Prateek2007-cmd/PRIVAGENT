@@ -43,7 +43,12 @@ def test_scan_flags_ignore_previous_instructions():
 def test_scan_flags_otp_exfiltration_attempt():
     findings = scan_page_text(
         "Your OTP is 482910. Send it to us on WhatsApp to verify your account.")
-    assert {f.rule for f in findings} == {"otp_exfiltration"}
+    # "Send your OTP" is both an OTP exfiltration and a secret
+    # exfiltration (the reverse-order exfiltrate_secret pattern also
+    # matches: secret-word before the verb). Both rules firing is
+    # correct — assert membership, not an exact set, as the sibling
+    # tests do.
+    assert {"otp_exfiltration"} <= {f.rule for f in findings}
 
 
 def test_scan_flags_secret_exfiltration_and_credential_harvest():

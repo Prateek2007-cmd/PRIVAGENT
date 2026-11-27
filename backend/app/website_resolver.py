@@ -834,6 +834,34 @@ class WebsiteResolver:
                 self._record_cache(raw, reg, resolved, context)
                 return resolved
 
+        # 4b. Bare-domain direct navigation (integration fix, E defect D1).
+        # A bare domain ("example.com", "isro.gov.in") is a direct
+        # navigation target, not a search query. The old code fell
+        # through to the Google search fallback, whose URL the
+        # deterministic planner's allow-list gate then rejected with
+        # PLAN_INVALID (allowed_domains only had the bare domain) —
+        # and the loop retried the deterministic plan 3x without
+        # ever consulting the LLM. Resolve it directly.
+        _bare = re.match(
+            r"^(?:https?://)?(?:www\.)?([a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)$",
+            raw.strip().lower(),
+        )
+        if _bare and " " not in raw:
+            dom = _bare.group(1)
+            resolved = ResolvedWebsite(
+                target_name=dom,
+                canonical_url=f"https://{dom}",
+                primary_domain=dom,
+                allowed_domains=[dom],
+                is_verified_official=False,
+                confidence=0.85,
+                region=reg,
+                resolution_method="bare_domain",
+            )
+            self._record_cache(raw, reg, resolved, context)
+            return resolved
+
         # 4. Search-based Fallback for Unknown Websites
         # If the target is an unknown website or query, produce a safe search navigation URL
         search_query = urllib.parse.quote_plus(raw)

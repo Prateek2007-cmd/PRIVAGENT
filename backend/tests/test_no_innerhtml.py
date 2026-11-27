@@ -57,6 +57,11 @@ SAFE_IDENTIFIERS: dict[str, set[str]] = {
         "sizeStr",  # formatBytes() numeric string ("1.2 KB")
         "tabInfo", "childInfo",  # number-derived strings (" · Tab #3")
         "isOk",  # boolean
+        "alertCount",  # (mission.events || []).length — a number, not text
+        # Watch-card baseline/latest: built ONLY from escapeHtml(...)
+        # outputs and the constants "₹"/"—" — no unescaped API text
+        # reaches the markup (verified by reading the assignments).
+        "baseline", "latest",
     },
     "src/controlViews.ts": {
         "modeBadge", "metricsHtml", "controlsHtml", "subtabsHtml",

@@ -102,6 +102,51 @@ function broadcastCompanion(): void {
 }
 
 let progressSocket: WebSocket | null = null;
+
+// Stream D (CONTRACTS3 §3, RC-LIVE-03): the backend broadcasts
+// MISSION_EVENT_TRIGGERED (watch fired) — and NOTIFICATION /
+// SCHEDULED_JOB_BLOCKED (outbox rows) — to every /ws/client socket,
+// and this extension IS a client (connectProgress below). The old
+// onmessage handler only accepted PROGRESS and returned early on
+// anything else, so a fired watch never surfaced in the extension
+// at all: no badge, no stored event, nothing for the operator to
+// pull on reconnect. Surface it instead: persist the event in
+// session storage (capped list the companion drawer / dashboard can
+// read) and raise the action badge count. No `notifications`
+// permission is declared in the manifest, so no OS notification is
+// attempted — the badge + stored list is the surface. Best-effort
+// throughout: surfacing must never break the relay.
+const MISSION_EVENTS_STORAGE_KEY = "missionEvents";
+const MISSION_EVENTS_MAX = 20;
+
+async function surfaceMissionEvent(data: any): Promise<void> {
+  const title = typeof data?.title === "string" && data.title ? data.title : "Watch alert";
+  const message = typeof data?.message === "string" && data.message ? data.message : "";
+  const event = {
+    type: typeof data?.type === "string" ? data.type : "MISSION_EVENT_TRIGGERED",
+    title,
+    message,
+    eventId: typeof data?.event_id === "string" ? data.event_id : null,
+    missionId: typeof data?.mission_id === "string" ? data.mission_id : null,
+    createdAt: typeof data?.created_at === "string" ? data.created_at : new Date().toISOString(),
+  };
+  try {
+    const stored = await chrome.storage.session.get(MISSION_EVENTS_STORAGE_KEY);
+    const list = Array.isArray(stored?.[MISSION_EVENTS_STORAGE_KEY])
+      ? (stored[MISSION_EVENTS_STORAGE_KEY] as unknown[])
+      : [];
+    list.unshift(event);
+    const trimmed = list.slice(0, MISSION_EVENTS_MAX);
+    await chrome.storage.session.set({ [MISSION_EVENTS_STORAGE_KEY]: trimmed });
+    try {
+      chrome.action.setBadgeText({ text: trimmed.length > 0 ? String(Math.min(trimmed.length, 99)) : "" });
+    } catch { /* Badge is best-effort. */ }
+    try {
+      chrome.action.setBadgeBackgroundColor({ color: "#b3261e" });
+    } catch { /* Badge is best-effort. */ }
+  } catch { /* Surfacing must never break the relay. */ }
+}
+
 async function connectProgress(): Promise<void> {
   if (progressSocket && progressSocket.readyState <= WebSocket.OPEN) return;
   const token = await getBackendToken();
@@ -110,6 +155,12 @@ async function connectProgress(): Promise<void> {
   ws.onmessage = async event => {
     let data: any;
     try { data = JSON.parse(event.data); } catch { return; }
+    // Stream D: notification envelopes are not progress packets —
+    // surface them (badge + stored event) instead of dropping them.
+    if (data?.type === "MISSION_EVENT_TRIGGERED" || data?.type === "NOTIFICATION" || data?.type === "SCHEDULED_JOB_BLOCKED") {
+      await surfaceMissionEvent(data);
+      return;
+    }
     if (data?.type !== "PROGRESS" || typeof data.taskId !== "string") return;
     await restored;
     const packet = data.payload;

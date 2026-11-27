@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YatraDemo — Book Trains &amp; Buses | Demo Sandbox</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand" data-testid="brand">YatraDemo <span class="sandbox-badge">Demo Sandbox — not the real site</span></div>
+  <nav aria-label="Main">
+    <button id="loginBtn" class="btn ghost" data-testid="login-button">Sign in (demo)</button>
+    <span id="userChip" class="user-chip" hidden data-testid="user-chip"></span>
+  </nav>
+</header>
+
+<main class="wrap">
+  <p class="notice" role="note">Fictional demo data only. No real tickets, no real payment — checkout prepares a booking and stops before charging.</p>
+
+  <!-- STEP 1: SEARCH -->
+  <section id="step-search" class="card" aria-label="Search">
+    <h1>Book trains &amp; buses</h1>
+    <form id="searchForm" data-testid="search-form">
+      <div class="field">
+        <label for="fromInput">From</label>
+        <input id="fromInput" data-testid="from-input" list="cityList" value="Hyderabad (HYD)" autocomplete="off" required>
+      </div>
+      <div class="field">
+        <label for="toInput">To</label>
+        <input id="toInput" data-testid="to-input" list="cityList" value="Bengaluru (BLR)" autocomplete="off" required>
+      </div>
+      <datalist id="cityList" data-testid="city-list"></datalist>
+      <div class="field">
+        <label for="dateInput">Travel date</label>
+        <input id="dateInput" data-testid="date-input" type="date" value="2026-12-05" min="2026-12-01" max="2026-12-31" required>
+        <button type="button" id="calToggle" class="btn ghost small" aria-expanded="false" data-testid="calendar-toggle">Pick from calendar</button>
+      </div>
+      <button type="submit" class="btn primary" data-testid="search-button">Search</button>
+    </form>
+    <div id="calendar" class="calendar" hidden aria-label="December 2026 calendar"></div>
+    <p id="searchError" class="error" role="alert" hidden></p>
+  </section>
+
+  <!-- STEP 2: RESULTS -->
+  <section id="step-results" class="card" hidden aria-label="Results">
+    <div class="results-head">
+      <h2 id="resultsTitle" data-testid="results-title">Results</h2>
+      <button id="backToSearch" class="btn ghost small" data-testid="back-to-search">Modify search</button>
+    </div>
+    <div class="filters" role="group" aria-label="Filters">
+      <label>Mode
+        <select id="filterMode" data-testid="filter-mode">
+          <option value="">All modes</option><option value="train">Train</option><option value="bus">Bus</option>
+        </select>
+      </label>
+      <label>Max price (₹)
+        <input id="filterPrice" data-testid="filter-price" type="number" min="0" placeholder="No limit">
+      </label>
+      <label>Depart after
+        <input id="filterTime" data-testid="filter-time" type="time">
+      </label>
+      <label>Sort by
+        <select id="sortBy" data-testid="sort-by">
+          <option value="departure">Departure time</option><option value="price">Price (low first)</option>
+        </select>
+      </label>
+      <button id="applyFilters" class="btn small" data-testid="apply-filters">Apply</button>
+    </div>
+    <div id="resultsLoading" class="loading" hidden>Searching options…</div>
+    <p id="resultsError" class="error" role="alert" hidden></p>
+    <ul id="resultsList" class="results" data-testid="results-list"></ul>
+  </section>
+
+  <!-- STEP 3: SEATS -->
+  <section id="step-seats" class="card" hidden aria-label="Select seats">
+    <h2 id="seatTitle" data-testid="seat-title">Select seats</h2>
+    <p class="muted">Tap a seat to select it, tap again to remove. Green = available, grey = booked, amber = held.</p>
+    <div id="seatLoading" class="loading" hidden>Loading seat map…</div>
+    <div id="seatMap" class="seat-map" data-testid="seat-map" role="group" aria-label="Seat map"></div>
+    <p id="seatError" class="error" role="alert" hidden></p>
+    <div class="row">
+      <button id="backToResults" class="btn ghost" data-testid="back-to-results">Back to results</button>
+      <button id="holdBtn" class="btn primary" data-testid="hold-button" disabled>Hold selected seats</button>
+    </div>
+  </section>
+
+  <!-- STEP 4: PASSENGER -->
+  <section id="step-passenger" class="card" hidden aria-label="Passenger details">
+    <h2>Passenger details</h2>
+    <p class="muted">Synthetic demo data only — do not enter real personal details.</p>
+    <form id="passengerForm" data-testid="passenger-form">
+      <div class="field"><label for="pName">Full name</label><input id="pName" data-testid="passenger-name" value="Demo Traveller" required minlength="2"></div>
+      <div class="field"><label for="pAge">Age</label><input id="pAge" data-testid="passenger-age" type="number" value="28" min="1" max="120" required></div>
+      <div class="field"><label for="pGender">Gender</label>
+        <select id="pGender" data-testid="passenger-gender"><option>Female</option><option selected>Male</option><option>Other</option><option>Prefer not to say</option></select></div>
+      <div class="field"><label for="pEmail">Email</label><input id="pEmail" data-testid="passenger-email" type="email" value="demo@example.test"></div>
+      <div class="field"><label for="pPhone">Phone</label><input id="pPhone" data-testid="passenger-phone" type="tel" value="9000000000"></div>
+      <p id="passengerError" class="error" role="alert" hidden></p>
+      <button type="submit" class="btn primary" data-testid="passenger-submit">Continue to summary</button>
+    </form>
+  </section>
+
+  <!-- STEP 5: SUMMARY / CHECKOUT -->
+  <section id="step-summary" class="card" hidden aria-label="Booking summary">
+    <h2>Booking summary</h2>
+    <dl id="summaryBox" class="summary" data-testid="booking-summary"></dl>
+    <div id="fareBox" class="fare" data-testid="fare-breakdown"></div>
+    <p id="checkoutMsg" class="notice" role="status" hidden></p>
+    <div class="row">
+      <button id="backToPassenger" class="btn ghost" data-testid="back-to-passenger">Edit passenger</button>
+      <button id="checkoutBtn" class="btn primary" data-testid="checkout-button">Proceed to payment</button>
+    </div>
+  </section>
+</main>
+<footer class="wrap muted small">YatraDemo is a fictional demo sandbox for testing only. Fares, operators and availability are synthetic. Payment is disabled.</footer>
+<script src="/app.js"></script>
+</body>
+</html>

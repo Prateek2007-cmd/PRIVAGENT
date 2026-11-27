@@ -24,6 +24,7 @@ export const ACTION_TYPES = [
   "upload_file",
   "webmcp_tool",
   "ucp_checkout",
+  "mcp_tool",
 ] as const;
 
 export type ActionType = (typeof ACTION_TYPES)[number];
@@ -57,6 +58,9 @@ export const TYPE_ACTION_RISK_FLOOR: Record<ActionType, RiskClass> = {
   // a UCP checkout moves money, so it floors at sensitive.
   webmcp_tool: "write",
   ucp_checkout: "sensitive",
+  // mcp_tool: an MCP tool can change outside state; the registry's
+  // read-only flag is server-declared and untrusted for risk purposes.
+  mcp_tool: "write",
 };
 
 export interface ElementTarget {
@@ -182,6 +186,16 @@ export interface UCPCheckoutAction extends ActionBase {
   params: { merchant: string; amount: string; currency: string };
 }
 
+/** Call a registered MCP server tool (name + JSON arguments).
+ * Executed by the backend via the unified tool registry, never sent
+ * to the extension — present in the union so the contract stays
+ * byte-identical with the backend; the executor rejects it if it ever
+ * arrives here. */
+export interface MCPToolAction extends ActionBase {
+  type: "mcp_tool";
+  params: { tool: string; arguments?: Record<string, unknown> };
+}
+
 export type BrowserAction =
   | NavigateAction
   | ClickAction
@@ -199,7 +213,8 @@ export type BrowserAction =
   | SetDateAction
   | UploadFileAction
   | WebMCPToolAction
-  | UCPCheckoutAction;
+  | UCPCheckoutAction
+  | MCPToolAction;
 
 export interface SemanticElement {
   elementId: string;

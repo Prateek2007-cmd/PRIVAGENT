@@ -57,10 +57,16 @@ def missions():
 
 @router.post("/missions", status_code=201)
 def create_mission(body: MonitorInput):
-    from .website_resolver import is_safe_public_url
+    # Stream C (RC-LIVE-04): creation uses the ONE monitoring URL gate
+    # (change_detector.validate_monitor_url) — the same gate the fetch
+    # path uses. website_resolver.is_safe_public_url rejected the
+    # 127.0.0.1 fixture host (and, in this sandbox, every public URL
+    # whose DNS answers CGNAT), so a watch the checker would happily
+    # run could never be created through this endpoint.
+    from .change_detector import validate_monitor_url
     from .privacy import redact_url, _redact_text, classify_sensitivity, Sensitivity
     url = str(body.target_url)
-    if not is_safe_public_url(url)[0]:
+    if not validate_monitor_url(url)[0]:
         raise HTTPException(422, "Monitor requires a safe public URL")
     criteria = json.dumps(body.condition_params, sort_keys=True)
     if (redact_url(url) != url or _redact_text(body.title, 120) != body.title or
@@ -165,11 +171,75 @@ def acknowledge_event(mission_id: str, event_id: str):
 
 @router.get("/capabilities")
 def capabilities():
-    return [dict(name=name, kind="connector", status="not configured",
-                 description="Native adapter and OAuth configuration required; no account access is assumed.")
-            for name in ("Gmail", "Google Calendar", "Google Drive", "Slack", "GitHub")] + [
-        dict(name="MCP tool runtime", kind="mcp", status="not connected",
-             description="No external servers registered. Mutating tools require an execution-bound approval.")]
+    """Live capability status (Stream B, S3-R8).
+
+    Was hardcoded: every connector "not configured" and MCP "not
+    connected" regardless of reality, disagreeing with the live
+    /api/connectors view. Now computed from oauth_manager.status()
+    (same source as /api/connectors) plus the MCP registry: a connected
+    user sees "connected" here. Status words: "connected" (verified
+    live), "configured" (credentials exist, liveness not verified),
+    "not configured" (nothing stored). Any failure computing a status
+    degrades to "not configured" with the error noted — never a crash.
+    """
+    statuses: dict[str, dict[str, Any]] = {}
+    try:
+        from .connectors.oauth import oauth_manager
+
+        for item in oauth_manager.status():
+            statuses[item["provider"]] = item
+    except Exception as exc:
+        statuses = {"_error": {"error": str(exc)}}
+
+    def _connector_item(name: str, provider: str, description: str) -> dict[str, Any]:
+        info = statuses.get(provider) or {}
+        if info.get("connected"):
+            status = "connected"
+        elif info.get("configured"):
+            status = "configured"
+        else:
+            status = "not configured"
+        item: dict[str, Any] = {
+            "name": name, "kind": "connector", "status": status,
+            "description": description,
+        }
+        if info.get("account"):
+            item["account"] = info["account"]
+        if status == "not configured" and info.get("error"):
+            item["error"] = str(info["error"])[:200]
+        return item
+
+    google_desc = "Native adapter and OAuth configuration required; no account access is assumed."
+    items = [
+        _connector_item("Gmail", "google", google_desc),
+        _connector_item("Google Calendar", "google", google_desc),
+        _connector_item("Google Drive", "google", google_desc),
+        _connector_item("Slack", "slack", google_desc),
+        _connector_item("GitHub", "github", google_desc),
+    ]
+    # MCP runtime: live from the registry, not a constant.
+    mcp_status = "not connected"
+    mcp_desc = "No external servers registered. Mutating tools require an execution-bound approval."
+    try:
+        from .mcp.api import _ensure_restored
+        from .mcp.api import discovery as _mcp_discovery
+        from .mcp.api import registry as _mcp_registry
+
+        _ensure_restored()
+        server_names = list(_mcp_discovery.servers)
+        tool_count = len(_mcp_registry.tools)
+        if server_names:
+            mcp_status = "connected"
+            mcp_desc = (
+                f"{len(server_names)} server(s) registered "
+                f"({', '.join(server_names)}) with {tool_count} discovered tool(s). "
+                "Mutating tools require an execution-bound approval."
+            )
+    except Exception:
+        pass
+    items.append(dict(name="MCP tool runtime", kind="mcp", status=mcp_status,
+                      description=mcp_desc))
+    return items
 
 
 @router.get("/inspector")

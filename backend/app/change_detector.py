@@ -13,6 +13,86 @@ from .privacy import _redact_text
 
 _PRICE = re.compile(r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
 
+# Price-keyword context: a currency amount only counts as "the
+# price" when it sits next to a price word. A banner, a related
+# product or an MRP elsewhere on the page must not become the
+# watched price (the old first-currency-match did exactly that).
+_PRICE_CONTEXT_RES = [
+    re.compile(r"(?:selling|current|offer|sale|deal|discounted|special|now|today'?s|our)\s+price[^₹$\d]{0,40}?"
+               r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I),
+    re.compile(r"(?:price|mrp|buy\s+now|add\s+to\s+cart|check\s*out)[^₹$\d]{0,40}?"
+               r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I),
+    re.compile(r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)[^.\n]{0,40}?"
+               r"(?:selling|current|offer|sale|deal|discounted|special)\s+price", re.I),
+]
+
+
+def _extract_price(observation: dict[str, Any], text: str) -> tuple[float | None, str | None]:
+    """The watched price for an observation — structured first,
+    contextual second, unambiguous-single-amount last.
+
+    1. Structured metadata (``observation["price"]`` from
+       monitor_check: JSON-LD / microdata / meta / JSON product
+       API), already validated there.
+    2. A currency amount adjacent to a price word ("selling price
+       ₹4,199", "Price: ₹4,199").
+    3. The ONLY currency amount in the whole text (unambiguous —
+       a one-line browser observation such as "₹100").
+    4. None — several competing amounts and no structure means the
+       price is unknown, and guessing the first one (often a banner
+       or an MRP) is worse than reporting "Price unavailable".
+    """
+    structured = observation.get("price")
+    if isinstance(structured, (int, float)) and structured > 0:
+        return float(structured), (observation.get("price_info") or {}).get("source") if isinstance(observation.get("price_info"), dict) else None
+    for pattern in _PRICE_CONTEXT_RES:
+        match = pattern.search(text)
+        if match:
+            try:
+                value = float(match.group(1).replace(",", ""))
+            except (ValueError, IndexError):
+                continue
+            if 0 < value <= 10_000_000:
+                return value, "contextual"
+    amounts = _PRICE.findall(text)
+    if len(amounts) == 1:
+        try:
+            value = float(amounts[0].replace(",", ""))
+        except ValueError:
+            return None, None
+        if 0 < value <= 10_000_000:
+            return value, "single-amount"
+    return None, None
+
+# Stream C (RC-LIVE-04): ONE URL gate for monitoring, used by creation
+# (continuous_monitoring_companion) AND fetch (monitor_check /
+# monitoring_scheduler). The fetch gate already allows the 127.0.0.1
+# fixture host and keeps the SSRF guard for public hosts; the creation
+# gate (website_resolver.is_safe_public_url, used by
+# POST /api/control/missions) rejects 127.0.0.1, so a watch the fetch
+# path would happily check could never be created. This wrapper is the
+# canonical entry point — do not add a second gate.
+def validate_monitor_url(url: str) -> tuple[bool, str | None]:
+    """Fail-closed URL gate shared by watch creation and watch checks.
+
+    Allows the 127.0.0.1 fixture host for controlled demos; every other
+    loopback/private/link-local/reserved address and embedded-credential
+    URL is refused, and public hostnames get the DNS-rebinding check
+    (skipped when a proxy resolves the host, as in this sandbox).
+    """
+    from .monitor_check import _validate_monitor_url
+
+    return _validate_monitor_url(url)
+
+
+# Stream C (R-12): minimum seconds between two alerts from the same
+# watch. A page that changes every tick (live scores, rotating banners
+# that survive volatile-stripping) used to alert every tick. The
+# default applies to new watches; per-watch override lives in
+# monitoring_missions.alert_cooldown_seconds. A daily_price digest is
+# a report, not an alert, so it is exempt.
+DEFAULT_ALERT_COOLDOWN_S = 60
+
 # Task 2 live monitoring: volatile noise that must NOT alert. Each
 # match is replaced by a single space before hashing/diffing, so a
 # page whose only change is a timestamp, a "5 minutes ago" label or a
@@ -37,6 +117,13 @@ _VOLATILE_RES = [
     re.compile(r"\b[\d,]+\s+(?:views?|visitors?|likes?|comments?|shares?|followers?|subscribers?|downloads?|plays?),?(?!\w)", re.I),
     re.compile(r"\b[\d,]+\s+people\s+(?:online|viewing|reading|here),?(?!\w)", re.I),
     re.compile(r"\b[\d,]+\s+online,?(?!\w)", re.I),
+    # "posted today / updated yesterday" flips every day without any
+    # real content change; "5 min read" is a layout label, not content.
+    re.compile(r"\b(?:posted|updated|published|modified)\s+(?:today|yesterday),?(?!\w)", re.I),
+    re.compile(r"\b\d+\s+min\s+read,?(?!\w)", re.I),
+    # Ad markers that survive into visible text ("Sponsored", a lone
+    # "Advertisement" label) are chrome, not content.
+    re.compile(r"\b(?:sponsored|advertisement)\b,?(?!\w)", re.I),
     # Clock times: 09:28, 09:28:14, 9:28 AM
     re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]M|am|pm)?,?(?!\w)"),
 ]
@@ -53,9 +140,25 @@ def _normalise_volatile(text: str) -> str:
 def _state(observation: dict[str, Any]) -> dict[str, Any]:
     text = _redact_text(_normalise_volatile(re.sub(r"\s+", " ", str(observation.get("text") or "")).strip()), 4000)
     names = [_redact_text(_normalise_volatile(str(name)), 120) for name in (observation.get("elements") or [])[:100]]
-    match = _PRICE.search(text)
-    price = float(match.group(1).replace(",", "")) if match else None
-    return {"text": text, "elements": names, "price": price}
+    # Stream A: the price is NEVER the first currency-looking number
+    # in the text (a banner/MRP/related-product price used to become
+    # the watched price). Structured metadata wins, then a
+    # price-keyword context, then a single unambiguous amount.
+    price, price_source = _extract_price(observation, text)
+    state: dict[str, Any] = {"text": text, "elements": names, "price": price}
+    product_name = observation.get("product_name")
+    if not product_name:
+        price_info = observation.get("price_info")
+        if isinstance(price_info, dict):
+            product_name = price_info.get("name")
+    if product_name:
+        # Identity: the structured product name the price belongs
+        # to, so a watch can be checked against the product it
+        # names instead of trusting any number on the page.
+        state["product_name"] = _redact_text(str(product_name), 200)
+    if price_source:
+        state["price_source"] = price_source
+    return state
 
 
 def _triggered(condition: str, params: dict, before: dict, after: dict) -> tuple[bool, str]:
@@ -173,6 +276,24 @@ def evaluate_observation(mission_id: str, observation: dict[str, Any], *,
             should_alert, summary = False, "Unchanged"
             fire = False
         event = None
+        # Stream C (R-12): alert cooldown. The dedup above already
+        # suppresses repeat alerts for the SAME state; the cooldown
+        # suppresses a *different* change arriving while the previous
+        # alert is still fresh, so a fast-changing page cannot spam
+        # the user every tick. The state is still stored, so nothing
+        # is lost — only the alert is held. Daily-price digests are
+        # reports, not alerts, and are exempt.
+        cooldown = DEFAULT_ALERT_COOLDOWN_S
+        try:
+            stored_cd = row["alert_cooldown_seconds"]
+            if stored_cd is not None:
+                cooldown = max(0, int(stored_cd))
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+        last_alert = row["last_alert_at"]
+        if (fire and row["condition_type"] != "daily_price" and last_alert
+                and now - float(last_alert) < cooldown):
+            fire = False
         if fire:
             event = {"id": str(uuid.uuid4()), "mission_id": mission_id, "task_id": task_id,
                      "detected_at": now, "title": row["title"], "summary": summary,
@@ -192,9 +313,47 @@ def evaluate_observation(mission_id: str, observation: dict[str, Any], *,
 
 
 async def broadcast_event(event: dict[str, Any]) -> None:
+    """Deliver one monitoring event to the user — live AND durable.
+
+    Stream C (R-01/R-04): the old version only fanned out to open
+    WebSocket clients and marked `notification_sent=1` when any socket
+    accepted the JSON — "delivered" meant "a socket took it", not "the
+    user saw it", and a closed frontend meant the event vanished. Now:
+
+    1. The envelope keeps the `MISSION_EVENT_TRIGGERED` name and adds
+       the contract §3 fields (mission_id, title, message, event_id,
+       created_at ISO-8601 UTC) at the top level; the old taskId /
+       payload shape is kept for backward compatibility.
+    2. The alert is ALSO posted into the watch's conversation
+       (db.add_message — the same precedent the email tick uses), so
+       it is visible in chat history whenever the user reopens that
+       chat, even with no socket ever connected.
+    3. The alert is ALSO written to the notification outbox
+       (``monitoring_scheduler.post_outbox_notification``, kind
+       ``monitor``, ref_id = the event id) — the durable
+       notification row the reconnect pull
+       (``GET /api/monitoring/events``) returns. The unified pull
+       deduplicates it against the monitoring_events row, so one
+       alert is never counted or listed twice.
+    4. `notification_sent` / `delivered_at` are set ONLY when at least
+       one of those channels actually took the event. An event is not
+       "delivered" until a client acknowledges it or the missed-event
+       pull (GET /api/monitoring/events) returns it — see
+       monitoring_scheduler.mark_events_delivered.
+    """
     from starlette.websockets import WebSocketDisconnect, WebSocketState
     from .hub import hub
-    envelope = {"type": "MISSION_EVENT_TRIGGERED", "taskId": event.get("task_id"), "payload": event}
+    created_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(event.get("detected_at") or time.time())))
+    envelope = {
+        "type": "MISSION_EVENT_TRIGGERED",
+        "mission_id": event.get("mission_id"),
+        "taskId": event.get("task_id"),
+        "title": event.get("title") or "Watch alert",
+        "message": event.get("summary") or "",
+        "event_id": event.get("id"),
+        "created_at": created_iso,
+        "payload": event,
+    }
     delivered = False
     for ws in list(hub.client_sockets):
         if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED or getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
@@ -207,6 +366,61 @@ async def broadcast_event(event: dict[str, Any]) -> None:
             hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
         except Exception:
             hub.client_sockets.remove(ws) if ws in hub.client_sockets else None
+    # Durable channel: post the alert into the watch's conversation.
+    # The frontend loads chat history on open, so this is visible on
+    # reopen with no socket involved. Best-effort — a missing chat
+    # must never break the live broadcast above.
+    try:
+        mission_id = event.get("mission_id")
+        chat_id = None
+        if mission_id:
+            with db.get_connection() as conn:
+                row = conn.execute(
+                    "SELECT conversation_id FROM monitoring_missions WHERE id=?",
+                    (mission_id,),
+                ).fetchone()
+                chat_id = row["conversation_id"] if row else None
+        if chat_id:
+            db.add_message(
+                chat_id,
+                "agent",
+                f"🔔 Watch alert — {event.get('title') or 'Watch'}: {event.get('summary') or ''}",
+                evidence=f"monitoring event {event.get('id')}",
+                task_id=event.get("task_id"),
+            )
+            delivered = True
+    except Exception:
+        pass
+    # Durable notification row: the outbox is the record the
+    # reconnect pull returns, independent of any live socket. The
+    # unified pull deduplicates this row against the
+    # monitoring_events row (same ref_id), so the alert is listed
+    # once. Best-effort — a missing outbox table must never break
+    # the live broadcast above.
+    try:
+        from .monitoring_scheduler import post_outbox_notification
+
+        post_outbox_notification(
+            "monitor", str(event.get("id") or ""),
+            str(event.get("title") or "Watch alert"),
+            str(event.get("summary") or ""),
+            diff_data={"event_id": event.get("id"),
+                       "mission_id": event.get("mission_id")},
+        )
+    except Exception:
+        pass
     if delivered:
+        # delivered_at is added by monitoring_scheduler.ensure_stream_c_schema;
+        # a DB that has not run the migration (e.g. a test temp DB) falls
+        # back to the pre-existing notification_sent-only update.
         with db.get_connection() as conn:
-            conn.execute("UPDATE monitoring_events SET notification_sent=1 WHERE id=?", (event["id"],))
+            try:
+                conn.execute(
+                    "UPDATE monitoring_events SET notification_sent=1, delivered_at=? WHERE id=?",
+                    (time.time(), event["id"]),
+                )
+            except Exception:
+                conn.execute(
+                    "UPDATE monitoring_events SET notification_sent=1 WHERE id=?",
+                    (event["id"],),
+                )

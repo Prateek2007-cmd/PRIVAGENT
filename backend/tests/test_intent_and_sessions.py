@@ -295,7 +295,10 @@ def test_intent_classification_existing_user_tab():
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_tab_fails_closed(monkeypatch):
+async def test_ambiguous_tab_pauses_and_asks(monkeypatch):
+    # Stream D (RC-1.1): ambiguity PAUSES and asks instead of failing
+    # closed. The task checkpoints, broadcasts ASK_USER, and waits in
+    # awaiting_input; a cancel ends it as cancelled, honestly.
     class MockHub:
         extension_sockets = ["dummy_ws"]
         tasks = {}
@@ -319,9 +322,24 @@ async def test_ambiguous_tab_fails_closed(monkeypatch):
     )
     mock_hub.tasks[task_id] = record
 
-    await agentLoop.run_task(task_id)
-    assert record.state == "failed"
-    assert "AMBIGUOUS_TAB" in record.message
+    runner = asyncio.create_task(agentLoop.run_task(task_id))
+    try:
+        # Wait for the pause (bounded — never the 300 s gate timeout).
+        for _ in range(100):
+            if record.state == "awaiting_input":
+                break
+            await asyncio.sleep(0.05)
+        assert record.state == "awaiting_input"
+        pending = getattr(record, "pending_ask_user", None)
+        assert isinstance(pending, dict)
+        assert "site" in str(pending.get("question") or "").lower()
+
+        assert agentLoop.cancel_ask_user(task_id) is True
+        await asyncio.wait_for(runner, timeout=10)
+        assert record.state == "cancelled"
+    finally:
+        if not runner.done():
+            runner.cancel()
 
 
 # ---------------------------------------------------------------------------

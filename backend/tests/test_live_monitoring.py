@@ -217,14 +217,17 @@ def test_fetch_gives_up_after_three_transient_failures(monkeypatch):
 
 
 def test_fetch_does_not_retry_refusals(monkeypatch):
-    """Refusals are definitive, not transient: a non-HTML body raises
-    at once with a single attempt and no backoff sleep."""
+    """Refusals are definitive, not transient: a JSON body with no
+    product raises at once with a single attempt and no backoff
+    sleep. (Stream A: application/json IS a supported fetch target
+    for product APIs — the refusal here is 'no product in the
+    payload', not 'non-HTML'.)"""
     opener = _FlakyOpener(0, '{"price": 1299}', ctype="application/json")
     monkeypatch.setattr("app.monitor_check.urllib.request.build_opener", lambda *a, **k: opener)
     sleeps: list[float] = []
     monkeypatch.setattr("time.sleep", lambda s: sleeps.append(round(float(s), 1)))
 
-    with pytest.raises(ValueError, match="non-HTML"):
+    with pytest.raises(ValueError, match="no product"):
         fetch_observation("http://127.0.0.1/gadget")
     assert opener.calls == 1
     assert sleeps == []
@@ -335,10 +338,21 @@ def test_http_redirect_to_private_host_is_refused(database, fixture_server):
         server.server_close()
 
 
-def test_http_oversized_body_is_refused(fixture_server):
+def test_http_oversized_body_truncates_instead_of_refusing(fixture_server):
+    """Stream A: a body past the stream cap is truncated and still
+    observed — the old test asserted a refusal, which is exactly
+    what killed every check of the 1.75 MB ISRO page (Demo 2)."""
     _FixtureHandler.pages["/huge"] = "<html><body><p>" + ("x" * 1_100_000) + "</p></body></html>"
-    with pytest.raises(ValueError, match="over"):
-        fetch_observation(fixture_server + "/huge", max_bytes=1_048_576)
+    observation = fetch_observation(fixture_server + "/huge", max_bytes=1_048_576)
+    assert observation["truncated"] is True
+    assert len(observation["text"]) > 0
+    # And a page over the OLD 1 MiB cap but under the 8 MiB stream
+    # cap is observed whole (truncated False); the extracted text
+    # itself is capped at 200,000 chars by the parser, so the
+    # assertion is on the cap, not the raw body length.
+    observation = fetch_observation(fixture_server + "/huge")
+    assert observation["truncated"] is False
+    assert len(observation["text"]) >= 200_000
 
 
 def test_scheduler_claim_run_now_and_http_path(database, fixture_server):

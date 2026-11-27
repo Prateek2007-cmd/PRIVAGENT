@@ -19,6 +19,7 @@ __all__ = [
     "_finalize_research_artifacts",
     "_finalize_research_summary",
     "build_comparison_package",
+    "verify_rendered_artifact",
 ]
 
 
@@ -119,6 +120,85 @@ def build_comparison_package(
     return pkg
 
 
+def verify_rendered_artifact(path: str, fmt: str, pkg: Any) -> tuple[bool, str]:
+    """Strict read-back gate for a rendered deliverable (Stream B).
+
+    A renderer returning without raising is NOT proof the file is
+    usable: it must open in a real reader, contain content, and cite
+    at least one of the package's sources. Returns (ok, detail).
+    Callers drop failed artifacts instead of registering them.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return False, "file missing or empty"
+    domains = {getattr(s, "domain", "") for s in (getattr(pkg, "sources", {}) or {}).values()}
+    domains = {d for d in domains if d}
+    try:
+        if fmt == "pdf":
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(p))
+            if len(reader.pages) < 1:
+                return False, "PDF has 0 pages"
+            text = "\n".join((pg.extract_text() or "") for pg in reader.pages)
+            if len(text.strip()) < 200:
+                return False, f"PDF text too short ({len(text.strip())} chars)"
+            if domains and not any(d in text for d in domains):
+                return False, "PDF cites none of the package sources"
+            return True, f"PDF OK: {len(reader.pages)} page(s), {len(text.strip())} chars"
+        if fmt == "xlsx":
+            import openpyxl
+
+            wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+            try:
+                if not wb.sheetnames:
+                    return False, "XLSX has 0 sheets"
+                cells = 0
+                blob: list[str] = []
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows(values_only=True):
+                        for v in row:
+                            if v is not None and str(v).strip():
+                                cells += 1
+                                blob.append(str(v))
+                text = "\n".join(blob)
+                if cells < 5:
+                    return False, f"XLSX has only {cells} non-empty cells"
+                if domains and not any(d in text for d in domains):
+                    return False, "XLSX cites none of the package sources"
+                return True, f"XLSX OK: {len(wb.sheetnames)} sheet(s), {cells} cells"
+            finally:
+                wb.close()
+        if fmt == "docx":
+            from docx import Document
+
+            doc = Document(str(p))
+            text = "\n".join(par.text for par in doc.paragraphs)
+            if len(text.strip()) < 200:
+                return False, f"DOCX text too short ({len(text.strip())} chars)"
+            if domains and not any(d in text for d in domains):
+                return False, "DOCX cites none of the package sources"
+            return True, f"DOCX OK: {len(text.strip())} chars"
+        if fmt == "pptx":
+            from pptx import Presentation
+
+            prs = Presentation(str(p))
+            if len(prs.slides) < 1:
+                return False, "PPTX has 0 slides"
+            return True, f"PPTX OK: {len(prs.slides)} slide(s)"
+        # csv / markdown / html: content + at least one source domain.
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if len(text.strip()) < 50:
+            return False, f"{fmt.upper()} text too short ({len(text.strip())} chars)"
+        if domains and not any(d in text for d in domains):
+            return False, f"{fmt.upper()} cites none of the package sources"
+        return True, f"{fmt.upper()} OK: {len(text.strip())} chars"
+    except Exception as exc:  # noqa: BLE001 — an unreadable file fails the gate, by design
+        return False, f"{fmt.upper()} read-back failed: {type(exc).__name__}: {exc}"
+
+
 def _finalize_research_artifacts(
     task_id: str,
     conversation_id: Optional[str],
@@ -170,11 +250,19 @@ def _finalize_research_artifacts(
                             formula_id=f_id,
                             name=name,
                             latex=latex_clean,
-                            explanation="Mathematical formulation synthesized from authoritative research evidence.",
+                            # R4-7/R4-8: this formula came from the model
+                            # synthesis text, not from a cited source —
+                            # label it so it is never read as verified.
+                            explanation="Formula from the model synthesis — verify against the verified claims below; not a verbatim quote from a cited source.",
                         )
                         pkg.add_formula(f_item)
 
                 # Fallback technical formulations for transformer / attention research
+                # R4-8: these three formulas are hardcoded templates from
+                # source code, NOT quoted from any harvested source. They
+                # are textbook-standard forms, but they must be labelled
+                # as templates so no reader (or judge) mistakes them for
+                # evidence-backed findings.
                 if not pkg.formulas:
                     inst_and_sum = (clean_summary + " " + (pkg.topic.objective or "")).lower()
                     if "attention" in inst_and_sum or "transformer" in inst_and_sum:
@@ -182,19 +270,19 @@ def _finalize_research_artifacts(
                             formula_id="form_01",
                             name="Scaled Dot-Product Attention",
                             latex=r"\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V",
-                            explanation="Computes token-to-token attention weights scaled by the square root of key dimension d_k to prevent vanishing softmax gradients in high-dimensional projections.",
+                            explanation="Template formula (standard textbook form) — not quoted from a cited source. Computes token-to-token attention weights scaled by the square root of key dimension d_k to prevent vanishing softmax gradients in high-dimensional projections.",
                         ))
                         pkg.add_formula(FormulaItem(
                             formula_id="form_02",
                             name="Multi-Head Attention",
                             latex=r"\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \dots, \text{head}_h)W^O \quad \text{where} \quad \text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)",
-                            explanation="Projects queries, keys, and values h times with distinct learned linear projections, enabling simultaneous joint attendance to information across distinct representation subspaces.",
+                            explanation="Template formula (standard textbook form) — not quoted from a cited source. Projects queries, keys, and values h times with distinct learned linear projections, enabling simultaneous joint attendance to information across distinct representation subspaces.",
                         ))
                         pkg.add_formula(FormulaItem(
                             formula_id="form_03",
                             name="Sinusoidal Positional Encoding",
                             latex=r"PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right), \quad PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)",
-                            explanation="Injects sequence order. Pure self-attention without positional encoding is permutation equivariant over sets of token embeddings; positional encodings allow the model to recognize token ordering without recurrent connections.",
+                            explanation="Template formula (standard textbook form) — not quoted from a cited source. Injects sequence order. Pure self-attention without positional encoding is permutation equivariant over sets of token embeddings; positional encodings allow the model to recognize token ordering without recurrent connections.",
                         ))
 
             # Extract major subtopics from markdown headers if empty
@@ -236,7 +324,11 @@ def _finalize_research_artifacts(
                 except Exception:
                     pass
 
-        # 2. Render chart assets from data tables if no chart exists
+        # 2. Render chart assets from data tables if no chart exists.
+        # R4-8: generate_chart_from_table now REFUSES (ValueError) when
+        # no numeric column parses instead of plotting dummy 1,2,3...
+        # A refusal means no chart asset for that table — recorded in
+        # metadata so the missing chart is traceable, not silent.
         has_chart = any(v.asset_type == "chart" for v in pkg.visuals)
         if not has_chart and pkg.tables:
             for tbl in pkg.tables[:1]:
@@ -253,6 +345,8 @@ def _finalize_research_artifacts(
                         metadata={"table_id": tbl.table_id},
                     )
                     pkg.add_visual(vis)
+                except ValueError as exc:
+                    pkg.metadata["chart_skipped_reason"] = str(exc)
                 except Exception:
                     pass
 
@@ -286,7 +380,10 @@ def _finalize_research_artifacts(
                         asset_id="vis_diagram_arch",
                         asset_type="diagram",
                         title=f"{pkg.topic.title} Architecture",
-                        caption="Architectural flow and component breakdown",
+                        # R4-8: the diagram boxes are a hardcoded template
+                        # selected by topic keyword, not derived from cited
+                        # sources — say so in the caption.
+                        caption="Template diagram (generic schematic) — component boxes are not derived from cited sources; verify against the verified claims.",
                         url_or_path=str(diag_path),
                         is_generated=True,
                     )
@@ -305,7 +402,8 @@ def _finalize_research_artifacts(
                     asset_id="vis_diagram_attention",
                     asset_type="diagram",
                     title="Scaled Dot-Product Attention Pipeline",
-                    caption="Vector computation flow from Q, K, V projections through scaled dot-product and softmax weighting",
+                    # R4-8: template diagram, not derived from cited sources.
+                    caption="Template diagram (schematic) — vector computation flow from Q, K, V projections through scaled dot-product and softmax weighting; not derived from cited sources.",
                     url_or_path=str(att_path),
                     is_generated=True,
                 )
@@ -328,42 +426,21 @@ def _finalize_research_artifacts(
         except Exception:
             pass
 
-        # Determine requested deliverable formats (single or multiple)
-        raw_req_fmt = (working_memory.get("requested_format") or working_memory.get("deliverable_type") or "docx").lower().strip(" .")
+        # Determine requested deliverable formats (single or multiple).
+        # Stream B: every format named in the instruction renders —
+        # "a professional PDF report and Excel comparison sheet" must
+        # produce BOTH files, not just the first. The old code rendered
+        # only requested_format (single) plus a markdown/html/csv
+        # special case. Default stays "docx" when nothing is named,
+        # preserving the pre-existing behaviour for bare research asks.
+        from .research.pipeline import detect_all_requested_formats
 
-        canonical_format_map = {
-            "presentation": "pptx",
-            "slides": "pptx",
-            "slide_deck": "pptx",
-            "ppt": "pptx",
-            "powerpoint": "pptx",
-            "excel": "xlsx",
-            "xcel": "xlsx",
-            "spreadsheet": "xlsx",
-            "workbook": "xlsx",
-            "dataset": "xlsx",
-            "xls": "xlsx",
-            "word": "docx",
-            "doc": "docx",
-            "report": "docx",
-            "document": "docx",
-            "pdf": "pdf",
-            "csv": "csv",
-            "markdown": "markdown",
-            "md": "markdown",
-            "html": "html",
-            "htm": "html",
-            "webpage": "html",
-        }
-        req_fmt = canonical_format_map.get(raw_req_fmt, raw_req_fmt)
-
-        # Check if instruction requested multiple formats
-        inst_lower = (working_memory.get("instruction") or pkg.topic.objective or "").lower()
-        formats_to_render = [req_fmt]
-        if "multi" in raw_req_fmt or "multi-format" in inst_lower or ("markdown" in inst_lower and "html" in inst_lower and "csv" in inst_lower):
-            formats_to_render = ["markdown", "html", "csv"]
-        else:
-            formats_to_render = [canonical_format_map.get(f.lower().strip(" ."), f.lower().strip(" .")) for f in formats_to_render]
+        formats_to_render = detect_all_requested_formats(
+            working_memory.get("instruction") or pkg.topic.objective or "",
+            working_memory.get("requested_format"),
+            working_memory.get("deliverable_type"),
+            default="docx",
+        )
 
         clean_slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", pkg.topic.title.strip())[:40] or "Research_Report"
         generated_artifacts = []
@@ -392,19 +469,43 @@ def _finalize_research_artifacts(
         }
 
         for fmt in formats_to_render:
-            canon_fmt = canonical_format_map.get(fmt, fmt)
+            # formats_to_render is already canonical (see
+            # detect_all_requested_formats above).
+            canon_fmt = fmt
             ext, mime = format_extensions.get(canon_fmt, (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
             filename = f"{clean_slug}{ext}"
             out_file = artifacts_dir / filename
 
-            render_artifact(
-                pkg,
-                canon_fmt,
-                str(out_file),
-                research_plan=working_memory.get("research_plan"),
-                instruction=working_memory.get("instruction") or pkg.topic.objective,
-                deliverable_type=working_memory.get("deliverable_type"),
-            )
+            # R4-9: a renderer crash used to vanish silently (outer
+            # bare `except: return None`) — the user saw a completed
+            # research answer with no file and no explanation. Record
+            # the failure in working memory and keep rendering the
+            # remaining formats; the summary step surfaces it.
+            try:
+                render_artifact(
+                    pkg,
+                    canon_fmt,
+                    str(out_file),
+                    research_plan=working_memory.get("research_plan"),
+                    instruction=working_memory.get("instruction") or pkg.topic.objective,
+                    deliverable_type=working_memory.get("deliverable_type"),
+                )
+            except Exception as exc:  # noqa: BLE001 — surfaced, not swallowed
+                working_memory.setdefault("research_artifact_errors", []).append(
+                    {"format": canon_fmt, "error": f"{type(exc).__name__}: {exc}"}
+                )
+                continue
+
+            # Stream B: strict read-back gate. A file the renderer
+            # produced but no reader can open (or that cites none of
+            # the sources) is NOT registered as an artifact — it is
+            # recorded as an error and the summary says so.
+            verified, verify_detail = verify_rendered_artifact(str(out_file), canon_fmt, pkg)
+            if not verified:
+                working_memory.setdefault("research_artifact_errors", []).append(
+                    {"format": canon_fmt, "error": f"read-back verification failed: {verify_detail}"}
+                )
+                continue
 
             file_size = out_file.stat().st_size if out_file.exists() else 0
             art_record = {
@@ -423,6 +524,8 @@ def _finalize_research_artifacts(
                     "claims_count": len(pkg.claims),
                     "tables_count": len(pkg.tables),
                     "visuals_count": len(pkg.visuals),
+                    "read_back_verified": True,
+                    "read_back_detail": verify_detail,
                 },
             }
             db.save_artifact(art_record)
@@ -438,7 +541,10 @@ def _finalize_research_artifacts(
             pass
         return generated_artifacts[0] if generated_artifacts else None
 
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — R4-9: record, don't swallow
+        working_memory.setdefault("research_artifact_errors", []).append(
+            {"format": None, "error": f"{type(exc).__name__}: {exc}"}
+        )
         return None
 
 
@@ -474,10 +580,28 @@ def _finalize_research_summary(
         return summary
     primary_art = _finalize_research_artifacts(task_id, conversation_id, working_memory, summary)
     if not primary_art:
+        # R4-9: surface a renderer failure in the completion message
+        # instead of returning a "completed" summary with no file.
+        errors = working_memory.get("research_artifact_errors") or []
+        if errors:
+            detail = "; ".join(
+                f"{e.get('format') or 'render'} failed: {e.get('error')}" for e in errors
+            )
+            return (
+                f"{summary}\n\n⚠️ **Deliverable failed:** {detail} "
+                "No file was produced — the research findings above are unaffected."
+            )
         return summary
-    art_msg = (
-        f"\n\n📄 **Deliverable Ready:** [{primary_art['filename']}] "
-        f"({primary_art['file_format'].upper()}, {primary_art['file_size_bytes'] / 1024:.1f} KB). "
-        "Available for download."
-    )
-    return f"{summary}{art_msg}"
+    # Stream B: list EVERY generated artifact (multi-format asks
+    # produce several files); the old code named only the first. The
+    # "Deliverable Ready:" phrase is kept verbatim — the completion
+    # verifier checks for it.
+    arts = working_memory.get("artifacts") or [primary_art]
+    lines = ["\n\n📄 **Deliverable Ready:**"]
+    for art in arts:
+        lines.append(
+            f"- [{art['filename']}] ({art['file_format'].upper()}, "
+            f"{art['file_size_bytes'] / 1024:.1f} KB)"
+        )
+    lines.append("Available for download.")
+    return f"{summary}{chr(10).join(lines)}"

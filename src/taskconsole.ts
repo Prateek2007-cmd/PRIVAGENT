@@ -1,5 +1,5 @@
 import "./styles/taskconsole.css";
-import { linkify } from "./sanitize";
+import { escapeHtml, linkify } from "./sanitize";
 import { apiFetch, wsUrl } from "./auth";
 
 const API = "http://localhost:8000";
@@ -48,15 +48,27 @@ function actionIcon(msg: string): string {
 function renderTaskState(taskState: string, message: string): void {
   // Single source of truth: the backend task state. The UI never invents "complete".
   setState(taskState);
-  if (["completed", "failed", "cancelled"].includes(taskState)) {
+  // Stream D: "blocked" is terminal too (missing dependency, e.g.
+  // the extension is not connected) — a blocked task must release
+  // the controls and show its reason, not sit as if still working.
+  if (["completed", "failed", "cancelled", "blocked"].includes(taskState)) {
     // A terminal task can no longer be approved; never leave a stale modal.
     if (confirmModal && !confirmModal.hidden) closeConfirm(false);
   }
   if (taskState === "completed" && summaryEl) {
     summaryEl.innerHTML = `<strong>✓ Completed</strong> · ${formatSummary(message || "Task completed.")}`;
     summaryEl.hidden = false;
+  } else if (taskState === "blocked" && summaryEl) {
+    summaryEl.innerHTML = `<strong>⛔ Blocked — dependency missing</strong> · ${formatSummary(message || "Task stopped: a dependency is missing.")}`;
+    summaryEl.hidden = false;
   } else if (taskState === "failed" && summaryEl) {
-    summaryEl.innerHTML = `<strong>✗ Blocked / Failed</strong> · ${formatSummary(message || "Task stopped.")}`;
+    summaryEl.innerHTML = `<strong>✗ Failed</strong> · ${formatSummary(message || "Task stopped.")}`;
+    summaryEl.hidden = false;
+  } else if (taskState === "awaiting_input" && summaryEl) {
+    // Stream D: the task paused for one ask-user question. The
+    // answer path is a reply in the agent workspace chat — the
+    // question itself is the message.
+    summaryEl.innerHTML = `<strong>⏸ Waiting for your answer</strong> · ${formatSummary(message || "Answer the question to continue the same task.")} Reply in the agent workspace chat.`;
     summaryEl.hidden = false;
   } else if (taskState === "awaiting_takeover" && summaryEl) {
     // Task 4: takeover is not a confirmation — the confirm modal posts
@@ -171,7 +183,7 @@ startBtn?.addEventListener("click", async () => {
         const t = (await stRes.json()) as { taskState: string; message: string };
         if (t.taskState && t.taskState !== "planning") {
           renderTaskState(t.taskState, t.message);
-          if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+          if (["completed", "failed", "cancelled", "blocked"].includes(t.taskState)) {
             startBtn.disabled = false;
             if (cancelBtn) cancelBtn.hidden = true;
           }
@@ -204,12 +216,31 @@ cancelBtn?.addEventListener("click", async () => {
 function connectEvents(): void {
   const ws = new WebSocket(wsUrl(`ws://localhost:8000/ws/client`));
   ws.onopen = async () => {
+    // Stream C (R-04): pull alerts missed while the console was
+    // closed, so a watch firing with no frontend open is still seen
+    // on reconnect.
+    try {
+      const evRes = await apiFetch(`${API}/api/monitoring/events?unread=true`);
+      if (evRes.ok) {
+        const data = (await evRes.json()) as {
+          events?: Array<{ id?: string; title?: string; summary?: string; created_at?: number }>;
+          unread?: number;
+        };
+        for (const ev of data.events || []) {
+          addStep(`🔔 ${ev.title || "Watch alert"}: ${ev.summary || ""}`);
+        }
+        if ((data.unread || 0) > 0 && summaryEl) {
+          summaryEl.innerHTML = `<strong>🔔 ${escapeHtml(String(data.unread ?? 0))} unread alert${(data.unread || 0) === 1 ? "" : "s"}</strong> · see the steps below; the backend marks them read when you open them in the workspace.`;
+          summaryEl.hidden = false;
+        }
+      }
+    } catch { /* offline — the next reconnect retries */ }
     if (currentTaskId) {
       try {
         const res = await apiFetch(`${API}/api/task/${currentTaskId}`);
         if (res.ok) {
           const t = (await res.json()) as { taskState: string; message: string };
-          if (["completed", "failed", "cancelled"].includes(t.taskState)) {
+          if (["completed", "failed", "cancelled", "blocked"].includes(t.taskState)) {
             renderTaskState(t.taskState, t.message);
             if (startBtn) startBtn.disabled = !input?.value.trim();
             if (cancelBtn) cancelBtn.hidden = true;
@@ -232,6 +263,24 @@ function connectEvents(): void {
           sessionId?: string | null;
         };
       };
+      // Stream C (R-01): MISSION_EVENT_TRIGGERED used to be dropped
+      // here (`env.type !== "PROGRESS"`). A watch alert now lands in
+      // the steps and the summary banner; a blocked scheduled job
+      // arrives as SCHEDULED_JOB_BLOCKED.
+      if (env.type === "MISSION_EVENT_TRIGGERED" || env.type === "SCHEDULED_JOB_BLOCKED" || env.type === "NOTIFICATION") {
+        const alert = env as unknown as {
+          title?: string; message?: string;
+          payload?: { title?: string; summary?: string };
+        };
+        const title = alert.title || alert.payload?.title || (env.type === "MISSION_EVENT_TRIGGERED" ? "Watch alert" : "Scheduled job blocked");
+        const message = alert.message || alert.payload?.summary || "";
+        addStep(`🔔 ${title}: ${message}`);
+        if (summaryEl) {
+          summaryEl.innerHTML = `<strong>🔔 ${formatSummary(title)}</strong> · ${formatSummary(message)}`;
+          summaryEl.hidden = false;
+        }
+        return;
+      }
       if (env.type !== "PROGRESS" || env.taskId !== currentTaskId) return;
       const p = env.payload;
       const modeStr = p.intent === "NON_BROWSER" || p.isBrowserTask === false
@@ -263,7 +312,7 @@ function connectEvents(): void {
           })
           .catch(() => { /* offline — renderTaskState already showed the state */ });
       }
-      if (["completed", "failed", "cancelled"].includes(p.taskState)) {
+      if (["completed", "failed", "cancelled", "blocked"].includes(p.taskState)) {
         startBtn && (startBtn.disabled = false);
         if (cancelBtn) cancelBtn.hidden = true;
       }

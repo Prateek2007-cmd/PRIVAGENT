@@ -211,6 +211,411 @@ def parse_daily_time(instruction: str) -> tuple[str, str] | None:
     return f"{utc_total % 60} {utc_total // 60} * * *", display
 
 
+# ---------------------------------------------------------------------------
+# Stream C (R-05): NL scheduling intents (contract §4).
+#
+# "do this in 2 minutes" / "summarise this daily at 8am" / "run this
+# every 15 minutes" / "continue this task tomorrow morning" create a
+# REAL scheduled job via scheduler.create_job — the same function the
+# API uses, not a parallel path. The intent shape is:
+#   {"intent": "create_schedule", "instruction": "...",
+#    "schedule": {"kind": "once"|"every"|"daily", "in_minutes": int|None,
+#                 "interval_minutes": int|None, "time_ist": "HH:MM"|None}}
+# Times the user says are IST (their timezone); daily jobs are stored
+# as UTC cron via parse_daily_time, one-off jobs as a delay. The
+# monitoring directive pattern is checked FIRST in
+# is_continuous_monitoring_directive, so "monitor X every 15 minutes"
+# and "every day at 9am tell me the price" stay watches, not jobs.
+# ---------------------------------------------------------------------------
+_SCHEDULE_TASK_VERB = (
+    r"(?:do|run|perform|repeat|schedule|remind|check|tell|send|give|show|"
+    r"summari[sz]e|generate|create|write|fetch|search|look|continue|start)"
+)
+_SCHEDULE_ONCE_RE = re.compile(
+    rf"\b{_SCHEDULE_TASK_VERB}\b[^.\n]{{0,80}}?\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b|"
+    rf"\b(?:this|that|it)\s+in\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b|"
+    rf"\bremind\s+me\b[^.\n]{{0,80}}?\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_EVERY_RE = re.compile(
+    rf"\b{_SCHEDULE_TASK_VERB}\b[^.\n]{{0,80}}?\bevery\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?)\b|"
+    rf"\b(?:this|that|it)\s+every\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?)\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_DAILY_RE = re.compile(
+    rf"\b{_SCHEDULE_TASK_VERB}\b[^.\n]{{0,80}}?\b(?:daily|every\s+day|everyday|every\s+morning|each\s+morning)\b|"
+    rf"\b(?:this|that|it)\s+(?:daily|every\s+day|everyday)\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_TOMORROW_RE = re.compile(
+    rf"\b{_SCHEDULE_TASK_VERB}\b[^.\n]{{0,80}}?\btomorrow\b(?:\s+(morning|afternoon|evening))?"
+    rf"(?:\s+at\s+(\d{{1,2}})(?::(\d{{2}}))?\s*(am|pm)?)?|"
+    rf"\btomorrow\b(?:\s+(morning|afternoon|evening))?"
+    rf"(?:\s+at\s+(\d{{1,2}})(?::(\d{{2}}))?\s*(am|pm)?)?",
+    re.IGNORECASE,
+)
+_SCHEDULE_STRIP_RES = [
+    # Remove the schedule clause itself, leaving the instruction.
+    re.compile(r"\bin\s+\d+\s*(?:minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE),
+    re.compile(r"\bevery\s+(?:\d+\s*)?(?:minutes?|mins?|hours?|hrs?|days?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:daily|every\s+day|everyday|every\s+morning|each\s+morning)\b(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?", re.IGNORECASE),
+    re.compile(r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*(?:every\s+day|everyday|daily)\b", re.IGNORECASE),
+    re.compile(r"\btomorrow\b(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?", re.IGNORECASE),
+]
+
+
+def _tomorrow_delay_minutes(instruction: str) -> int | None:
+    """Minutes from now until tomorrow morning/afternoon/evening (IST).
+
+    'tomorrow morning' -> 09:00 IST, afternoon -> 15:00 IST, evening
+    -> 19:00 IST; an explicit 'at HH:MM' overrides the part of day.
+    Returns None when the instruction names no tomorrow time.
+    """
+    m = _SCHEDULE_TOMORROW_RE.search(instruction or "")
+    if not m:
+        return None
+    part = (m.group(1) or m.group(5) or "morning").lower()
+    hour_s = m.group(2) or m.group(6)
+    minute_s = m.group(3) or m.group(7)
+    marker = (m.group(4) or m.group(8) or "").lower()
+    if hour_s:
+        hour = int(hour_s)
+        minute = int(minute_s or 0)
+        if marker == "pm" and hour != 12:
+            hour += 12
+        elif marker == "am" and hour == 12:
+            hour = 0
+    else:
+        hour, minute = {"morning": (9, 0), "afternoon": (15, 0), "evening": (19, 0)}[part]
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    from datetime import datetime, timedelta, timezone as _tz
+
+    ist = _tz(timedelta(minutes=_IST_OFFSET_MINUTES))
+    now_ist = datetime.now(ist)
+    target = now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=1)
+    delay = int((target - now_ist).total_seconds() // 60)
+    return delay if delay >= 1 else None
+
+
+def parse_schedule_intent(text: str) -> dict[str, Any] | None:
+    """Parse an NL scheduling ask into the contract §4 intent shape.
+
+    Returns None when the text carries no schedule. The instruction
+    text is NOT resolved here — the caller strips the schedule clause
+    and resolves 'this' from history.
+    """
+    if not text:
+        return None
+    m = _SCHEDULE_ONCE_RE.search(text)
+    if m:
+        groups = [g for g in m.groups() if g is not None]
+        num = int(groups[0])
+        unit = groups[1].lower()
+        minutes = num * 60 if unit.startswith(("hour", "hr")) else num
+        return {"intent": "create_schedule", "instruction": "",
+                "schedule": {"kind": "once", "in_minutes": minutes,
+                             "interval_minutes": None, "time_ist": None}}
+    m = _SCHEDULE_EVERY_RE.search(text)
+    if m:
+        groups = [g for g in m.groups() if g is not None]
+        num = int(groups[0])
+        unit = groups[1].lower()
+        if unit.startswith("day"):
+            minutes = num * 24 * 60
+        elif unit.startswith(("hour", "hr")):
+            minutes = num * 60
+        else:
+            minutes = num
+        return {"intent": "create_schedule", "instruction": "",
+                "schedule": {"kind": "every", "in_minutes": None,
+                             "interval_minutes": minutes, "time_ist": None}}
+    daily = parse_daily_time(text)
+    if daily is not None and _SCHEDULE_DAILY_RE.search(text):
+        _cron, display = daily
+        hour_min = display.replace(" IST", "")
+        return {"intent": "create_schedule", "instruction": "",
+                "schedule": {"kind": "daily", "in_minutes": None,
+                             "interval_minutes": None, "time_ist": hour_min}}
+    if _SCHEDULE_DAILY_RE.search(text):
+        return {"intent": "create_schedule", "instruction": "",
+                "schedule": {"kind": "daily", "in_minutes": None,
+                             "interval_minutes": None, "time_ist": "9:00 AM"}}
+    delay = _tomorrow_delay_minutes(text)
+    if delay is not None:
+        return {"intent": "create_schedule", "instruction": "",
+                "schedule": {"kind": "once", "in_minutes": delay,
+                             "interval_minutes": None, "time_ist": None}}
+    return None
+
+
+def is_schedule_directive(text: str) -> bool:
+    """True when the text asks to schedule a task (not a watch)."""
+    if not text:
+        return False
+    return parse_schedule_intent(text) is not None
+
+
+def _strip_schedule_clause(text: str) -> str:
+    """Remove the schedule wording, leaving the task instruction."""
+    out = text or ""
+    for pattern in _SCHEDULE_STRIP_RES:
+        out = pattern.sub(" ", out)
+    # Leading schedule verbs ("do this", "run", "remind me to", "schedule").
+    out = re.sub(r"^\s*(?:please\s+)?(?:do|run|perform|repeat|schedule|start|continue)\s+(?:this|that|it|the\s+\w+)?\s*",
+                 "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^\s*remind\s+me\s+to\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^\s*(?:do|run)\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s+", " ", out).strip(" .,:;")
+    return out
+
+
+def _instruction_from_history(history: Optional[list[dict[str, Any]]],
+                              current: str) -> str:
+    """The task 'this' refers to: the last substantive user message.
+
+    Skips the current ask itself, schedule/monitor asks, and bare
+    affirmatives. Returns "" when history names no task.
+    """
+    for entry in reversed(history or []):
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("role") or "").lower() != "user":
+            continue
+        content = str(entry.get("content") or entry.get("message") or "").strip()
+        if not content or content == (current or "").strip():
+            continue
+        if _is_bare_affirmative(content):
+            continue
+        if MONITORING_DIRECTIVE_PATTERN.search(content) or is_schedule_directive(content):
+            continue
+        if len(content) < 4:
+            continue
+        return content
+    return ""
+
+
+def _schedule_to_create_job_args(intent: dict[str, Any]) -> tuple[str, str]:
+    """Contract §4 intent -> (schedule string, human description).
+
+    Daily times are IST: parse_daily_time already converted the IST
+    hour to a UTC cron, so create_job gets the raw cron. One-off and
+    every-N go through parse_schedule's own forms.
+    """
+    sched = intent["schedule"]
+    kind = sched["kind"]
+    if kind == "once":
+        minutes = int(sched["in_minutes"])
+        if minutes % 60 == 0 and minutes >= 60:
+            hours = minutes // 60
+            sched_str = f"in {hours} hour" + ("s" if hours != 1 else "")
+        else:
+            sched_str = f"in {minutes} minute" + ("s" if minutes != 1 else "")
+        desc = f"once, {sched_str}"
+        return sched_str, desc
+    if kind == "every":
+        minutes = int(sched["interval_minutes"])
+        if minutes % (24 * 60) == 0:
+            days = minutes // (24 * 60)
+            sched_str = f"every {days}d"
+            desc = f"every {days} day" + ("s" if days != 1 else "")
+        elif minutes % 60 == 0:
+            hours = minutes // 60
+            sched_str = f"every {hours}h"
+            desc = f"every {hours} hour" + ("s" if hours != 1 else "")
+        else:
+            sched_str = f"every {minutes}m"
+            desc = f"every {minutes} minute" + ("s" if minutes != 1 else "")
+        return sched_str, desc
+    # daily: IST time -> UTC cron (parse_daily_time did the conversion).
+    time_ist = (sched.get("time_ist") or "9:00 AM").strip()
+    cron, display = parse_daily_time(f"every day at {time_ist}") or ("30 3 * * *", "9:00 AM IST")
+    return cron, f"daily at {display}"
+
+
+async def _handle_schedule_instruction(instruction: str, chat_id: Optional[str],
+                                       history: Optional[list[dict[str, Any]]],
+                                       db_path: Optional[str]) -> str:
+    """Create a real scheduled job from NL (Stream C, R-05)."""
+    from .monitoring_scheduler import format_ist_short
+    from .scheduler import create_job
+
+    intent = parse_schedule_intent(instruction)
+    if intent is None:
+        return (
+            "I can schedule that, but I couldn't work out the timing. "
+            "Try 'do this in 2 minutes', 'every 15 minutes', or 'daily at 8am'."
+        )
+    task_text = _strip_schedule_clause(instruction)
+    if not task_text or task_text.lower() in ("this", "that", "it", "do it", "this task"):
+        task_text = _instruction_from_history(history, instruction)
+    if not task_text:
+        return (
+            "Got the timing, but what should I do on that schedule? "
+            "Tell me the task — for example, 'summarise the news daily at 8am' — "
+            "and I'll set it up."
+        )
+    try:
+        sched_str, desc = _schedule_to_create_job_args(intent)
+        job = create_job(task_text, sched_str, db_path=db_path)
+    except ValueError as exc:
+        return f"I couldn't create that schedule: {exc}"
+    next_run = format_ist_short(job.get("next_run_at"))
+    job_id = job["id"]
+    return (
+        f"### 📅 Scheduled job created\n\n"
+        f"I'll run **{task_text[:120]}** {desc}.\n\n"
+        f"• **Job ID:** `{job_id}`\n"
+        f"• **Next run:** {next_run or '—'}\n"
+        f"• **Status:** Active\n\n"
+        f"Manage it in chat: `pause scheduled job {job_id[:8]}`, "
+        f"`resume scheduled job {job_id[:8]}`, or `cancel scheduled job {job_id[:8]}`. "
+        f"The job keeps running even with the frontend closed, as long as the backend is up."
+    )
+
+
+# --- Stream C: chat control for jobs and watches (task 6) -------------
+_JOB_CONTROL_RE = re.compile(
+    r"\b(pause|resume|cancel|delete|stop)\b[^.\n]{0,30}?\b(?:scheduled\s+)?jobs?\b\s*([0-9a-fA-F]{6,})?",
+    re.IGNORECASE,
+)
+_JOB_LIST_RE = re.compile(
+    r"\b(?:list|show|what\s+are)\b[^.\n]{0,30}?\b(?:my\s+)?(?:scheduled\s+)?jobs?\b",
+    re.IGNORECASE,
+)
+_WATCH_CONTROL_RE = re.compile(
+    r"\b(pause|resume|cancel|delete|stop)\b[^.\n]{0,30}?\bwatch\b\s*(?:for\s+)?(.{0,80})?",
+    re.IGNORECASE,
+)
+
+
+def _resolve_job(job_ref: str | None, db_path: Optional[str]) -> dict | None:
+    """A job by full id, id prefix (first 8 chars), or None."""
+    from .scheduler import get_job, list_jobs
+
+    if job_ref:
+        job = get_job(job_ref, db_path=db_path)
+        if job:
+            return job
+        for candidate in list_jobs(db_path=db_path):
+            if candidate["id"].startswith(job_ref.lower()):
+                return candidate
+    return None
+
+
+def _handle_job_control(instruction: str, db_path: Optional[str]) -> str | None:
+    """Pause/resume/cancel/list scheduled jobs from chat. None = not a job-control ask."""
+    from .monitoring_scheduler import format_ist_short
+    from .scheduler import delete_job, list_jobs, set_job_status
+
+    m = _JOB_LIST_RE.search(instruction or "")
+    if m and not _JOB_CONTROL_RE.search(instruction or ""):
+        jobs = list_jobs(db_path=db_path)
+        if not jobs:
+            return "No scheduled jobs yet. Say 'summarise the news daily at 8am' to create one."
+        lines = ["### 📅 Scheduled jobs\n"]
+        for job in jobs:
+            outcome = job.get("last_outcome") or "—"
+            lines.append(
+                f"• `{job['id'][:8]}` — {str(job['instruction'])[:80]} — "
+                f"{job['schedule']} — {job['status']} — next: "
+                f"{format_ist_short(job.get('next_run_at')) or '—'} — last run: {outcome}"
+            )
+        return "\n".join(lines)
+    m = _JOB_CONTROL_RE.search(instruction or "")
+    if not m:
+        return None
+    action = m.group(1).lower()
+    ref = (m.group(2) or "").strip() or None
+    job = _resolve_job(ref, db_path)
+    if job is None:
+        if ref:
+            return f"I couldn't find a scheduled job starting with `{ref}`. Say 'list scheduled jobs' to see them."
+        return "Which scheduled job? Say 'list scheduled jobs' and give me its id (the first 8 characters are enough)."
+    if action in ("cancel", "delete", "stop"):
+        # Cancel keeps the row (status 'cancelled', visible in the
+        # list with its last outcome); delete removes it entirely.
+        if action == "delete":
+            delete_job(job["id"], db_path=db_path)
+            return f"Deleted scheduled job `{job['id'][:8]}` ({str(job['instruction'])[:60]})."
+        set_job_status(job["id"], "cancelled", db_path=db_path)
+        return (
+            f"Cancelled scheduled job `{job['id'][:8]}` ({str(job['instruction'])[:60]}). "
+            f"It will not run again. Say 'list scheduled jobs' to confirm."
+        )
+    status = "paused" if action == "pause" else "active"
+    set_job_status(job["id"], status, db_path=db_path)
+    verb = "Paused" if action == "pause" else "Resumed"
+    extra = f" Next run: {format_ist_short(job.get('next_run_at')) or '—'}." if action == "resume" else ""
+    return f"{verb} scheduled job `{job['id'][:8]}` ({str(job['instruction'])[:60]}).{extra}"
+
+
+def _resolve_watch(ref: str | None, chat_id: Optional[str], db_path: Optional[str]):
+    """A watch by id/prefix, or by words in its title. Returns (row, ambiguous)."""
+    if not ref:
+        return None, False
+    ref = ref.strip().strip("\"'").strip()
+    if not ref:
+        return None, False
+    with db.get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitoring_missions ORDER BY created_at DESC"
+        ).fetchall()
+    hex_ref = re.sub(r"[^0-9a-fA-F]", "", ref)
+    if len(hex_ref) >= 6:
+        for row in rows:
+            if row["id"].replace("-", "").startswith(hex_ref.lower()):
+                return row, False
+    wanted = _normalised_product_title(ref)
+    matches = [r for r in rows if wanted and wanted in _normalised_product_title(r["title"])]
+    if len(matches) == 1:
+        return matches[0], False
+    if len(matches) > 1:
+        return None, True
+    return None, False
+
+
+def _handle_watch_control(instruction: str, chat_id: Optional[str],
+                          db_path: Optional[str]) -> str | None:
+    """Pause/resume/cancel watches from chat. None = not a watch-control ask."""
+    m = _WATCH_CONTROL_RE.search(instruction or "")
+    if not m:
+        return None
+    action = m.group(1).lower()
+    ref = (m.group(2) or "").strip() or None
+    row, ambiguous = _resolve_watch(ref, chat_id, db_path)
+    if ambiguous:
+        return "That matches more than one watch — give me more of its name, or its id."
+    if row is None:
+        if ref:
+            return f"I couldn't find a watch for '{ref}'. Check the watch card in this chat for its exact name or id."
+        return "Which watch? Give me part of its name or its id (from the watch card)."
+    mission_id = row["id"]
+    title = row["title"]
+    if action in ("cancel", "delete", "stop"):
+        with db.get_connection(db_path) as conn:
+            conn.execute("DELETE FROM monitoring_events WHERE mission_id=?", (mission_id,))
+            conn.execute("DELETE FROM monitoring_missions WHERE id=?", (mission_id,))
+        hub.spawn(hub.broadcast_control_state())
+        return f"Cancelled the watch **{title}**. It will not check again."
+    now = time.time()
+    if action == "pause":
+        with db.get_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE monitoring_missions SET status='paused', next_run_at=NULL WHERE id=?",
+                (mission_id,),
+            )
+        hub.spawn(hub.broadcast_control_state())
+        return f"Paused the watch **{title}**. Say 'resume watch {title}' to start it again."
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE monitoring_missions SET status='active', next_run_at=? WHERE id=?",
+            (now, mission_id),
+        )
+    hub.spawn(hub.broadcast_control_state())
+    return f"Resumed the watch **{title}** — the next check runs now."
+
+
 _BELOW_PRICE_RE = re.compile(
     r"(?:\b(?:below|under|less\s+than|at\s+most)\s*(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
     r"|\b(?:reaches?|drops?|falls?|goes?|gets?|dips?)\s+(?:below|under|to|under)\s*(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
@@ -587,6 +992,29 @@ def is_continuous_monitoring_directive(text: str, history: Optional[list[dict[st
         return False
     if MONITORING_DIRECTIVE_PATTERN.search(text):
         return True
+    # Stream C: a monitor/track/watch verb with a pasted URL is a watch
+    # ask even when no price/cadence word matches the patterns above —
+    # the {0,60} windows in the pattern cannot span a dotted URL
+    # ([^.\n] excludes '.'), so "monitor http://127.0.0.1:8765/notes
+    # every 1 minute" never matched and fell through to a browser task
+    # (EXTENSION_DISCONNECTED with no extension). The handler validates
+    # the URL with the unified gate and asks when it cannot use it.
+    if re.search(r"\b(?:monitor|track|watch)\b[^.\n]{0,40}?https?://\S+", text, re.IGNORECASE):
+        return True
+    # Stream C (R-05/R-06): NL scheduling + chat control for jobs and
+    # watches route here too — the handler dispatches them before the
+    # monitor logic. The monitor pattern above wins, so a price watch
+    # never becomes a job. Job control needs the word "scheduled" or
+    # an id, so a bare "cancel the job" (a browser task) does not get
+    # hijacked into the scheduler.
+    if is_schedule_directive(text):
+        return True
+    if _JOB_LIST_RE.search(text):
+        return True
+    if _JOB_CONTROL_RE.search(text) and ("scheduled" in text.lower() or re.search(r"\b[0-9a-fA-F]{6,}\b", text)):
+        return True
+    if _WATCH_CONTROL_RE.search(text):
+        return True
     # Fix 5: a bare "yes" answering the alert offer the agent just
     # made ("Want me to keep an eye on it?") is an acceptance, not a
     # new conversational turn — route it to the handler so a real
@@ -636,12 +1064,13 @@ def _history_has_monitored_product(history: list[dict[str, Any]]) -> bool:
             return True
         if re.search(r"https?://[^\s\"'<>)]*(?:amazon\.|flipkart\.|croma\.)", content, re.IGNORECASE):
             return True
-        # A listing/search page (internships, jobs) is watchable too:
-        # a bare "yes" to the alert offer after a listing search must
-        # create a new_listings watch, not stay conversational. The
-        # store-URL check above only knows retail hosts.
+        # A listing/search page is watchable too: a bare "yes" to the
+        # alert offer after a listing search must create a
+        # new_listings watch, not stay conversational. Any pasted
+        # http(s) URL counts (Stream A: no hardcoded domain list —
+        # the SSRF guard at creation time decides what is watchable).
         for m in _URL_RE.finditer(content):
-            if any(d in m.group(0).lower() for d in _LISTING_DOMAINS):
+            if m.group(0).lower().startswith(("http://", "https://")):
                 return True
     return False
 
@@ -747,13 +1176,17 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
         if raw.lower() not in ("this", "this product", "the product", "this price", "it", ""):
             candidate_title = raw
 
-    # A store URL pasted in the instruction itself wins — the history
+    # A URL pasted in the instruction itself wins — the history
     # loop below only sees earlier messages, so a URL given with the
     # ask was ignored and the watch fell back to a Flipkart search
     # page (whose first price is a banner, not the product's).
+    # Stream C: ANY http(s) URL counts, not only stores — a generic
+    # page watch ("monitor http://127.0.0.1:8765/notes every 15
+    # minutes") targets that page with a text_change condition. The
+    # unified URL gate validates it at creation (see the handler).
     best_url = ""
     url_m = re.search(r"https?://[^\s\"'<>)]+", instruction or "")
-    if url_m and any(d in url_m.group(0).lower() for d in ("amazon.", "flipkart.", "croma.")):
+    if url_m:
         best_url = url_m.group(0)
 
     # Look back in history for product name and URL. The history scan
@@ -798,10 +1231,14 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
         # would have watched the wrong product entirely.
         return "", ""
     if not candidate_title:
-        # A store URL but no name: the watch targets a real product
-        # page; title it by its store rather than inventing a model.
+        # A URL but no name: title it from the URL. A store product
+        # page gets "Product on <host>"; any other page gets its path
+        # slug ("Field Notes" for /notes) or the host.
         host = (urlsplit(best_url).hostname or "store").removeprefix("www.")
-        candidate_title = f"Product on {host}"
+        if any(d in best_url.lower() for d in ("amazon.", "flipkart.", "croma.")):
+            candidate_title = f"Product on {host}"
+        else:
+            candidate_title = _title_from_listing_url(best_url) or f"Page on {host}"
     if not best_url:
         # A product but no store URL: watch its search page, never a
         # store homepage (whose first price is a banner, not the
@@ -816,11 +1253,14 @@ def urllib_quote(s: str) -> str:
     return urllib.parse.quote_plus(s)
 
 
-# Sites whose listing / search pages a new-listings watch can target.
-# URLs are extracted whole first, then filtered by domain — anchoring
-# the domain inside the URL regex truncates the match to the domain.
+# Stream A: there is NO hardcoded domain list for new-listings
+# watches any more. Any http(s) URL the user pastes (or the history
+# carries) is a candidate; watchability is decided by the SSRF guard
+# (change_detector.validate_monitor_url) at creation time, the same
+# gate the fetch path uses — so a watch that is created can always
+# be checked. The old six-domain list refused isro.gov.in (and every
+# other site outside it) before any fetch.
 _URL_RE = re.compile(r"https?://[^\s\"'<>)]+", re.IGNORECASE)
-_LISTING_DOMAINS = ("internshala.com", "linkedin.com", "unstop.com", "amazon.", "flipkart.", "croma.")
 _TRACK_LISTING_TITLE_RE = re.compile(
     r"\b(?:track|watch|monitor)\b\s+(?:the\s+)?(.+?)(?:\s+and\s+(?:alert|notify|tell)|"
     r"\s+when\s+a\s+new|\s+on\s+(?:internshala|linkedin|unstop|amazon|flipkart|croma)\b|\s*$)",
@@ -836,6 +1276,37 @@ def _is_track_new_ask(instruction: str) -> bool:
     """True when the instruction asks to watch for NEW items
     (listings, jobs, internships) rather than a price."""
     return bool(_TRACK_NEW_RE.search(instruction or ""))
+
+
+_STORE_DOMAINS = ("amazon.", "flipkart.", "croma.")
+
+
+def _is_store_url(url: str) -> bool:
+    """True for the retail stores the price detector is built for."""
+    return any(d in (url or "").lower() for d in _STORE_DOMAINS)
+
+
+_KEYWORD_RE = re.compile(
+    r"\b(?:mentions?|contains?|says?|includes?|shows?)\s+[\"']?([A-Za-z][\w\- ]{1,50}?)[\"']?(?:\s*(?:,|and|then|$))",
+    re.IGNORECASE,
+)
+
+
+def _parse_keyword(instruction: str) -> str | None:
+    """'monitor this page and tell me when it mentions X' -> 'X'.
+
+    The keyword becomes a regex condition (escaped, so it is a plain
+    substring match). Returns None when no mention/contains ask is
+    present. A price ask never yields a keyword — the handler only
+    consults this for generic page watches.
+    """
+    m = _KEYWORD_RE.search(instruction or "")
+    if not m:
+        return None
+    word = re.sub(r"\s+", " ", m.group(1)).strip().strip("\"'")
+    if len(word) < 2 or word.lower() in ("a", "an", "the", "it", "price", "change", "changes"):
+        return None
+    return word
 
 
 def _extract_tracked_listing(instruction: str, history: Optional[list[dict[str, Any]]] = None) -> tuple[str, str]:
@@ -876,18 +1347,19 @@ def _extract_tracked_listing(instruction: str, history: Optional[list[dict[str, 
     url = ""
     for source in (instruction or "",):
         for m3 in _URL_RE.finditer(source):
-            if any(d in m3.group(0).lower() for d in _LISTING_DOMAINS):
-                url = m3.group(0)
-                break
+            # Stream A: any pasted http(s) URL is a candidate — the
+            # SSRF guard in _create_new_listings_watch decides
+            # watchability, not a hardcoded domain list.
+            url = m3.group(0)
+            break
         if url:
             break
     if not url and history:
         for entry in reversed(history):
             content = str(entry.get("content") or entry.get("message") or "")
             for m4 in _URL_RE.finditer(content):
-                if any(d in m4.group(0).lower() for d in _LISTING_DOMAINS):
-                    url = m4.group(0)
-                    break
+                url = m4.group(0)
+                break
             if url:
                 break
     # A bare pronoun title ("Track them and alert me" -> "them") cannot
@@ -904,19 +1376,18 @@ def _create_new_listings_watch(
     db_path: Optional[str],
 ) -> str:
     """Insert a new_listings mission (hourly) and return its confirmation.
-    The watch's checks run through the same egress gate as browsing: if
-    the site is not on the allow-list, the checks would fail forever,
-    so refuse honestly instead of creating a watch that can never fire."""
-    from .allowlist import url_allowed
-    from . import config as _config
+    Watchability is decided by the ONE monitoring URL gate
+    (change_detector.validate_monitor_url — the SSRF guard the fetch
+    path uses), never by a domain allowlist: a watch that is created
+    can always be checked, and a URL the guard refuses is refused
+    honestly here instead of being created to fail forever."""
+    from .change_detector import validate_monitor_url
 
-    if not url_allowed(listing_url, _config.ALLOWED_DOMAINS):
-        host = urlsplit(listing_url).hostname or listing_url
+    ok, gate_reason = validate_monitor_url(listing_url)
+    if not ok:
         return (
-            f"I can't watch {host} yet — it is not on the allowed-domains list, "
-            f"so the watch's checks would be blocked. Add {host} to "
-            f"PRIVAGENT_ALLOWED_DOMAINS in backend/.env and restart the backend, "
-            f"then ask me again and I'll set up the watch."
+            f"I can't watch {listing_url} — {gate_reason} "
+            f"Give me a public page URL (http or https) and I'll set up the watch."
         )
     mission_id = str(uuid.uuid4())
     now = time.time()
@@ -941,16 +1412,22 @@ def _create_new_listings_watch(
             ),
         )
         conn.commit()
-    try:
-        hub.spawn(hub.broadcast_control_state())
-    except Exception:
-        pass
+    # Stream C (R-03): broadcast_control_state now exists on the hub;
+    # the old try/except: pass swallowed the AttributeError and no
+    # client was ever told a watch was created/updated.
+    hub.spawn(hub.broadcast_control_state())
+    from .monitoring_scheduler import format_ist_short
+
     return (
         f"### 👀 New-listings watch active\n\n"
         f"I'll check **{listing_title}** every hour and alert you right here in this conversation when a new one appears.\n\n"
         f"• **Status:** Active — alerts land in this conversation\n"
+        f"• **Watch ID:** `{mission_id}`\n"
         f"• **Watching:** [{listing_title} ↗]({listing_url})\n"
         f"• **Check frequency:** Every hour\n"
+        f"• **Next check:** {format_ist_short(now) or '—'}\n"
+        f"• **Manage:** say `pause watch {mission_id[:8]}`, `resume watch {mission_id[:8]}`, "
+        f"or `cancel watch {mission_id[:8]}`, or use the card below\n"
         f"• **Alert:** The moment a new listing shows up\n\n"
         f"<!-- privagent-watch: {mission_id} -->"
     )
@@ -983,6 +1460,19 @@ async def handle_continuous_monitoring_instruction(
 ) -> str:
     """Register a persistent continuous monitoring mission and return natural departure handoff."""
     db.init_db(db_path)
+    # Stream C: chat control + NL scheduling dispatch first — but a
+    # genuine monitor ask always wins over a control phrase that
+    # happens to share a word ("show me the jobs" inside a track-new
+    # ask is still a listings watch, not the job list).
+    if not MONITORING_DIRECTIVE_PATTERN.search(instruction or "") and not _is_track_new_ask(instruction or ""):
+        job_answer = _handle_job_control(instruction, db_path)
+        if job_answer is not None:
+            return job_answer
+        watch_answer = _handle_watch_control(instruction, chat_id, db_path)
+        if watch_answer is not None:
+            return watch_answer
+        if is_schedule_directive(instruction):
+            return await _handle_schedule_instruction(instruction, chat_id, history, db_path)
     # Price signals are read first: a price ask must never become a
     # listing watch. Dispatch order is daily -> below -> percent ->
     # new_listings -> price_drop, so the handler body matches the
@@ -1026,7 +1516,7 @@ async def handle_continuous_monitoring_instruction(
         if not listing_title or not listing_url:
             return (
                 "I can watch for new listings, but I need the search page to watch. "
-                "Paste the search results URL (for example, the Internshala search page), "
+                "Paste the search results URL (for example, a job board's search page), "
                 "or ask me to search for the listings first and I'll offer the watch after."
             )
         return _create_new_listings_watch(listing_title, listing_url, chat_id, db_path)
@@ -1054,6 +1544,24 @@ async def handle_continuous_monitoring_instruction(
             "set up the watch."
         )
 
+    # Stream C (RC-LIVE-04): creation uses the SAME URL gate as the
+    # fetch — a watch the checker would refuse (private host, bad
+    # scheme) is refused here, honestly, instead of being created to
+    # fail forever. The 127.0.0.1 fixture host passes this gate. A
+    # DNS "does not resolve" failure is TRANSIENT (the fetch path
+    # treats it the same way): the watch is created with a note, and
+    # the scheduler keeps retrying, instead of refusing a page that
+    # may resolve a moment later.
+    from .change_detector import validate_monitor_url
+
+    ok, gate_reason = validate_monitor_url(target_url)
+    dns_transient = (not ok) and gate_reason and "does not resolve" in gate_reason
+    if not ok and not dns_transient:
+        return (
+            f"I can't watch {target_url} — {gate_reason} "
+            f"Give me a public page URL (http or https) and I'll set up the watch."
+        )
+
     # A product-named cadence follow-up ("live monitor Apple iPhone
     # 17, check every 5 minutes") names no threshold — the threshold
     # from the watch already running for this product still applies,
@@ -1066,6 +1574,33 @@ async def handle_continuous_monitoring_instruction(
 
     mission_id = str(uuid.uuid4())
     now = time.time()
+    # Stream C: a generic (non-store) page watch is a text_change /
+    # keyword watch, NOT a price watch. The old code built a
+    # price_drop mission for every URL, and price_drop with no
+    # extractable price can never fire — a "monitor this page" watch
+    # sat active forever and silently never alerted. A store URL (or
+    # any price signal) keeps the price branches below.
+    keyword = _parse_keyword(instruction)
+    is_generic = not _is_store_url(target_url)
+    watch_title = product_title if is_generic else f"Price Watch: {product_title}"
+    reply_header = "### 🎯 Continuous Price Monitoring Activated\n\n"
+    dns_note = ""
+    if dns_transient:
+        dns_note = (
+            f"• **Note:** {target_url} didn't resolve just now — I'll keep retrying on schedule "
+            f"instead of refusing the watch.\n"
+        )
+    if is_generic and daily is None and below is None and percent is None:
+        interval_sec = _parse_interval_seconds(instruction)
+        trigger_type, schedule_cron = "interval", None
+        if keyword:
+            condition_type, condition_params = "regex", {"target": product_title, "pattern": re.escape(keyword)}
+            alert_line = f"• **Alert Condition:** Alert the moment the page mentions '{keyword}'\n"
+        else:
+            condition_type, condition_params = "text_change", {"target": product_title}
+            alert_line = "• **Alert Condition:** Alert the moment the page content changes\n"
+        cadence_line = f"• **Check Frequency:** {_describe_interval(interval_sec).capitalize()} (interval scheduler tick)\n"
+        reply_header = "### 👀 Watch active\n\n"
     # A daily cadence and a threshold COMPOSE: "below ₹5000, notify
     # me every day" is a below_price mission on a daily cron — the
     # check runs once a morning and alerts only when the price is
@@ -1074,7 +1609,7 @@ async def handle_continuous_monitoring_instruction(
     # back to a 5-minute interval the user never asked for. The
     # scheduler's claim_due handles a cron trigger for any condition,
     # so the composed mission is checked the same way.
-    if daily and below is not None:
+    elif daily and below is not None:
         cron, display = daily
         trigger_type, schedule_cron, interval_sec = "cron", cron, 86400
         condition_type, condition_params = "below_price", {"target": product_title, "threshold": below}
@@ -1096,6 +1631,20 @@ async def handle_continuous_monitoring_instruction(
             f"• **Alert Condition:** Alert when the price drops {percent:g}% or more "
             f"from the price on the previous check (the first check records today's price)\n"
         )
+    elif is_generic and daily:
+        # Stream C: a generic page on a daily cadence is a daily
+        # text_change check, NOT a daily price report — there is no
+        # price to report on a notices page.
+        cron, display = daily
+        trigger_type, schedule_cron, interval_sec = "cron", cron, 86400
+        if keyword:
+            condition_type, condition_params = "regex", {"target": product_title, "pattern": re.escape(keyword)}
+            alert_line = f"• **Alert Condition:** Alert the moment the page mentions '{keyword}'\n"
+        else:
+            condition_type, condition_params = "text_change", {"target": product_title}
+            alert_line = "• **Alert Condition:** Alert when the page content changes\n"
+        cadence_line = f"• **Check Schedule:** Every day at **{display}**\n"
+        reply_header = "### 👀 Watch active\n\n"
     elif daily:
         # A daily time ("every day at 9am", "every morning at 9")
         # becomes a cron mission that REPORTS the price each morning,
@@ -1176,7 +1725,7 @@ async def handle_continuous_monitoring_instruction(
                FROM monitoring_missions
                WHERE conversation_id = ? AND title = ? AND status = 'active'
                ORDER BY created_at DESC LIMIT 1""",
-            (chat_id or "default", f"Price Watch: {product_title}"),
+            (chat_id or "default", watch_title),
         ).fetchone()
     # A re-ask that adds or drops the brand ("Apple iPhone 17"
     # after "iPhone 17") is the same watch — fall back to the
@@ -1260,13 +1809,18 @@ async def handle_continuous_monitoring_instruction(
                 ),
             )
             conn.commit()
-        try:
-            hub.spawn(hub.broadcast_control_state())
-        except Exception:
-            pass
+        # Stream C (R-03): broadcast_control_state now exists on the
+        # hub; the old try/except: pass hid the missing method.
+        hub.spawn(hub.broadcast_control_state())
+        from .monitoring_scheduler import format_ist_short
+
         return (
             f"Updated the watch for **{product_title}** — it was checking {old_cadence}{old_threshold}, "
-            f"now checking {new_cadence}{new_threshold}."
+            f"now checking {new_cadence}{new_threshold}.\n\n"
+            f"• **Watch ID:** `{existing['id']}`\n"
+            f"• **Next check:** {format_ist_short(now) or '—'}\n"
+            f"• **Manage:** say `pause watch {existing['id'][:8]}`, `resume watch {existing['id'][:8]}`, "
+            f"or `cancel watch {existing['id'][:8]}`, or use the card below."
         ) + f"\n\n<!-- privagent-watch: {existing['id']} -->"
 
     with db.get_connection(db_path) as conn:
@@ -1278,7 +1832,7 @@ async def handle_continuous_monitoring_instruction(
             (
                 mission_id,
                 chat_id or "default",
-                f"Price Watch: {product_title}",
+                watch_title,
                 target_url,
                 trigger_type,
                 schedule_cron,
@@ -1293,10 +1847,10 @@ async def handle_continuous_monitoring_instruction(
 
     # Inform connected workspace clients (alerts land in the
     # conversation the watch was created in).
-    try:
-        hub.spawn(hub.broadcast_control_state())
-    except Exception:
-        pass
+    # Stream C (R-03): broadcast_control_state now exists on the hub;
+    # the old try/except: pass swallowed the AttributeError and no
+    # client was ever told a watch was created/updated.
+    hub.spawn(hub.broadcast_control_state())
 
     # The watch marker is machine-readable: the workspace strips it
     # before rendering and turns it into an interactive watch card
@@ -1304,13 +1858,28 @@ async def handle_continuous_monitoring_instruction(
     # Monitoring is chat-only since 2026-11-18 — there is no monitor
     # form or scheduled-missions page anymore, so the confirmation
     # must not point at the Control Center dashboard.
-    return (
-        f"### 🎯 Continuous Price Monitoring Activated\n\n"
+    # Stream C (task 3): the reply must carry the watch id, the next
+    # check in IST, and a pause/resume/cancel affordance — the old
+    # reply had none of the three (only the hidden card marker).
+    from .monitoring_scheduler import format_ist_short
+
+    intro = (
         f"I've configured continuous background price tracking for **{product_title}**.\n\n"
+        if not is_generic
+        else f"I'll watch **{product_title}** and alert you right here in this conversation when it changes.\n\n"
+    )
+    return (
+        f"{reply_header}"
+        f"{intro}"
         f"• **Status:** Active — I'll post an alert right here in this conversation the moment anything changes\n"
-        f"• **Monitored Target:** [{product_title} Listing ↗]({target_url})\n"
+        f"• **Watch ID:** `{mission_id}`\n"
+        f"• **Monitored Target:** [{product_title} ↗]({target_url})\n"
         f"{cadence_line}"
         f"{alert_line}"
+        f"{dns_note}"
+        f"• **Next check:** {format_ist_short(now) or '—'}\n"
+        f"• **Manage:** say `pause watch {mission_id[:8]}`, `resume watch {mission_id[:8]}`, "
+        f"or `cancel watch {mission_id[:8]}`, or use the card below\n"
         f"• **Persistence:** Stored in SQLite — checks continue automatically even if you navigate away\n\n"
         f"---\n\n"
         f"*I've got the watch running in the background — I'll post an alert right here in this conversation the moment anything changes. Catch you later, buddy!* 👋\n"

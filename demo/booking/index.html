@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search trips — Demo Booking Fixture</title>
+<link rel="stylesheet" href="fixture.css">
+</head>
+<body>
+<main>
+  <div class="banner"><strong>DEMO FIXTURE — synthetic data only.</strong>
+  No real booking, no payment, no backend. Every train, price and passenger here is made up for the demo.</div>
+
+  <h1>Search trips</h1>
+  <p class="sub">Step 1 of 4 — pick a route and a date. All fields are labelled so the agent reads them from the accessibility tree.</p>
+
+  <form action="results.html" method="get">
+    <fieldset>
+      <legend>Trip</legend>
+      <div class="row">
+        <div>
+          <label for="from">From</label>
+          <select id="from" name="from" required>
+            <option value="Hyderabad (HYD)">Hyderabad (HYD)</option>
+            <option value="Bengaluru (BLR)">Bengaluru (BLR)</option>
+            <option value="Chennai (MAS)">Chennai (MAS)</option>
+            <option value="Mumbai (CSMT)">Mumbai (CSMT)</option>
+            <option value="Delhi (NDLS)">Delhi (NDLS)</option>
+          </select>
+        </div>
+        <div>
+          <label for="to">To</label>
+          <select id="to" name="to" required>
+            <option value="Bengaluru (BLR)">Bengaluru (BLR)</option>
+            <option value="Hyderabad (HYD)">Hyderabad (HYD)</option>
+            <option value="Chennai (MAS)">Chennai (MAS)</option>
+            <option value="Mumbai (CSMT)">Mumbai (CSMT)</option>
+            <option value="Delhi (NDLS)">Delhi (NDLS)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="date">Date of travel</label>
+          <input id="date" name="date" type="date" value="2026-12-05" min="2026-11-27" required>
+        </div>
+        <div>
+          <label for="passengers">Passengers</label>
+          <select id="passengers" name="passengers">
+            <option value="1">1 passenger</option>
+            <option value="2">2 passengers</option>
+            <option value="3">3 passengers</option>
+            <option value="4">4 passengers</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label for="travel_class">Class <span class="hint">(preference — options are shown for every class)</span></label>
+        <select id="travel_class" name="travel_class">
+          <option value="Sleeper">Sleeper</option>
+          <option value="3AC">3AC</option>
+          <option value="2AC">2AC</option>
+          <option value="Flight Economy">Flight Economy</option>
+        </select>
+      </div>
+    </fieldset>
+    <button class="btn" type="submit">Search trips</button>
+  </form>
+
+  <footer>Demo Booking Fixture · NAVIGATOR / PRIVAGENT · Stream F · All data synthetic.</footer>
+</main>
+</body>
+</html>

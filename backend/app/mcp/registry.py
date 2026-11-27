@@ -1,5 +1,6 @@
 """Schema-validated MCP tool catalog with single-use mutation gates."""
 from __future__ import annotations
+import asyncio
 import inspect
 import re
 import time
@@ -69,8 +70,21 @@ class Registry:
         try:
             result = tool.execute(args)
             if inspect.isawaitable(result):
-                if inspect.iscoroutine(result): result.close()
-                raise RuntimeError("async MCP tool requires execute_async")
+                # Stream B (S3-R4): discovered MCP tools are async
+                # closures (discovery.py opens a fresh session per
+                # call), so the sync path used to close the coroutine
+                # and raise for every discovered tool. When no event
+                # loop is running, drive it to completion here; when a
+                # loop IS running (async caller), that caller must use
+                # execute_async — awaiting from sync code would
+                # deadlock, so the RuntimeError stands there.
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    result = asyncio.run(result)  # type: ignore[arg-type]
+                else:
+                    if inspect.iscoroutine(result): result.close()
+                    raise RuntimeError("async MCP tool requires execute_async")
             clean = sanitize_tool_output(result)
             record_receipt(name, args, int((time.monotonic() - started) * 1000), "ok", clean["output_hash"])
             return clean

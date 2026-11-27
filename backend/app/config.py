@@ -78,6 +78,14 @@ SCHEDULER_TICK_S = float(os.getenv("PRIVAGENT_SCHEDULER_TICK_S", "30"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 TASK_TIMEOUT_S = float(os.getenv("TASK_TIMEOUT_S", "360"))
 
+# RC-1.5 / RC-LIVE-06: mock-provider banner. With no LLM key the whole
+# product runs on the canned mock provider; the UI must say so loudly
+# instead of silently presenting canned answers as AI. The banner in
+# src/agentApp.ts shows whenever GET /api/llm/config reports
+# provider "mock". Default on; set false only for a test double run
+# where the operator has deliberately chosen mock and knows it.
+MOCK_PROVIDER_BANNER = os.getenv("PRIVAGENT_MOCK_PROVIDER_BANNER", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # Screenshots are local-only by default. Remote vision is opt-in because a
 # rendered page can contain PII that never appears in the DOM snapshot.
 ALLOW_SCREENSHOTS = os.getenv("ALLOW_SCREENSHOTS", "false").strip().lower() in {"1", "true", "yes", "on"}

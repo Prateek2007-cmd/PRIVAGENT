@@ -112,14 +112,23 @@ def test_mcp_discovery_schema_policy_sanitizer_and_audit(tmp_path, monkeypatch):
     spec = ServerSpec("test", "stdio", command=sys.executable, read_only_tools=frozenset({"lookup"}))
     with pytest.raises(PermissionError): discovery.register_server(spec)
     discovery.register_server(spec, trusted_user=True)
+    # Fake session matching the real mcp 2.3.0 SDK surface:
+    # ClientSession.list_tools(*, params=None), pagination via
+    # params={"cursor": ...}, snake_case fields input_schema /
+    # next_cursor. The fake serves two pages so the test verifies the
+    # cursor round-trips through params=.
+    seen_params: list = []
     class Session:
-        async def list_tools(self, cursor=None):
-            return SimpleNamespace(tools=[SimpleNamespace(name="lookup", description="Read", inputSchema={"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":False}),
-                                          SimpleNamespace(name="write", description="Write", inputSchema={"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":False})], nextCursor=None)
+        async def list_tools(self, params=None):
+            seen_params.append(params)
+            if params and params.get("cursor") == "page2":
+                return SimpleNamespace(tools=[SimpleNamespace(name="write", description="Write", input_schema={"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":False})], next_cursor=None)
+            return SimpleNamespace(tools=[SimpleNamespace(name="lookup", description="Read", input_schema={"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":False})], next_cursor="page2")
     @asynccontextmanager
     async def fake_session(_): yield Session()
     discovery._session = fake_session
     assert asyncio.run(discovery.discover("test")) == ["test.lookup", "test.write"]
+    assert seen_params == [None, {"cursor": "page2"}]
     # Re-running discovery refreshes the same server's catalog instead of
     # failing on duplicate tool names.
     assert asyncio.run(discovery.discover("test")) == ["test.lookup", "test.write"]

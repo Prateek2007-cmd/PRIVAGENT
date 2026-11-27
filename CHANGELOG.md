@@ -5,6 +5,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — privacy redaction: bare OTPs and postal addresses no longer leak (2026-11-26, R5-02/R5-05)
+
+- Labelled-OTP pattern, bare-6-digit masking in page text / OCR text /
+  element values, OTP-named element values dropped, street-address +
+  UK-postcode patterns (`backend/app/privacy.py`). OCR text is now
+  routed through the same redactor before it reaches the planner.
+- Privacy leak re-measured with the repo's own eval harness
+  (`python backend/scripts/eval_live.py --suite privacy`):
+  **0.0417 (1/24)** — bare OTP 0/2, labelled OTP 0/1, postal address
+  0/1, phone 0/3; the one remaining leak is the unlabelled password
+  1/1, which has no pattern to match. History: 6/23 on 2026-11-16, 5/24 (0.2083) on 2026-11-18 after the phone fix.
+  Results in `evals/results/privacy_leak_2026-11-26.json`; docs
+  (`README.md`, `docs/DPIA.md`, `docs/EVALS.md`) updated to the
+  re-measured figure. Note: `backend/tests/test_privacy_leak.py`
+  still pins the old known-gap set — it needs its `KNOWN_GAPS`
+  expectations updated to match this fix (Stream E).
+- MCP discovery fixed for pinned `mcp==2.3.0` (paginate via
+  `params={"cursor": ...}`; discovery failures are now logged with
+  their exception type instead of swallowed), email dispatch is
+  honestly draft-only ("draft created — open Gmail to send it", never
+  "sent"; failures raise instead of falling through), the `json`
+  import that crashed every chat reply once a preference was stored
+  is added, a mock canned greeting can no longer complete a
+  non-greeting instruction (`MOCK_GREETING_MISMATCH`), and a loud
+  "MOCK PROVIDER — not real AI" banner shows in the UI whenever the
+  provider is mock.
+
 ### Fixed — UI flicker: first paint showed the old workspace, then the new UI
 
 - The old workspace is no longer painted HTML: `agent.html` keeps
@@ -52,8 +79,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   4, observations 1, wall median 825.39 ms vs committed 824.32 ms
   (within first-run variance; the 7 → 4 / 2 → 1 mechanism
   reproduces exactly). Eval harness re-run: checker ASR 0.50
-  (canonical 0.25, evasion 1.0), privacy leak rate 0.2609 (6/23),
-  mock benchmark 8/8 — identical to the Task 6 measurements.
+  (canonical 0.25, evasion 1.0), privacy leak rate 0.0417 (1/24,
+  re-measured 2026-11-26 after the OTP/address redaction fix; was
+  6/23 at Task 6), mock benchmark 8/8.
 - Live smoke against the real server (mock planner, fresh temp DB
   via `PRIVAGENT_DB_PATH`): `/api/health` reports provider `mock`;
   unauthenticated `/api/*` returns 401; `GET /api/control/privacy`
@@ -516,7 +544,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   supports `?event=` / `?limit=` and reports chain health;
   `verify_chain()` returns the first broken index. See `docs/PRIVACY.md`.
 - DPIA (`docs/DPIA.md`): data inventory, per-provider data flows,
-  measured risks (checker ASR 0.50, leak rate 0.2609), mitigations,
+  measured risks (checker ASR 0.50, leak rate 0.0417 — re-measured
+  2026-11-26; was 6/23 at Task 6), mitigations,
   and residual risks stated honestly.
 - Tracker / fingerprint hygiene: DNR blocklist extended 12 → 24 hosts
   (ads, session replay, fingerprinting — named list in
@@ -776,10 +805,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`benchmark_eval.py --trajectory-out`). Results in `evals/results/`,
   trajectories in `evals/trajectories/`.
 - Measured 2026-11-16: checker ASR **0.50 overall** (canonical 0.25,
-  evasion 1.0; benign false-positive rate 0.0), privacy leak rate
-  **0.2609** (6/23; pattern-covered types leak 0, leaks are bare OTPs,
-  unlabelled passwords, postal addresses, and a phone in an element
-  value), mock benchmark **8/8**. See `docs/EVALS.md` for the per-family
+  evasion 1.0; benign false-positive rate 0.0). Privacy leak rate was
+  **6/23** on 2026-11-16 (pattern-covered types leak 0, leaks
+  were bare OTPs, unlabelled passwords, postal addresses, and a phone
+  in an element value); re-measured **0.0417** (1/24) on 2026-11-26
+  after the OTP/address fix — bare OTPs, labelled OTPs and postal
+  addresses now leak 0; the one remaining leak is an unlabelled
+  password. Mock benchmark **8/8**. See `docs/EVALS.md` for the per-family
   and per-type breakdowns and the five documented regex gaps (including
   `click_instruction`, which the scan detects but `check_plan` never
   flags).

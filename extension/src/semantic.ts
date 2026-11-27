@@ -115,20 +115,53 @@ export function semanticRole(el: Element): string {
  switch(el.tagName.toLowerCase()) {
  case 'a':return el.hasAttribute('href')?'link':'generic';
  case 'button':return 'button';case 'select':return 'combobox';case 'textarea':return 'textbox';
- case 'input':{const type=(el as HTMLInputElement).type;return ({search:'searchbox',checkbox:'checkbox',radio:'radio',file:'button',button:'button',submit:'button'} as Record<string,string>)[type]||'textbox';}
+ case 'input':{const type=(el as HTMLInputElement).type;return ({search:'searchbox',checkbox:'checkbox',radio:'radio',range:'slider',file:'button',button:'button',submit:'button'} as Record<string,string>)[type]||'textbox';}
  default:return el.hasAttribute('contenteditable')?'textbox':'generic';
  }
 }
 export function controlType(el: Element): SemanticElement['controlType'] {
  const role=semanticRole(el);const type=(el as HTMLInputElement).type;
- if(type==='file')return 'file_uploader';if(type==='date'||type==='datetime-local'||el.getAttribute('aria-haspopup')==='dialog'&&/date|calendar/i.test(accessibleName(el)))return 'calendar_picker';
+ if(type==='file')return 'file_uploader';
+ // All native date/time pickers, not just date/datetime-local: a
+ // booking form's time or month field is a calendar control too.
+ if(type==='date'||type==='datetime-local'||type==='time'||type==='month'||type==='week'||el.getAttribute('aria-haspopup')==='dialog'&&/date|calendar/i.test(accessibleName(el)))return 'calendar_picker';
  if(role==='switch')return 'toggle_switch';if(role==='checkbox')return 'checkbox';if(role==='radio')return 'radio';if(role==='dialog')return 'modal';
+ // A button that opens a listbox/menu popup is a custom dropdown even
+ // though its role is plain "button" (unfamiliar sites, custom selects).
+ if(role==='button'&&['listbox','menu','tree','grid'].includes(el.getAttribute('aria-haspopup')||'')&&el.getAttribute('aria-expanded')!==null)return 'custom_dropdown';
  if(role==='combobox'&&el.tagName!=='SELECT')return 'custom_dropdown';if(role==='searchbox')return 'search_input';return 'generic';
+}
+/** Nearest preceding heading (h1–h6) in document order, searching
+ * previous siblings of the element and each ancestor. A page-level
+ * heading is still useful section context; the clip() bound keeps it
+ * short. Used by contextText to disambiguate repeated generic
+ * buttons ("Continue", "Next") across multi-step forms. */
+function nearestPrecedingHeading(el: Element): string {
+ let node: Element | null = el;
+ while (node) {
+   let sib = node.previousElementSibling;
+   while (sib) {
+     if (/^H[1-6]$/.test(sib.tagName)) return sib.textContent || '';
+     const inner = sib.querySelector('h1,h2,h3,h4,h5,h6');
+     if (inner) return inner.textContent || '';
+     sib = sib.previousElementSibling;
+   }
+   node = node.parentElement;
+ }
+ return '';
 }
 export function contextText(el: Element): string {
  const b=el.getBoundingClientRect();const parent=el.parentElement;
  if(!parent)return '';
- return clip(Array.from(parent.children).filter(n=>n!==el&&perceptible(n)&&Math.abs(n.getBoundingClientRect().top-b.top)<=50).map(n=>n.textContent||'').join(' '),160);
+ const parts: string[] = [];
+ // Fieldset legend: the group label for a control inside a <fieldset>
+ // (booking/passenger forms group "Passenger 1", "Trip", "Payment").
+ const legend = el.closest('fieldset')?.querySelector('legend');
+ if (legend?.textContent?.trim()) parts.push(legend.textContent);
+ const heading = nearestPrecedingHeading(el);
+ if (heading.trim()) parts.push(heading);
+ parts.push(Array.from(parent.children).filter(n=>n!==el&&perceptible(n)&&Math.abs(n.getBoundingClientRect().top-b.top)<=50).map(n=>n.textContent||'').join(' '));
+ return clip(parts.filter(p=>p.trim()).join(' '),160);
 }
 export function semanticElement(el: Element, elementId: string): SemanticElement | null {
  const bounds=viewportBounds(el);if(!bounds)return null;

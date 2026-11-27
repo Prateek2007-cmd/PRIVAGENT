@@ -44,10 +44,37 @@ CONNECTOR_LABELS = {
     "gmail": "Gmail",
     "google_calendar": "Google Calendar",
     "google_drive": "Google Drive",
+    "mailcal_sandbox": "MailCal Sandbox (test inbox)",
 }
 
 # Operations that change state. Everything else is a read.
 MUTATING_OPERATIONS = frozenset({"create", "draft", "trash"})
+
+# Stream C [C-jobs-mailcal-mcp]: the MailCal demo sandbox
+# (demo-sandboxes/mailcal, port 8126, account demo@demo.test) is a
+# *test* inbox — synthetic data, drafts never sent, no send endpoint.
+# It routes ONLY when the instruction names the test/demo inbox (or
+# the sandbox itself); a plain "check my inbox" still routes to real
+# Gmail, which fails honestly when unconnected. The route operation
+# is "review": one instruction may need several sandbox calls (list
+# inbox -> deadlines -> draft reply -> calendar event), and the
+# runner executes that multi-step review internally, gating each
+# mutating sub-step (draft, event) on its own confirmation.
+_MAILCAL_MARKER_RE = re.compile(
+    r"\b(?:test|demo)\s+(?:inbox|e-?mails?|mail|mailbox|calendar)\b"
+    r"|\bmailcal\b"
+    r"|\bdemo@demo\.test\b",
+    re.IGNORECASE,
+)
+
+# A test-inbox instruction is review-shaped when it asks for the
+# inbox review itself (deadlines, a draft reply, a calendar event).
+# Targeted single-message requests (search/read/download one email)
+# do not match and fall through to the planner's mailcal tools.
+_MAILCAL_REVIEW_RE = re.compile(
+    r"\b(?:review|deadline|draft|calendar|prepare|important|identify|reply)\b",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Detection tables (data, not code paths — one row per intent shape)
@@ -177,7 +204,7 @@ def _clean_query(raw: Optional[str]) -> str:
 class ConnectorRoute:
     """One routing decision: which connector, which operation, with what."""
 
-    connector: str  # "gmail" | "google_calendar" | "google_drive"
+    connector: str  # "gmail" | "google_calendar" | "google_drive" | "mailcal_sandbox"
     operation: str  # "search" | "list" | "get" | "create" | "draft" | "trash"
     query: str = ""
     params: dict[str, Any] = field(default_factory=dict)
@@ -246,6 +273,30 @@ def route_instruction(instruction: str) -> Optional[ConnectorRoute]:
     if _EXPLICIT_NAVIGATION_RE.search(text):
         return None
     if _is_disallowed_overlap(text):
+        return None
+
+    # Stream C: the test/demo inbox routes to the MailCal sandbox,
+    # checked FIRST — "prepare a calendar event" inside a test-inbox
+    # instruction is a sandbox event, not a Google Calendar create,
+    # and "review my test inbox" is a sandbox read, not a Gmail read.
+    # Without this, the calendar-companion check below would steal
+    # the whole instruction for Google Calendar (unconnected here)
+    # and the inbox half would never run.
+    if _MAILCAL_MARKER_RE.search(text):
+        # Review-shaped requests (review the inbox, deadlines, draft a
+        # reply, prepare a calendar event) run the multi-step review.
+        # A targeted request (find/read ONE message, download its
+        # attachment) does NOT take the review op: the review would
+        # create an unrelated draft + calendar event for it. It falls
+        # through to the planner, which has the mailcal_sandbox.* tools
+        # in the registry and selects search/get/download itself.
+        if _MAILCAL_REVIEW_RE.search(text):
+            return ConnectorRoute(
+                connector="mailcal_sandbox",
+                operation="review",
+                confidence=0.95,
+                reason="test/demo inbox intent routes to the MailCal sandbox connector (synthetic data; drafts never sent)",
+            )
         return None
 
     # Calendar: reuse the existing companion detector for reads, and

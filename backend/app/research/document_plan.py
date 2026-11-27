@@ -196,8 +196,15 @@ class StructuredDocumentPlan(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _build_citation_map(pkg: ResearchKnowledgePackage) -> dict[str, int]:
-    """1-indexed citation number mapping for all sources in package."""
-    sorted_sources = sorted(pkg.sources.values(), key=lambda s: s.source_id)
+    """1-indexed citation number mapping for all sources in package.
+
+    Natural order (src_2 before src_10) — see
+    renderers/base.py::_natural_source_key: a lexicographic sort
+    mis-numbers every citation once a package has >= 10 sources.
+    """
+    from .renderers.base import _natural_source_key
+
+    sorted_sources = sorted(pkg.sources.values(), key=lambda s: _natural_source_key(s.source_id))
     return {src.source_id: idx for idx, src in enumerate(sorted_sources, start=1)}
 
 
@@ -749,7 +756,15 @@ def build_structured_document_plan(
                 first_title="Unverified summary (from the conversation; no external sources were consulted)",
             )
     elif pkg.topic.findings_summary:
-        _add_markdown_text(s1, pkg.topic.findings_summary, first_title="Executive Synthesis")
+        # R4-7: findings_summary is unchecked model text, not verified
+        # evidence. Label it as model synthesis so a reader can tell
+        # which sentences are verified (the claims below) and which are
+        # model text. Never render it as "Executive Synthesis".
+        _add_markdown_text(
+            s1,
+            pkg.topic.findings_summary,
+            first_title="Model synthesis — verify against the verified claims below",
+        )
     else:
         s1.add_text(
             f"This autonomous technical dossier delivers an authoritative investigation into {clean_doc_title}. "

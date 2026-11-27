@@ -865,7 +865,7 @@ export async function executeAction(action: BrowserAction, taskId: string, allow
 
   const v = validateAction(action);
   if (!v.ok) {
-    return { ok: false, error: { code: "PLAN_INVALID", message: `invalid action: ${v.error}`, recoverable: false } };
+    return { ok: false, error: { code: "PLAN_INVALID", message: `invalid action ${action.type ?? "?"}: ${v.error}`, recoverable: false } };
   }
   // Task 4: while the operator has the browser (takeover), no agent
   // action may execute — not even a read. Recoverable: the action was
@@ -982,7 +982,7 @@ export async function executeAction(action: BrowserAction, taskId: string, allow
     }
   } catch (e) {
     if (e instanceof ActionAborted) return err("TIMEOUT", "action aborted after its deadline", true);
-    return err("UNKNOWN", String(e), true);
+    return err("UNKNOWN", `${actionLabel(action)} failed: ${String(e)}`, true);
   }
 }
 
@@ -994,14 +994,15 @@ async function doSpecialInput(
 ): Promise<ActionResult> {
   await ensureTabActive(tabId, signal);
   const agent = await withAgent(tabId);
-  const target = findTarget(action.target, await agent.list(), "click");
-  if (!target) return err("STALE_TARGET", `special input target missing or ambiguous${ambiguitySuffix()}`, true);
+  const candidates = await agent.list();
+  const target = findTarget(action.target, candidates, "click");
+  if (!target) return err("STALE_TARGET", `${actionLabel(action)}: target missing or ambiguous (${observedNote(candidates.length)})${ambiguitySuffix()}`, true);
   const p = action.params as any;
   throwIfAborted(signal);
   const result = method === "selectOption" ? await agent.selectOption(target.targetId, p.option, target.name)
     : method === "setDate" ? await agent.setDate(target.targetId, p.date, target.name)
     : await agent.uploadFile(target.targetId, p.fileName, p.base64, target.name);
-  if (!result.ok) return err("STALE_TARGET", result.error ?? "input not verified", true);
+  if (!result.ok) return err("STALE_TARGET", `${actionLabel(action)}: ${result.error ?? "input not verified"}`, true);
   await settleDom(tabId);
   return { ok: true, targetId: target.targetId, observation: await observe(tabId),
     evidence: `${action.type} selected and read back`,
@@ -1010,6 +1011,49 @@ async function doSpecialInput(
 
 function err(code: AgentError["code"], message: string, recoverable: boolean): ActionResult {
   return { ok: false, error: { code, message, recoverable } };
+}
+
+/**
+ * Stream F (diagnosability): a short, secret-free label for an action,
+ * so a failure names the step, the target ref/name, and what was
+ * observed — instead of an opaque "type failed" / "execution failed".
+ * Never includes typed text (params.text can be a password, PIN, or
+ * OTP) or file contents; option/date/key values are planner-chosen
+ * labels, not secrets.
+ */
+export function targetLabel(target: unknown): string {
+  const t = (target ?? {}) as Record<string, unknown>;
+  const bits: string[] = [];
+  if (typeof t.elementRef === "string" && t.elementRef) bits.push(`ref=${t.elementRef}`);
+  if (typeof t.targetId === "string" && t.targetId) bits.push(`id=${t.targetId}`);
+  if (typeof t.name === "string" && t.name) bits.push(`name="${String(t.name).slice(0, 60)}"`);
+  const coords = t.coords as Record<string, unknown> | undefined;
+  if (coords && typeof coords.x === "number" && typeof coords.y === "number") {
+    bits.push(`coords=(${coords.x}, ${coords.y})`);
+  }
+  return bits.join(" ");
+}
+
+export function actionLabel(action: BrowserAction): string {
+  const target = (action as { target?: unknown }).target;
+  const params = (action as { params?: Record<string, unknown> }).params ?? {};
+  const extra: string[] = [];
+  if (action.type === "navigate" && typeof params.url === "string") extra.push(`url=${params.url}`);
+  if (action.type === "select_option" && typeof params.option === "string") {
+    extra.push(`option="${String(params.option).slice(0, 60)}"`);
+  }
+  if (action.type === "set_date" && typeof params.date === "string") extra.push(`date=${params.date}`);
+  if (action.type === "press" && typeof params.key === "string") extra.push(`key=${params.key}`);
+  if (action.type === "scroll" && typeof params.direction === "string") extra.push(`direction=${params.direction}`);
+  if (action.type === "scroll" && typeof params.containerId === "string") extra.push(`container=${params.containerId}`);
+  return [action.type, target ? targetLabel(target) : "", ...extra].filter(Boolean).join(" ");
+}
+
+/** "observed N interactive element(s)" — appended to not-found errors so
+ * the planner (and the operator) can tell an empty page from a page
+ * whose elements simply did not match. */
+function observedNote(count: number): string {
+  return `observed ${count} interactive element(s) in the last observation`;
 }
 
 /**
@@ -1663,7 +1707,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
     // A plain not-found (no ambiguity recorded) still recovers via
     // coordinates, as before.
     if (getLastTargetAmbiguity()) {
-      return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
+      return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)} (${observedNote(cands.length)})${ambiguitySuffix()}`, true);
     }
     // Exactly one click: trusted CDP input, with a single in-page fallback.
     const p = action.target.coords;
@@ -1704,7 +1748,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
   }
 
   if (!target) {
-    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
+    return err("STALE_TARGET", `no matching element for ${JSON.stringify(action.target)} (${observedNote(cands.length)})${ambiguitySuffix()}`, true);
   }
 
   const targetId = target.targetId;
@@ -1726,7 +1770,7 @@ async function doClick(action: Extract<BrowserAction, { type: "click" }>, taskId
     throwIfAborted(signal);
     const res = await agent.click(targetId, targetName);
     if (!res.ok) {
-      return err("STALE_TARGET", res.error ?? `no matching element for ${JSON.stringify(action.target)}`, true);
+      return err("STALE_TARGET", `${actionLabel(action)}: ${res.error ?? "in-page click failed"}`, true);
     }
   }
   let obsTab = await settleAfterAction(tabId, before, action.timeoutMs, tabIdsBefore, signal);
@@ -1892,7 +1936,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
     target = resolveType(cands);
   }
   if (!target) {
-    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)}${ambiguitySuffix()}`, true);
+    return err("STALE_TARGET", `no safely identifiable element for ${JSON.stringify(action.target)} (${observedNote(cands.length)})${ambiguitySuffix()}`, true);
   }
   const targetId = target.targetId;
   const targetName = target.name || action.target.name || "";
@@ -1981,16 +2025,16 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
       res = await agent.type(targetId, typedText, clear, targetName);
     } catch (e) {
       const detail = String(e instanceof Error ? e.message : e).slice(0, 120);
-      return err("STALE_TARGET", `type failed: ${detail}`, true);
+      return err("STALE_TARGET", `${actionLabel(action)}: type failed: ${detail}`, true);
     }
-    if (!res.ok) return err("STALE_TARGET", res.error ?? "type failed", true);
+    if (!res.ok) return err("STALE_TARGET", `${actionLabel(action)}: ${res.error ?? "type failed"}`, true);
     typingMode = target.tag === "select" ? "in-page select" : "in-page fallback";
 
     if (target.tag !== "select") {
       const probe = await agent.readValue(targetId, targetName);
       const actual = res.value ?? probe.value;
       if (!probe.ok && res.value === undefined) {
-        return err("STALE_TARGET", "typed value could not be read back from the page", true);
+        return err("STALE_TARGET", `${actionLabel(action)}: typed value could not be read back from the page`, true);
       }
       if (!typedValueMatches(actual, typedText, clear)) {
         // Never embed the values: the typed text and the DOM value
@@ -1998,7 +2042,7 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
         // itself is all the planner needs to retry or re-ground.
         return err(
           "STALE_TARGET",
-          "typed value not confirmed in the DOM",
+          `${actionLabel(action)}: typed value not confirmed in the DOM`,
           true,
         );
       }
@@ -2119,7 +2163,7 @@ async function doPress(action: Extract<BrowserAction, { type: "press" }>, tabId:
       const agent = await withAgent(tabId);
       throwIfAborted(signal);
       const fallback = await agent.submit("", "");
-      if (!fallback.ok) return err("UNKNOWN", fallback.error ?? "Enter dispatch failed", true);
+      if (!fallback.ok) return err("UNKNOWN", `${actionLabel(action)}: ${fallback.error ?? "Enter dispatch failed"}`, true);
     }
   } else {
     throwIfAborted(signal);
@@ -2158,7 +2202,7 @@ async function doScroll(action: Extract<BrowserAction, { type: "scroll" }>, tabI
     ok: res.ok,
     observation: await observe(tabId),
     evidence: res.ok ? `scrollY=${res.scrollY}` : "scroll target not found",
-    error: res.ok ? undefined : { code: "STALE_TARGET", message: "scroll container not found", recoverable: true },
+    error: res.ok ? undefined : { code: "STALE_TARGET", message: `${actionLabel(action)}: scroll container not found`, recoverable: true },
   };
 }
 

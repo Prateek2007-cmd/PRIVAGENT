@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Choose an option — Demo Booking Fixture</title>
+<link rel="stylesheet" href="fixture.css">
+</head>
+<body>
+<main>
+  <div class="banner"><strong>DEMO FIXTURE — synthetic data only.</strong>
+  No real booking, no payment, no backend. Every train, price and passenger here is made up for the demo.</div>
+
+  <h1>Choose an option</h1>
+  <p class="sub">Step 2 of 4 — compare the options, then select one. Prices are per passenger, in rupees.</p>
+  <p class="trip" id="trip-line">Loading trip…</p>
+  <div id="options"></div>
+  <p><a class="link" href="index.html">Back to search</a></p>
+
+  <footer>Demo Booking Fixture · NAVIGATOR / PRIVAGENT · Stream F · All data synthetic.</footer>
+</main>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var from = q.get("from") || "Hyderabad (HYD)";
+  var to = q.get("to") || "Bengaluru (BLR)";
+  var date = q.get("date") || "2026-12-05";
+  var passengers = q.get("passengers") || "1";
+  var travelClass = q.get("travel_class") || "Sleeper";
+  document.getElementById("trip-line").textContent =
+    from + " to " + to + " · " + date + " · " + passengers + " passenger(s) · preferred class " + travelClass;
+
+  // Synthetic timetable. The Hyderabad–Bengaluru route has named trains;
+  // every other route gets the same three generic Demo Railways options.
+  var ROUTES = {
+    "Hyderabad (HYD)|Bengaluru (BLR)": [
+      { operator: "Demo Express 12639", depart: "06:00", arrive: "11:30", duration: "5h 30m", cls: "Sleeper", fare: 450 },
+      { operator: "Demo Shatabdi 12027", depart: "07:15", arrive: "12:45", duration: "5h 30m", cls: "3AC", fare: 720 },
+      { operator: "Demo Vande Bharat 20607", depart: "15:00", arrive: "19:40", duration: "4h 40m", cls: "2AC", fare: 990 }
+    ]
+  };
+  var GENERIC = [
+    { operator: "Demo Railways 101", depart: "06:30", arrive: "12:00", duration: "5h 30m", cls: "Sleeper", fare: 520 },
+    { operator: "Demo Railways 202", depart: "09:00", arrive: "14:10", duration: "5h 10m", cls: "3AC", fare: 780 },
+    { operator: "Demo Railways 303", depart: "16:20", arrive: "21:00", duration: "4h 40m", cls: "2AC", fare: 1150 }
+  ];
+  var options = ROUTES[from + "|" + to] || ROUTES[to + "|" + from] || GENERIC;
+  // Reverse direction uses the same times; the route label stays truthful.
+  var host = document.getElementById("options");
+  options.forEach(function (o, i) {
+    var card = document.createElement("div");
+    card.className = "card";
+    var params = new URLSearchParams({ from: from, to: to, date: date, passengers: passengers,
+      travel_class: travelClass, option: o.operator, depart: o.depart, arrive: o.arrive,
+      duration: o.duration, cls: o.cls, fare: String(o.fare) });
+    card.innerHTML =
+      '<div class="opt-head"><p class="opt-name"></p><p class="price"></p></div>' +
+      '<p class="meta"></p>' +
+      '<a class="btn" href="passengers.html?' + params.toString() + '"></a>';
+    card.querySelector(".opt-name").textContent = o.operator + " · " + o.cls;
+    card.querySelector(".price").textContent = "₹" + o.fare;
+    card.querySelector(".meta").textContent =
+      "Departs " + o.depart + " · arrives " + o.arrive + " · " + o.duration + " · " + from + " to " + to + " · " + date;
+    card.querySelector(".btn").textContent = "Select " + o.operator + ", ₹" + o.fare;
+    host.appendChild(card);
+  });
+})();
+</script>
+</body>
+</html>

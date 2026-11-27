@@ -5,6 +5,13 @@ The numbers come from a real run of ``backend/scripts/eval_live.py``
 ``backend/tests/fixtures/pii_cases.json``: 24 synthetic PII tokens,
 6 leaked into the planner prompt — leak rate 0.25. Re-measured
 2026-11-18 after the phone fix: 5 leaked — leak rate 0.2083.
+Re-measured 2026-11-26 after the OTP/address fix (Stream A, R5-02):
+1 leaked — leak rate 0.0417. Only the unlabelled bare password
+still leaks; bare OTPs, labelled OTPs and postal addresses are now
+redacted (see "Closed 2026-11-26" below). Re-measured 2026-11-27
+(Stream E, checker hardening + OCR verification): still 1 leaked —
+leak rate 0.0417. The bare password remains a documented gap: no
+pattern can match it without guessing.
 
 A leak = the exact token string survives ``classify_and_redact`` +
 ``build_prompt``. The fixture is split in two, and the split is the
@@ -13,14 +20,14 @@ point of the test:
 * ``PATTERN_COVERED`` — PII types the redactor's pattern set claims to
   handle (email, card, SSN, API keys, JWT, AWS, Slack, private key,
   labelled secrets, URL tokens, bare high-entropy tokens in element
-  values, phone numbers). These MUST NOT leak: the test asserts a zero
-  leak rate here. This is the fail-closed property.
+  values, phone numbers, bare/labelled OTPs, postal addresses). These
+  MUST NOT leak: the test asserts a zero leak rate here. This is the
+  fail-closed property.
 * ``KNOWN_GAPS`` — types the redactor does not cover today, measured
-  leaking: bare 6-digit OTPs (no pattern matches a bare short code),
-  unlabelled passwords, and postal addresses. These are asserted to
-  be *reported* with a leak-rate ceiling (overall <= 0.27, i.e. at
-  most the 6 measured leaks) — a fix may close a gap (the test then
-  needs updating deliberately, with the docs), but leaks may not
+  leaking: unlabelled passwords only (since 2026-11-26). These are
+  asserted to be *reported* with a leak-rate ceiling (overall <= 0.05,
+  i.e. at most the 1 measured leak) — a fix may close a gap (the test
+  then needs updating deliberately, with the docs), but leaks may not
   silently grow.
 
 Closed 2026-11-18: a bare high-entropy token (24+ chars, two
@@ -34,12 +41,22 @@ Closed 2026-11-18: phone numbers. ``PATTERNS`` had no phone pattern,
 so a phone in a ``tel:`` href, in free text, or in an element name
 passed through unredacted (``pii-el-phone-01`` leaked). The fix adds
 a ``phone`` pattern (country-code, grouped, and bare Indian mobile
-forms) and makes ``redact_url`` return ``tel:[REDACTED]`` / 
+forms) and makes ``redact_url`` return ``tel:[REDACTED]`` /
 ``sms:[REDACTED]`` — a tel:/sms: URL exists only to carry a number.
 Phone leak rate is now 0.0 (3/3 cases caught). Re-measured results
 are in ``evals/results/privacy_leak_2026-11-18.json`` (5/24, 0.2083).
 
-If the committed results JSON (``evals/results/privacy_leak_2026-11-18.json``)
+Closed 2026-11-26: bare OTPs, labelled OTPs, and postal addresses.
+The OTP/address fix (R5-02) adds an ``otp_labelled`` pattern (label +
+4-8 digit code), bare-6-digit masking in page text / OCR text /
+element values, OTP-named element values dropped, and street-address
++ UK-postcode patterns. Re-measured results are in
+``evals/results/privacy_leak_2026-11-26.json`` (1/24, 0.0417):
+bare OTP 0/2, labelled OTP 0/1, postal address 0/1, phone 0/3.
+Only the unlabelled bare password still leaks — no pattern can
+match it without guessing, so it stays a documented gap.
+
+If the committed results JSON (``evals/results/privacy_leak_2026-11-26.json``)
 is present, its summary must match a fresh run.
 """
 from __future__ import annotations
@@ -49,23 +66,23 @@ from pathlib import Path
 
 from scripts.eval_live import run_privacy_leak
 
-RESULTS_PATH = Path(__file__).resolve().parents[1].parent / "evals" / "results" / "privacy_leak_2026-11-18.json"
+RESULTS_PATH = Path(__file__).resolve().parents[1].parent / "evals" / "results" / "privacy_leak_2026-11-27.json"
 
 PATTERN_COVERED = {
     "email", "credit_card", "ssn", "api_key", "jwt", "aws_key",
     "slack_token", "private_key", "labelled_password", "labelled_token",
     "url_token", "bare_key", "phone",
+    # Closed 2026-11-26 by the OTP/address fix (R5-02): bare OTP 0/2,
+    # labelled OTP 0/1, postal address 0/1.
+    "bare_otp", "otp_labelled", "postal_address",
 }
 
-# (type, context) pairs measured leaking on 2026-11-16, with the reason.
-# Phone was here until 2026-11-18; the phone pattern + tel:/sms: URL
-# redaction closed it (re-measured 5/24, 0.2083).
+# (type, context) pairs measured leaking on 2026-11-26, with the reason.
+# OTPs and postal addresses were here until 2026-11-26; the OTP/address
+# fix closed them (re-measured 1/24, 0.0417). Only the unlabelled bare
+# password remains: no pattern can match it without guessing.
 KNOWN_GAPS = {
-    ("bare_otp", "page_text"): "no pattern matches a bare 6-digit code",
-    ("bare_otp", "element_value"): "element values only pass _redact_text (no OTP pattern)",
-    ("otp_labelled", "page_text"): "sensitive_kv needs an 8+ char value; a 6-digit OTP is shorter",
     ("bare_password", "page_text"): "unlabelled password has no pattern to match",
-    ("postal_address", "page_text"): "street addresses are not in the pattern set",
 }
 
 
@@ -94,10 +111,10 @@ def test_pattern_covered_types_never_leak():
 
 def test_known_gaps_are_reported_and_bounded():
     """The gaps may not silently grow: overall leak rate stays at or
-    below the measured 0.2609 (ceiling 0.27), and every known gap is
+    below the measured 0.0417 (ceiling 0.05), and every known gap is
     present in the results with its leaked status recorded."""
     result = run_privacy_leak()
-    assert result["leak_rate"] <= 0.27  # measured 0.2083 (5/24) after the phone fix; was 0.25 (6/24)
+    assert result["leak_rate"] <= 0.05  # measured 0.0417 (1/24) after the OTP/address fix; was 0.2083 (5/24)
     by_key = {(r["type"], r["context"]): r for r in result["cases"]}
     for (pii_type, context), _reason in KNOWN_GAPS.items():
         assert (pii_type, context) in by_key

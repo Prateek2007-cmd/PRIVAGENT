@@ -4,6 +4,21 @@ import type { SemanticElement } from "../src/contracts";
  * Content script injected programmatically by the service worker.
  * Performs in-page interaction and returns serializable results.
  * Exposes window.__navigatorAgent for executeScript probes.
+ *
+ * PRODUCTION OBSERVATION WALK: `candidates()` below is the walk the
+ * agent actually observes through — it is what `withAgent().list()`
+ * (actionExecutor.ts) returns and what the backend redacts. It is the
+ * ONLY walk that runs in a real tab. `src/observer.ts`
+ * `collectInteractiveElements` is a second, jsdom-only walk used by
+ * `extension/tests/observer.test.ts` to pin the same contract
+ * (refs e0.., bounds, search classification, sensitive-value
+ * exclusion) without a browser; it never runs in production, and the
+ * two must keep the same role vocabulary (see `implicitRole` — the
+ * production fallback used to return the raw tag name, "a"/"input",
+ * while the backend prompt and privacy prioritiser expect the ARIA
+ * roles "link"/"textbox"). Values are never read at observation time:
+ * `observe()` in actionExecutor.ts sends `value: undefined` for every
+ * element; values are only read by an explicit `readValue` probe.
  */
 export {}
 
@@ -274,6 +289,32 @@ function identityText(el: HTMLElement): string {
   ].filter(Boolean).join(" ")).toLowerCase();
 }
 
+/** Implicit ARIA role when the element carries no explicit `role`
+ * attribute. Must stay identical to `implicitRole` in
+ * `src/observer.ts` (the jsdom-only mirror walk): the backend prompt
+ * and the privacy prioritiser speak this vocabulary ("link",
+ * "textbox", "searchbox", "combobox"), not raw tag names ("a",
+ * "input"). A bare tag name here used to make descriptive links miss
+ * the link priority in `privacy.py` and made the planner prompt's
+ * `role="link"` vocabulary unmatchable in the ax tree. */
+function implicitRole(el: Element): string {
+  switch (el.tagName.toLowerCase()) {
+    case "button": return "button";
+    case "a": return "link";
+    case "input": {
+      const t = (el as HTMLInputElement).type;
+      if (t === "search") return "searchbox";
+      if (t === "text" || t === "email" || t === "url" || t === "password") return "textbox";
+      if (t === "checkbox") return "checkbox";
+      if (t === "radio") return "radio";
+      return "textbox";
+    }
+    case "textarea": return "textbox";
+    case "select": return "combobox";
+    default: return "generic";
+  }
+}
+
 function candidates(): AgentElement[] {
   const selectors = [
     'button',
@@ -456,7 +497,7 @@ function candidates(): AgentElement[] {
                  isComposer ? "textbox" :
                  (searchControl && isTextEntry(el)) ? "searchbox" :
                  (isSendBtn || isVoiceBtn || isCancelVoice || isGroupFilter || isCancelSearch) ? "button" :
-                 (isChatRow ? "listitem" : (el.getAttribute("role") || el.tagName.toLowerCase()));
+                 (isChatRow ? "listitem" : (el.getAttribute("role") || implicitRole(el)));
     const cssSelector = rawId ? `#${CSS.escape(rawId)}` : `[data-navigator-id="${targetId}"]`;
     // Task 7: element state for the accessibility tree. Checked comes
     // from the DOM for checkable inputs, selected/expanded from ARIA.
