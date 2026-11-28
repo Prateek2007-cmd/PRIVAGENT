@@ -15,6 +15,7 @@ import {
   isPageSettled,
   observe,
   resolveSessionTab,
+  typedValueMatches,
   withAgent,
 } from "../src/actionExecutor";
 import type { BrowserAction } from "../src/contracts";
@@ -1365,5 +1366,32 @@ describe("session tab drift", () => {
     });
     handleTabRemoved(1);
     expect(extensionSessions.has("s1")).toBe(false);
+  });
+});
+
+describe("typedValueMatches (Stream 2: form re-type verification; Stream C round 6: exact replace / combined append)", () => {
+  it("clear=true requires the exact value", () => {
+    expect(typedValueMatches("2026-12-05", "2026-12-05", true)).toBe(true);
+    // Stream C: surrounding whitespace is a different final value, not the
+    // intended one — the old trim forgiveness is gone (exact replace).
+    expect(typedValueMatches(" 2026-12-05 ", "2026-12-05", true)).toBe(false);
+    expect(typedValueMatches("2026-11-28", "2026-12-05", true)).toBe(false);
+  });
+
+  it("clear=false accepts an exact value or a true append", () => {
+    // Stream C: an append verifies against the EXPECTED COMBINED value
+    // (original + typed text). Without the original there is nothing to
+    // check the combination against, so it fails honestly.
+    expect(typedValueMatches("2026-12-05", "2026-12-05", false, "")).toBe(true);
+    // Search-box append: existing text + newly typed suffix.
+    expect(typedValueMatches("Hyderabad to ", "Hyderabad to Bengaluru", false, "")).toBe(false);
+    expect(typedValueMatches("Hyderabad to Bengaluru", "Bengaluru", false, "Hyderabad to ")).toBe(true);
+  });
+
+  it("clear=false rejects a value that merely contains the typed text mid-string", () => {
+    // Refinement re-type at the start of the caret: the new date is
+    // buried inside a corrupted value — must NOT verify.
+    expect(typedValueMatches("2026-12-052026-11-28", "2026-12-05", false, "2026-11-28")).toBe(false);
+    expect(typedValueMatches("xx2026-12-05yy", "2026-12-05", false, "xx")).toBe(false);
   });
 });

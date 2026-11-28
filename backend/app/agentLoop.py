@@ -342,6 +342,198 @@ def _is_form_refill_action(action: dict[str, Any]) -> bool:
     return False
 
 
+def _refill_field_key(action: dict[str, Any]) -> str:
+    """Stable identity for a form field: normalized target name/id."""
+    target = action.get("target") or {}
+    raw = str(target.get("name") or target.get("targetId") or "")
+    return re.sub(r"[^a-z0-9]+", "", raw.lower())
+
+
+def _refill_value(action: dict[str, Any]) -> str | None:
+    """The value a fill action carries, if any (type/set_date/select)."""
+    params = action.get("params") or {}
+    for key in ("text", "value", "date", "option"):
+        value = params.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    return None
+
+
+def _count_submits(history: list[dict[str, Any]]) -> int:
+    """How many search submits succeeded so far in this task."""
+    count = 0
+    for entry in history or []:
+        if not entry.get("result_ok"):
+            continue
+        action = entry.get("action") or {}
+        params = action.get("params") or {}
+        if action.get("type") == "type" and params.get("submit"):
+            count += 1
+        elif action.get("type") == "click":
+            target = action.get("target") or {}
+            name = str(target.get("name") or target.get("targetId") or "")
+            if _SUBMIT_NAME_RE.search(name):
+                count += 1
+    return count
+
+
+def _refill_clears(action: dict[str, Any]) -> bool:
+    """True when a fill action REPLACES the field (clear) rather than
+    appending to it. Only ``type`` actions carry a ``clear`` flag (the
+    extension defaults it to True); ``set_date``/``select`` always set
+    the whole value."""
+    if action.get("type") != "type":
+        return True
+    params = action.get("params") or {}
+    return bool(params.get("clear", True))
+
+
+def _submitted_field_values(history: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Each field's submitted COMBINED values, in submission order.
+
+    A replace (clear) sets the field's value; an append (clear=false)
+    extends the value the field held. The raw typed fragments alone do
+    not identify what was submitted: "Hyderabad" + append " to
+    Bengaluru" submitted "Hyderabad to Bengaluru", and a later replace
+    re-typing that combined value is a repeat even though the raw
+    fragment " to Bengaluru" differs from it.
+    """
+    submitted: dict[str, list[str]] = {}
+    current: dict[str, str] = {}
+    for entry in history or []:
+        if not entry.get("result_ok"):
+            continue
+        past = entry.get("action") or {}
+        if past.get("type") not in {"type", "set_date", "select"}:
+            continue
+        past_value = _refill_value(past)
+        if past_value is None:
+            continue
+        key = _refill_field_key(past)
+        if _refill_clears(past):
+            current[key] = past_value
+        else:
+            current[key] = (current.get(key) or "") + past_value
+        submitted.setdefault(key, []).append(current[key])
+    return submitted
+
+
+def _value_echoed_in_results_header(value: str, page_text: str | None) -> bool:
+    """True when a refill value is already the submitted search, as echoed
+    at the top of the results page.
+
+    A search submitted by clicking Search (pre-filled form, or values
+    typed before this history window) leaves NO type/set_date/select
+    entry in history, so the history-only comparison above would call
+    re-typing the same value a "refinement" and let the re-fill loop
+    run until the step budget dies (regression vs bddb272, where the
+    guard intercepted it). Search pages echo the submitted criteria in
+    a header near the top ("Harbour City → Lake Town · 2027-01-15"),
+    so a value already present there is a repeat, not a refinement.
+
+    Stream C (round 6): the echo must match a FULL header segment, not
+    a substring. The old substring check vetoed genuine refinements:
+    refining From down to "Harbour" was blocked because "Harbour"
+    appears inside the echoed "Harbour City", and an append fragment
+    such as " (BLR)" was blocked because it appears inside the echoed
+    "Bengaluru (BLR)" even though the combined value was new. The
+    header line is the first line carrying a route separator
+    ("→" or "·") within the first 500 chars, else the first non-empty
+    line; its segments (split on → · | , ;) are the echoed values.
+    Values shorter than 4 chars are ignored (they match too loosely
+    to prove anything), and anything past the header line — result
+    listings — never counts.
+    """
+    if not page_text or not value:
+        return False
+    needle = re.sub(r"\s+", " ", str(value).strip().lower())
+    if len(needle) < 4:
+        return False
+    header = str(page_text)[:500]
+    lines = [ln.strip() for ln in header.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    # The header is the first non-empty line — unless one of the first
+    # three lines carries a route separator ("→" / "·"), which is the
+    # echoed criteria line ("Harbour City → Lake Town · 2027-01-15").
+    # Only the first three lines are consulted: a "→" deeper in the page
+    # is a result listing's times, not the submitted search.
+    header_line = lines[0]
+    for ln in lines[:3]:
+        if "→" in ln or "·" in ln:
+            header_line = ln
+            break
+    segments = [
+        re.sub(r"\s+", " ", seg.strip().lower())
+        for seg in re.split(r"[→·|,;]", header_line)
+    ]
+    return needle in [seg for seg in segments if seg]
+
+
+def _refill_differs_from_submitted(
+    action: dict[str, Any],
+    history: list[dict[str, Any]],
+    working_memory: dict[str, Any],
+    page_text: str | None = None,
+) -> bool:
+    """True when a planned refill is a GENUINE REFINEMENT, not a loop.
+
+    A type/set_date/select carrying a value never submitted for that
+    field (e.g. changing the date 2026-12-05 -> 2026-12-06) is a
+    refinement: it must execute. Once such a refill is let through,
+    the Search click that submits it is part of the same refinement
+    and must also execute — tracked with the ``form_refinement_active``
+    flag, cleared only when a new submit actually lands in history
+    (so a failed click does not lose the refinement). A refill that
+    repeats an already-submitted value for the same field returns
+    False and is still intercepted by the form-results guard.
+
+    Stream C (round 6): the comparison is on the EXPECTED FINAL value,
+    not the raw fragment. A replace's final value is the typed value;
+    an append's final value is the field's last submitted value plus
+    the fragment (``_submitted_field_values`` reconstructs each field's
+    submitted combined values). So re-typing a combined value built by
+    an earlier append is a repeat, re-appending a fragment the field
+    already ends with is a repeat (it only duplicates text), and an
+    append whose combined value is new is a refinement — even when the
+    fragment alone appears in the results header. The header echo check
+    likewise runs on the expected final value.
+    """
+    if working_memory.get("form_refinement_active"):
+        if _count_submits(history) > int(working_memory.get("form_refinement_submits") or 0):
+            working_memory.pop("form_refinement_active", None)
+            working_memory.pop("form_refinement_submits", None)
+            return False
+        return True
+    if action.get("type") not in {"type", "set_date", "select"}:
+        return False
+    value = _refill_value(action)
+    if value is None:
+        return False
+    submitted = _submitted_field_values(history)
+    key = _refill_field_key(action)
+    prior = submitted.get(key, [])
+    if _refill_clears(action):
+        expected = value
+    else:
+        base = prior[-1] if prior else ""
+        if base.endswith(value):
+            # The field already ends with this fragment: appending it
+            # again only duplicates text (a re-append loop), even
+            # though the duplicated combined value is technically new.
+            return False
+        expected = base + value
+    if expected in prior:
+        return False
+    if _value_echoed_in_results_header(expected, page_text):
+        # Same value, submitted via a click (no typed history) and echoed
+        # in the results header: a repeat, not a refinement.
+        return False
+    working_memory["form_refinement_active"] = True
+    working_memory["form_refinement_submits"] = _count_submits(history)
+    return True
+
+
 def _extract_result_summary(text: str) -> str | None:
     """Deterministic summary of the priced results visible in page text.
 
@@ -445,11 +637,95 @@ def _record_results_page_as_research_source(
 # or, for a compound part, in its parent task's instruction — IS an
 # authorized research/navigation source when its host passes the task's
 # own domain allow-list. The allow-list stays the authorization
-# boundary: a host outside it is never admitted by this override.
-# No resolver/allow-list/planner code is touched (other streams' files).
+# boundary: a host outside it is never admitted by this override, and
+# with no allow-list configured at all the override admits nothing
+# (an unconfigured list is not an authorization). No
+# resolver/allow-list/planner code is touched (other streams' files).
 # ---------------------------------------------------------------------------
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>)]+")
+
+
+def _canonical_override_host(host: str) -> str:
+    """Host spelling as Chrome / the resolver will treat it.
+
+    Stream D (consistency): the allow-list match in
+    :func:`_task_authorized_host_url` is a plain string comparison, so
+    the same authorized host in a non-canonical spelling — decimal
+    ``2130706433``, hex ``0x7f000001``, octal ``0177.0.0.1``, short
+    ``127.1``, percent-encoded ``%31%32%37.0.0.1``, trailing dot —
+    did NOT match its own allow-list entry, while Chrome resolves
+    every one of those spellings to the same host. Normalizing here
+    (percent-decode once, strip a trailing dot, ``inet_aton``
+    canonicalization — the same normalization
+    :func:`app.monitor_check._canonical_ipv4` applies in the backend
+    fetch gate) makes the override judge the host the browser will
+    actually navigate to. It never widens the authorization: a host
+    only matches when its canonical form is on the list.
+    """
+    from urllib.parse import unquote
+
+    host = (host or "").lower().strip().rstrip(".")
+    if "%" in host:
+        try:
+            host = unquote(host).lower().strip().rstrip(".")
+        except Exception:
+            pass
+    try:
+        from .monitor_check import _canonical_ipv4
+
+        canonical = _canonical_ipv4(host)
+        if canonical is not None:
+            return canonical
+    except Exception:
+        pass
+    return host
+
+
+def _canonicalize_override_url(url: str, allowed_domains: list[str]) -> tuple[str | None, list[str] | None]:
+    """Rewrite *url* + *allowed_domains* to canonical host spellings.
+
+    Returns ``(None, None)`` when the URL needs no canonicalization
+    (already canonical), is not an http(s) URL, or carries userinfo —
+    in all of those cases the caller's plain ``url_allowed`` verdict
+    already stands and there is nothing to re-check.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None, None
+    if parts.scheme not in ("http", "https"):
+        return None, None
+    if parts.username or parts.password:
+        return None, None
+    if any(ch in url for ch in "\r\n\t\\"):
+        return None, None
+    raw_host = (parts.hostname or "").lower()
+    if not raw_host:
+        return None, None
+    canon_host = _canonical_override_host(raw_host)
+    if canon_host == raw_host.rstrip("."):
+        return None, None
+    netloc = canon_host
+    if ":" in netloc and not netloc.startswith("["):
+        netloc = f"[{netloc}]"
+    try:
+        port = parts.port
+    except ValueError:
+        return None, None
+    if port:
+        netloc = f"{netloc}:{port}"
+    canon_url = urlunsplit((parts.scheme, netloc, parts.path or "", parts.query or "", parts.fragment or ""))
+    canon_domains = []
+    for entry in allowed_domains:
+        entry = (entry or "").strip().lower()
+        if entry.startswith("*."):
+            canon_domains.append("*." + _canonical_override_host(entry[2:]))
+        else:
+            canon_domains.append(_canonical_override_host(entry))
+    return canon_url, canon_domains
 
 
 def _task_authorized_host_url(
@@ -459,9 +735,20 @@ def _task_authorized_host_url(
     parent_instruction: str | None = None,
 ) -> str | None:
     """First explicit URL in the instruction (else the parent task's)
-    whose host the task's domain allow-list permits, else None."""
+    whose host the task's domain allow-list permits, else None.
+
+    Fail-closed on an unconfigured allow-list: ``url_allowed`` allows
+    every host when the list is empty, which would let this override
+    admit any URL the task names — including a cloud-metadata or
+    private address the resolver deliberately rejects as SSRF-unsafe.
+    An unconfigured list means "not configured", not "authorize
+    everything": the override only ever admits a host the operator
+    explicitly allow-listed for the task.
+    """
     from .allowlist import url_allowed
 
+    if not allowed_domains:
+        return None
     candidates: list[str] = []
     for _text in (instruction or "", parent_instruction or ""):
         candidates.extend(_URL_IN_TEXT_RE.findall(_text))
@@ -470,6 +757,24 @@ def _task_authorized_host_url(
         try:
             if url_allowed(_url, allowed_domains):
                 return _url
+        except Exception:
+            continue
+        # Stream D: second pass on the canonical spelling. A task that
+        # allow-lists 127.0.0.1 and names http://2130706433/ (or the
+        # hex / octal / short / percent-encoded spelling) names the
+        # same host Chrome will navigate to — the plain string match
+        # above rejects it only because of spelling. The canonical
+        # URL is returned (never the raw spelling) so the navigation
+        # target logged and used downstream is unambiguous.
+        try:
+            _canon_url, _canon_domains = _canonicalize_override_url(_url, allowed_domains)
+        except Exception:
+            continue
+        if _canon_url is None or _canon_domains is None:
+            continue
+        try:
+            if url_allowed(_canon_url, _canon_domains):
+                return _canon_url
         except Exception:
             continue
     return None
@@ -1096,8 +1401,33 @@ async def _run_loop(
         # research extraction already ran on — nothing new to harvest.
         if not batch_continuation and raw_url and raw_text:
             try:
-                from .extractors.research import extract_page_research, update_multi_site_tracker
-                fact = extract_page_research(raw_url, raw_title, raw_text, image_url=raw_image or None)
+                from .extractors.research import (
+                    build_price_record,
+                    extract_page_research,
+                    update_multi_site_tracker,
+                )
+                # Merge phase (v4, Stream A issue 4): pass the observation's
+                # structured price metadata through (today the browser
+                # observation carries none until the extension captures
+                # JSON-LD/microdata, so the text-disambiguated record is
+                # the structured source) and persist the record even when
+                # no research fact is produced.
+                _structured_price = (
+                    raw_obs.get("price_info")
+                    if isinstance(raw_obs, dict)
+                    else None
+                )
+                fact = extract_page_research(
+                    raw_url, raw_title, raw_text,
+                    image_url=raw_image or None,
+                    structured_price=_structured_price,
+                )
+                _price_record = build_price_record(
+                    raw_url, raw_title, raw_text,
+                    structured_price=_structured_price,
+                    source="browser", task_id=task_id,
+                )
+                working_memory.setdefault("browser_price_records", {})[raw_url] = _price_record
                 if fact:
                     if "collected_research" not in working_memory:
                         working_memory["collected_research"] = {}
@@ -1702,7 +2032,16 @@ async def _run_loop(
             # ever get the penalty — their next step is a result click,
             # which is not a refill and is never intercepted here.
             _results_state = _results_state_in_text(raw_text)
-            if _results_state is not None and _search_submitted_in_history(history) and _is_form_refill_action(action):
+            if (
+                _results_state is not None
+                and _search_submitted_in_history(history)
+                and _is_form_refill_action(action)
+                # Merge phase (wiring): a refill carrying a NEW value for
+                # its field is a genuine refinement (new date / operator),
+                # not the re-fill loop — let it (and the Search click that
+                # submits it) execute instead of penalising it forever.
+                and not _refill_differs_from_submitted(action, history, working_memory, raw_text)
+            ):
                 _prompted_key = "form_results_read_prompted"
                 if not working_memory.get(_prompted_key):
                     working_memory[_prompted_key] = _results_state
@@ -4667,6 +5006,10 @@ async def _run_task_impl(task_id: str) -> None:
 
     intent_context = {
         "active_session": active_session,
+        # Stream 1 (CONTRACTS5): the task id rides in the context so
+        # the objective builder can tag its DETERMINISTIC_ROUTE /
+        # SEMANTIC_CLASSIFY log lines with it.
+        "task_id": task_id,
         # fixC M8: the classifier needs to know whether a live browser
         # exists before routing a latest-release question to it — the
         # question form is only a browser task when the extension is
@@ -4688,9 +5031,131 @@ async def _run_task_impl(task_id: str) -> None:
         "latest_checkpoint": latest_cp,
     }
 
-    classification = classify_intent(record.instruction, context=intent_context)
+    # Stream 1 (CONTRACTS5): the production semantic classifier — a
+    # provider-backed callable the objective builder consults ONLY for
+    # ambiguous/compound instructions. Built per task so the log lines
+    # carry this task_id; the provider itself is resolved lazily at
+    # call time, so no model call happens here.
+    from .semantic_classifier import make_semantic_classifier
+
+    classification = classify_intent(
+        record.instruction,
+        context=intent_context,
+        semantic_classifier=make_semantic_classifier(task_id=task_id),
+    )
+    # Stream B (CONTRACTS6): the semantic objective CONTROLS dispatch.
+    # resolve_dispatch reconciles the legacy keyword intent with the
+    # structured objective and returns the effective task type; the
+    # DISPATCH_DECISION line is the audit record of the choice taken
+    # here. When the semantic classifier was consulted and produced
+    # nothing usable while the legacy intent would run a browser /
+    # research workflow, the turn asks the operator what they meant
+    # (awaiting_input) instead of running a workflow on a guess —
+    # at most one clarification round, then the clarified text is
+    # re-classified once; a second failure falls through to the
+    # conversational path below instead of blocking forever.
+    from .intent_router import (
+        fallback_second_failure,
+        log_dispatch_decision,
+        resolve_dispatch,
+    )
+
+    _dispatch = resolve_dispatch(
+        classification,
+        task_id=task_id,
+        # Compound sub-tasks run autonomously inside the parent
+        # mission: nobody is there to answer a clarification
+        # question, so a failed semantic call must not park the part
+        # (and its parent) in the ask gate for 300 s — it falls
+        # through to legacy dispatch, which fails honestly
+        # downstream.
+        allow_ask=not getattr(record, "compound_part", False),
+    )
+    if _dispatch.await_input:
+        log_dispatch_decision(task_id, _dispatch)
+        _clarify_q = (
+            f"I couldn't work out what you meant by {record.instruction!r} — "
+            "the automatic check didn't return a clear answer. "
+            "What should I do with it?"
+        )
+        _save_checkpoint_defensive(
+            task_id, chat_id, None, 0, "",
+            [{"role": "user", "content": record.instruction}],
+            {**initial_memory, "pending_ask_user": {"question": _clarify_q, "kind": "preference"}},
+        )
+        _outcome, _answer = await _AskUserGate(record).ask(
+            question=_clarify_q, kind="preference"
+        )
+        if _outcome == "answer" and _answer:
+            initial_memory.setdefault("ask_user_answers", []).append(
+                {"question": _clarify_q, "answer": _answer}
+            )
+            record.instruction = (
+                f"{record.instruction}\n"
+                f"[Operator's answer to '{_clarify_q}': {_answer}]"
+            )
+            record.message = "Thinking..."
+            await real_hub.broadcast_progress(record)
+            classification = classify_intent(
+                record.instruction,
+                context=intent_context,
+                semantic_classifier=make_semantic_classifier(task_id=task_id),
+            )
+            _dispatch = resolve_dispatch(classification, task_id=task_id)
+            if _dispatch.await_input:
+                # Second failure: do not ask again. The clarified
+                # text goes to the conversational path below, which
+                # answers from it instead of running a guessed
+                # workflow. fallback_second_failure keeps overridden
+                # True so the dispatch site below applies
+                # effective_intent (NON_BROWSER) — otherwise the
+                # task would silently dispatch on the legacy browser
+                # guess while the log says non-browser.
+                _dispatch = fallback_second_failure(_dispatch)
+        else:
+            if _outcome == "cancel":
+                record.state = "cancelled"
+                record.message = "Cancelled — you didn't answer the question, so I stopped."
+            elif _outcome == "timeout":
+                record.state = "failed"
+                record.message = (
+                    "ASK_USER_TIMEOUT: no answer within 300 seconds — "
+                    "I stopped instead of guessing."
+                )
+            else:  # refused-sensitive
+                record.state = "failed"
+                record.message = (
+                    "I need that detail to proceed, but I can't ask for it in chat — "
+                    "passwords, codes and card details go through takeover in your browser only."
+                )
+            await real_hub.broadcast_progress(record)
+            if chat_id:
+                try:
+                    _persist_agent_message(
+                        chat_id, record.message,
+                        evidence="ask_user_cancelled" if _outcome == "cancel" else "failed",
+                        task_id=task_id,
+                    )
+                except Exception:
+                    pass
+            return
+    if _dispatch.overridden:
+        # The semantic objective overruled the legacy keyword intent:
+        # downstream branches (NON_BROWSER chain, RESEARCH_TASK
+        # intercept, browser gate) all read classification.intent /
+        # is_browser, so the override has to land here, not in a
+        # side channel.
+        classification.intent = _dispatch.effective_intent
     record.intent = classification.intent.value
     record.is_browser_task = classification.is_browser
+    log_dispatch_decision(task_id, _dispatch)
+    initial_memory["dispatch"] = {
+        "source": _dispatch.source,
+        "objective_type": _dispatch.objective_type,
+        "legacy_intent": _dispatch.legacy_intent,
+        "overridden": _dispatch.overridden,
+        "is_browser": _dispatch.is_browser,
+    }
 
     # Stream 1 (CONTRACTS4 §1): the structured objective rides in
     # working memory so every downstream consumer — the NON_BROWSER
@@ -5280,13 +5745,20 @@ async def _run_task_impl(task_id: str) -> None:
             _branch_objective = classification.objective
             try:
                 from .objective import build_objective as _build_branch_objective
+                from .semantic_classifier import make_semantic_classifier
 
                 _branch_objective = _build_branch_objective(
                     record.instruction,
                     context={
                         "conversation_history": initial_memory.get("conversation_history", []),
                         "has_active_email_mission": bool(_active_email_mission),
+                        "task_id": task_id,
                     },
+                    # Stream 1 (CONTRACTS5): same per-turn classifier
+                    # as the 4691 classification — the per-turn cache
+                    # in semantic_classifier means an ambiguous turn
+                    # costs one model call, not two.
+                    semantic_classifier=make_semantic_classifier(task_id=task_id),
                 )
                 initial_memory["objective"] = _branch_objective.to_dict()
             except Exception:
@@ -5326,7 +5798,21 @@ async def _run_task_impl(task_id: str) -> None:
                 _branch_objective is not None
                 and _branch_objective.primary_intent
                 in {"update_monitor", "pause_monitor", "resume_monitor",
-                    "cancel_monitor", "list_monitors"}
+                    "cancel_monitor", "list_monitors",
+                    # Stream B (CONTRACTS6): watch CREATION intents too.
+                    # A semantic objective that overruled a legacy
+                    # browser intent lands here as monitor_*; without
+                    # this the turn falls past the monitoring-directive
+                    # regex (which misses pronoun-led and pattern-miss
+                    # asks) to the model sink, which answers in prose
+                    # and creates no watch — the override would change
+                    # the dispatch line but execute nothing. The
+                    # handler is the same one the directive regex
+                    # routes to, and it answers honestly when no
+                    # product resolves. monitor_inbox stays out: the
+                    # email branches above own inbox asks.
+                    "monitor_product", "monitor_website",
+                    "monitor_new_listings"}
             ):
                 # Stream 1 (S5 gen B5/D10/D11): the objective names a
                 # watch-control turn the regex directive misses
@@ -5544,9 +6030,26 @@ async def _run_task_impl(task_id: str) -> None:
                 elif hasattr(provider, "chat_call"):
                     try:
                         answer = provider.chat_call(record.instruction, history=history, system_prompt=sys_prompt)
-                    except Exception:
-                        from .providers.mock import MockProvider
-                        answer = MockProvider().chat_call(record.instruction, history=history)
+                    except Exception as exc:  # noqa: BLE001 — LIVE-REPLAY (Stream 4): a real-provider
+                        # failure (live: FreePi HTTP 429) must fail honestly,
+                        # never silently fall back to the mock provider —
+                        # the mock returns a canned greeting and the turn
+                        # then fails as MOCK_GREETING_MISMATCH, hiding the
+                        # real cause from the operator.
+                        record.steps_done = 1
+                        record.state = "failed"
+                        record.message = (
+                            f"Task failed: the planner provider call failed ({exc}). "
+                            "No answer was produced — nothing was attempted with a fallback. "
+                            "Wait a moment and retry."
+                        )
+                        await real_hub.broadcast_progress(record)
+                        if chat_id:
+                            try:
+                                _persist_agent_message(chat_id, record.message, evidence="failed", task_id=task_id)
+                            except Exception:
+                                pass
+                        return
                 else:
                     answer = "I have processed your request."
                 # A hallucinated tool call must never reach the user as if

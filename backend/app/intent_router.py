@@ -11,10 +11,23 @@ preserve deliverable format metadata.
 """
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger("app.intent_router")
+
+# Same visibility fix as app.objective / app.semantic_classifier:
+# uvicorn leaves the root logger at WARNING, so without this the
+# DISPATCH_DECISION / SEMANTIC_OVERRIDE INFO lines would never reach
+# the backend log.
+if not logger.handlers:
+    _route_handler = logging.StreamHandler()
+    _route_handler.setLevel(logging.INFO)
+    logger.addHandler(_route_handler)
+logger.setLevel(logging.INFO)
 
 
 class TaskIntent(str, Enum):
@@ -81,6 +94,249 @@ class IntentClassification:
             "operationType": self.operation_type.value if self.operation_type else None,
             "objective": self.objective.to_dict() if self.objective is not None else None,
         }
+
+
+# ---------------------------------------------------------------------------
+# Stream B (CONTRACTS6): semantic objective controls dispatch.
+#
+# Before this, agentLoop dispatched on ``classification.intent`` /
+# ``classification.is_browser`` — the legacy keyword result — while
+# the structured objective (semantic or deterministic) was attached
+# to the classification and consulted in only two places
+# (should_route_email_interval, the watch-control branch). A
+# semantic ``browser_task`` for "what is latest from this" therefore
+# never browsed, and a legacy RESEARCH_TASK for a watch ask never
+# created a watch. :func:`resolve_dispatch` is the single place
+# where the legacy result and the objective are reconciled, and the
+# DISPATCH_DECISION line it feeds is the audit record of the choice
+# actually taken at the dispatch site.
+#
+# Precedence rule (semantic wins on ambiguity/conflict):
+#   1. Semantic failed (a REAL classifier consulted, transient
+#      failure) + a legacy browser intent -> ASK, don't guess: the
+#      turn ends ``awaiting_input`` with a clarification question
+#      instead of running a browser/research workflow on a guess.
+#      Structural unavailability (mock provider — no real model
+#      exists) is NOT a failure and never asks: the system runs on
+#      legacy routing, as designed. The ask is also suppressed for
+#      compound sub-tasks (``allow_ask=False``): a part runs
+#      autonomously inside its parent mission and nobody is there
+#      to answer it — it falls through to legacy dispatch, which
+#      fails honestly downstream instead of blocking the parent
+#      for 300 s.
+#   2. Semantic objective whose task type differs from the legacy
+#      intent -> the semantic type wins (either direction:
+#      NON_BROWSER -> browser, or browser -> NON_BROWSER).
+#      Logged as SEMANTIC_OVERRIDE with the legacy keyword rule.
+#   3. Otherwise the legacy intent stands. In particular a
+#      DETERMINISTIC objective never overrules a legacy browser
+#      intent: the legacy router owns two guards the single-family
+#      cascade does not — the compound find+track policy (a "find X
+#      and watch it" ask searches now and offers the watch; the
+#      handler would create a watch without ever showing results)
+#      and the how-to guard ("how do I check my email?" is advice,
+#      not a search, even though the cascade says simple_search).
+#      Verified live 2026-11-27: "check every 10 minutes for a
+#      price drop on the Sony headphones" is a watch by the legacy
+#      monitoring directive and a one-off simple_search by the
+#      cascade — the legacy answer is the right one there.
+#   4. CONTINUE_BROWSER_TASK / USE_EXISTING_USER_TAB are never
+#      overridden: the semantic classifier has no notion of the
+#      active session or the user's tab, and the browser gate
+#      already asks when the tab request itself is ambiguous.
+# ---------------------------------------------------------------------------
+
+#: Objective intents whose execution needs a live browser session.
+#: Every other canonical intent runs in the NON_BROWSER chain
+#: (monitoring / schedule / memory / connector handlers, or the
+#: conversational sink).
+OBJECTIVE_BROWSER_INTENTS = frozenset({"simple_search", "research", "browser_task"})
+
+
+def _effective_intent(objective_type: str, obj_is_browser: bool) -> TaskIntent:
+    """The legacy TaskIntent equivalent of a semantic objective."""
+    if not obj_is_browser:
+        return TaskIntent.NON_BROWSER
+    if objective_type == "research":
+        return TaskIntent.RESEARCH_TASK
+    return TaskIntent.NEW_BROWSER_TASK
+
+
+@dataclass
+class DispatchDecision:
+    """The reconciled dispatch choice for one turn."""
+
+    is_browser: bool
+    source: str  # "semantic" | "deterministic" | "fallback" | "legacy"
+    objective_type: Optional[str]
+    legacy_intent: str
+    overridden: bool
+    effective_intent: TaskIntent
+    await_input: bool
+    keyword_rule: Optional[str] = None
+
+
+def resolve_dispatch(
+    classification: "IntentClassification",
+    task_id: Optional[str] = None,
+    allow_ask: bool = True,
+) -> DispatchDecision:
+    """Reconcile the legacy keyword intent with the structured objective.
+
+    Pure (no I/O): safe to unit-test without a provider. The
+    SEMANTIC_OVERRIDE log line is emitted here when the semantic
+    objective overrules a disagreeing legacy intent; the
+    DISPATCH_DECISION line itself is logged by the caller at the
+    dispatch site via :func:`log_dispatch_decision`. ``allow_ask``
+    is False for compound sub-tasks (nobody is there to answer);
+    the caller (agentLoop) passes it from ``record.compound_part``.
+    """
+    legacy = classification.intent
+    legacy_intent = legacy.value
+    objective = getattr(classification, "objective", None)
+    if objective is None:
+        return DispatchDecision(
+            is_browser=classification.is_browser,
+            source="legacy",
+            objective_type=None,
+            legacy_intent=legacy_intent,
+            overridden=False,
+            effective_intent=legacy,
+            await_input=False,
+        )
+    primary = getattr(objective, "primary_intent", None) or "conversational"
+    source = getattr(objective, "source", "deterministic") or "deterministic"
+    obj_is_browser = primary in OBJECTIVE_BROWSER_INTENTS
+    # Session/tab intents are never overridden (rule 4 above).
+    if legacy in (TaskIntent.CONTINUE_BROWSER_TASK, TaskIntent.USE_EXISTING_USER_TAB):
+        return DispatchDecision(
+            is_browser=classification.is_browser,
+            source=source,
+            objective_type=primary,
+            legacy_intent=legacy_intent,
+            overridden=False,
+            effective_intent=legacy,
+            await_input=False,
+        )
+    # Rule 1: semantic failed + a browser workflow would have run on
+    # the legacy guess -> ask, don't guess. Only when a real provider
+    # was consulted and failed transiently (semantic_failed) — never
+    # for structural unavailability (semantic_unavailable: mock
+    # provider, no real model) — and never for compound sub-tasks
+    # (allow_ask=False: nobody is there to answer).
+    if (
+        getattr(objective, "semantic_failed", False)
+        and not getattr(objective, "semantic_unavailable", False)
+        and allow_ask
+        and classification.is_browser
+    ):
+        return DispatchDecision(
+            is_browser=False,
+            source="fallback",
+            objective_type=primary,
+            legacy_intent=legacy_intent,
+            overridden=True,
+            effective_intent=TaskIntent.NON_BROWSER,
+            await_input=True,
+            keyword_rule=classification.reason,
+        )
+    # Rule 2: semantic wins when its task type differs from legacy.
+    if source == "semantic":
+        effective = _effective_intent(primary, obj_is_browser)
+        if effective != legacy:
+            # A compound find+track ask ("find the cheapest X and
+            # watch its price") is deliberately a browser task: it
+            # searches now and offers the watch. The semantic
+            # objective says monitor_product, but routing it to the
+            # watch handler would create a watch without ever
+            # showing results — so the compound policy stands and
+            # the semantic result does not override here.
+            try:
+                from .continuous_monitoring_companion import _is_compound_find_and_track
+
+                _is_compound = _is_compound_find_and_track(
+                    getattr(objective, "raw", "") or ""
+                )
+            except Exception:
+                _is_compound = False
+            if _is_compound and effective == TaskIntent.NON_BROWSER:
+                return DispatchDecision(
+                    is_browser=classification.is_browser,
+                    source=source,
+                    objective_type=primary,
+                    legacy_intent=legacy_intent,
+                    overridden=False,
+                    effective_intent=legacy,
+                    await_input=False,
+                )
+            logger.info(
+                "SEMANTIC_OVERRIDE task_id=%s keyword_rule=%s semantic_result=%s reason=legacy_keyword_intent",
+                task_id or "unknown",
+                classification.reason,
+                primary,
+            )
+            return DispatchDecision(
+                is_browser=obj_is_browser,
+                source="semantic",
+                objective_type=primary,
+                legacy_intent=legacy_intent,
+                overridden=True,
+                effective_intent=effective,
+                await_input=False,
+                keyword_rule=classification.reason,
+            )
+    # Rule 3: legacy stands.
+    return DispatchDecision(
+        is_browser=classification.is_browser,
+        source=source,
+        objective_type=primary,
+        legacy_intent=legacy_intent,
+        overridden=False,
+        effective_intent=legacy,
+        await_input=False,
+    )
+
+
+def fallback_second_failure(decision: DispatchDecision) -> DispatchDecision:
+    """Second semantic failure, after the user already answered the ask
+    gate once: do not ask again. The clarified text goes to the
+    conversational path (NON_BROWSER) instead of running a workflow
+    guessed from keywords.
+
+    ``overridden`` stays True on purpose: the fallback overrules the
+    legacy browser guess, so the dispatch site applies
+    ``effective_intent`` (``if decision.overridden: classification.intent
+    = decision.effective_intent``). A regression (2026-11-27, found
+    live in the fallback run) set ``overridden=False`` here, which
+    silently skipped that application — the task then dispatched on
+    the legacy NEW_BROWSER_TASK while the DISPATCH_DECISION line
+    recorded non-browser. The log and the dispatch must agree.
+    """
+    return replace(
+        decision,
+        await_input=False,
+        overridden=True,
+        is_browser=False,
+        effective_intent=TaskIntent.NON_BROWSER,
+    )
+
+
+def log_dispatch_decision(task_id: Optional[str], decision: DispatchDecision) -> None:
+    """The DISPATCH_DECISION audit line (CONTRACTS6 vocabulary).
+
+    Logged at the dispatch site for every turn, overridden or not:
+    ``source`` is the provenance of the objective that controlled
+    the choice (semantic | deterministic | fallback | legacy when
+    no objective exists), ``objective_type`` is its primary intent,
+    ``legacy_intent`` is the keyword result it was reconciled with.
+    """
+    logger.info(
+        "DISPATCH_DECISION task_id=%s source=%s objective_type=%s legacy_intent=%s",
+        task_id or "unknown",
+        decision.source,
+        decision.objective_type or "none",
+        decision.legacy_intent,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1462,6 +1718,7 @@ def should_route_email_interval(
 def classify_intent(
     instruction: str,
     context: Optional[dict[str, Any]] = None,
+    semantic_classifier: Optional[Callable[[str], str]] = None,
 ) -> IntentClassification:
     """Classify user task intent before any browser operation.
 
@@ -1473,12 +1730,24 @@ def classify_intent(
     deterministically here (no model call — a bare interval stays
     ambiguous at this point because the active-email-mission flag
     lives in the dispatch layer, which re-resolves it).
+
+    ``semantic_classifier`` is the provider-backed callable from
+    :func:`app.semantic_classifier.make_semantic_classifier`
+    (production path: agentLoop builds it per task and passes it in).
+    It is consulted ONLY for genuinely ambiguous or compound
+    instructions — exactly one deterministic rule firing never calls
+    it — and an absent/invalid semantic result falls back honestly
+    instead of guessing. Callers that pass None keep the old
+    behaviour: ambiguous stays ``conversational`` with
+    missing=["intent_ambiguous"].
     """
     result = _classify_intent_impl(instruction, context=context)
     try:
         from .objective import build_objective
 
-        result.objective = build_objective(instruction, context=context)
+        result.objective = build_objective(
+            instruction, context=context, semantic_classifier=semantic_classifier
+        )
     except Exception:
         result.objective = None
     return result

@@ -11,13 +11,20 @@ Safety properties (read-only by construction):
   anything, no cookies or credentials are ever sent.
 * **SSRF-guarded.** Only ``http``/``https``; no userinfo in the URL;
   IP-literal hosts must be public, except ``127.0.0.1`` which is the
-  fixture address used by the tests and the demo script. Every
-  redirect hop is validated the same way (max 5). For hostname
+  fixture address used by the tests and the demo script. Non-canonical
+  IPv4 forms (decimal ``2130706433``, hex ``0x7f000001``, octal
+  ``0177.0.0.1``, short ``127.1``) are normalized to the canonical
+  dotted quad before the check, and a trailing dot is stripped, so
+  neither spelling can smuggle a private address past the gate.
+  Every redirect hop is validated the same way (max 5). For hostname
   targets the DNS rebinding check runs only when the fetch would go
   direct; when an HTTP(S) proxy is configured the proxy resolves the
   host, and this VM's local DNS answers every public name with a
   CGNAT address (``198.18.0.0/15``), so a local DNS check would
-  reject every real page.
+  reject every real page. (In practice the check never runs on Linux
+  — see :func:`_validate_monitor_url` — so the literal/canonical-IP
+  checks above are the operative defence and the rebinding defence
+  for proxied fetches rests on the egress proxy.)
 * **Bounded streaming.** ~10 s timeout; the body is streamed in
   64 KiB chunks and parsed incrementally, so a 1.75 MB page (ISRO
   opportunities) is checked, not refused. The raw stream is capped
@@ -93,6 +100,25 @@ _EMBEDDED_PRIVATE_IP_RE = re.compile(
 )
 
 
+def _canonical_ipv4(hostname: str) -> str | None:
+    """Canonical dotted-quad for an ``inet_aton``-style numeric host.
+
+    :func:`ipaddress.ip_address` only accepts canonical dotted quads,
+    but resolvers (and therefore urllib) also accept decimal
+    (``2130706433``), hex (``0x7f000001``), octal (``0177.0.0.1``) and
+    short (``127.1``) forms — all of which sailed past the IP-literal
+    check below and were only caught by the DNS-rebinding check, which
+    in practice never runs (see :func:`_validate_monitor_url`).
+    Normalizing here makes the IP check see the address the resolver
+    will actually use. Returns None for ordinary hostnames.
+    """
+    try:
+        packed = socket.inet_aton(hostname)
+    except (OSError, ValueError):
+        return None
+    return socket.inet_ntoa(packed)
+
+
 def _ip_is_public_or_fixture(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> tuple[bool, str | None]:
     """True for a public address, or the 127.0.0.1 fixture address."""
     if str(ip) == _FIXTURE_HOST:
@@ -121,7 +147,10 @@ def _validate_monitor_url(url: str) -> tuple[bool, str | None]:
         return False, f"Disallowed scheme '{parts.scheme}': only http and https are permitted."
     if parts.username or parts.password:
         return False, "Embedded credentials in URL authority are prohibited."
-    hostname = (parts.hostname or "").lower().strip()
+    # A trailing dot is insignificant in DNS ("localhost." is
+    # "localhost") but defeated the internal-hostname check below, so
+    # strip it before any hostname comparison.
+    hostname = (parts.hostname or "").lower().strip().rstrip(".")
     if not hostname:
         return False, "Empty hostname."
     if (hostname in _INTERNAL_HOSTNAMES or hostname.endswith(".internal")
@@ -131,14 +160,39 @@ def _validate_monitor_url(url: str) -> tuple[bool, str | None]:
         ip = ipaddress.ip_address(hostname)
     except ValueError:
         ip = None
+    if ip is None:
+        # Non-canonical IPv4 forms (decimal / hex / octal / short):
+        # judge the canonical address the resolver will use.
+        canonical = _canonical_ipv4(hostname)
+        if canonical is not None:
+            ip = ipaddress.ip_address(canonical)
     if ip is not None:
         return _ip_is_public_or_fixture(ip)
     if _EMBEDDED_PRIVATE_IP_RE.search(hostname):
         return False, f"Embedded private IP pattern in hostname '{hostname}' is blocked."
+    if "%" in hostname:
+        # A '%' here is never a legitimate DNS name (a valid IPv6
+        # zone id was already consumed by the IP-literal check above):
+        # it is a percent-encoded host such as %31%32%37.0.0.1, which
+        # no resolver will answer for. Reject rather than pass an
+        # unparseable host to the fetcher.
+        return False, f"Percent-encoded hostname '{hostname}' is blocked."
     # DNS rebinding defence, only when the fetch goes direct. When a
     # proxy is configured for this URL the proxy resolves the host;
     # local DNS in this VM answers every public name with a CGNAT
     # address, so checking it here would reject every real page.
+    # NOTE (2026-11-27, verified by probe): on Linux
+    # ``urllib.request.proxy_bypass`` returns False for every host
+    # except those in ``no_proxy`` — and False for ALL hosts when no
+    # proxy is configured at all (it falls through to the macOS
+    # sysconf path). So in practice this check runs only for
+    # ``no_proxy`` hosts (localhost / 127.0.0.1 / ::1 here), which the
+    # checks above already handle. The rebinding defence for proxied
+    # fetches therefore rests on the egress proxy, and the literal /
+    # canonical-IP checks above are the operative defence in this
+    # module. Do not "fix" this by always resolving: the local DNS
+    # answer (CGNAT 198.18.0.0/15, ``is_private``) would reject every
+    # real page.
     if urllib.request.proxy_bypass(hostname):
         try:
             addr_info = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
@@ -202,25 +256,38 @@ _MAX_SANE_PRICE = 10_000_000.0
 
 
 def _parse_amount(raw: str | None) -> float | None:
-    """'4,199' / '4199.00' -> 4199.0; None when not a sane price."""
+    """'4,199' / '4199.00' / '1,29,999' (Indian grouping) /
+    '1.299,99' (European decimal comma) -> float; None when not a
+    sane price. Delegates to the grouping-aware parser in
+    extractors.research so the monitor path and the browser text
+    path parse the same token the same way; plain numeric values
+    (JSON-LD ``price`` as a number) pass through directly."""
     if raw is None:
         return None
-    text = str(raw).strip().replace(",", "").replace("\u00a0", "")
-    try:
-        value = float(text)
-    except ValueError:
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        return value if 0 < value <= _MAX_SANE_PRICE else None
+    text = str(raw).strip().replace("\u00a0", "")
+    if not text:
         return None
-    if not (0 < value <= _MAX_SANE_PRICE):
-        return None
-    return value
+    from .extractors.research import _parse_grouped_amount
+
+    return _parse_grouped_amount(text)
 
 
 def _amount_from_text(text: str) -> tuple[float | None, str | None]:
-    """First currency amount in *text* -> (value, currency-or-None)."""
-    m = re.search(r"(₹|\$|£|€|(?:Rs\.?|INR|USD|EUR|GBP)\s*)\s*([\d,]+(?:\.\d{1,2})?)", text or "", re.I)
+    """First currency amount in *text* -> (value, currency-or-None).
+
+    The numeric token is captured whole (Indian grouping
+    ``1,29,999``, European ``1.299,99``) and parsed grouping-aware;
+    the old ``[\\d,]+(?:\\.\\d{1,2})?`` token truncated
+    ``€1.299,99`` to 1.29."""
+    m = re.search(r"(₹|\$|£|€|(?:Rs\.?|INR|USD|EUR|GBP)\s*)\s*([0-9](?:[0-9.,]*[0-9])?)", text or "", re.I)
     if not m:
         return None, None
-    value = _parse_amount(m.group(2))
+    from .extractors.research import _parse_grouped_amount
+
+    value = _parse_grouped_amount(m.group(2), m.group(1).strip())
     if value is None:
         return None, None
     symbol = m.group(1).strip()
@@ -689,7 +756,21 @@ def fetch_observation(url: str, *, timeout: float = FETCH_TIMEOUT_S,
     """
     for attempt in range(_FETCH_ATTEMPTS):
         try:
-            return _fetch_once(url, timeout=timeout, max_bytes=max_bytes)
+            observation = _fetch_once(url, timeout=timeout, max_bytes=max_bytes)
+            # R5-02 parity with the browser path (privacy.py): a bare
+            # 6-digit run in page text is OTP/PIN-shaped and is masked
+            # before the observation reaches the detector — the stored
+            # baseline must not keep a one-time code the page happened
+            # to display. Structured prices survive (they ride in the
+            # price fields, not the text), and the URL itself is never
+            # touched here. Applied here, not in _fetch_once, so
+            # retries still fetch the raw page.
+            text = observation.get("text")
+            if isinstance(text, str) and text:
+                from .privacy import _redact_bare_otp_codes
+
+                observation["text"] = _redact_bare_otp_codes(text)
+            return observation
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             if attempt + 1 >= _FETCH_ATTEMPTS:
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc

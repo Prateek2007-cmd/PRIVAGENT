@@ -1175,8 +1175,28 @@ def harvest_page_evidence(
                         "User-Agent": "PrivAgentResearchBot/1.0 (https://github.com/privagent; contact@privagent.local)",
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                     }
-                    with httpx.Client(timeout=4.0, follow_redirects=True, trust_env=False) as client:
+                    with httpx.Client(timeout=4.0, follow_redirects=False, trust_env=False) as client:
                         resp = client.get(canon_url, headers=fetch_headers)
+                        # Merge phase (v4, Stream D gap D4): redirects are
+                        # followed only to URLs that pass the same SSRF gate
+                        # as the initial URL — an unchecked
+                        # follow_redirects=True fetched private content
+                        # (proven live: redirect to a localhost listener
+                        # returned its body). Max 5 hops.
+                        for _hop in range(5):
+                            if resp.status_code not in (301, 302, 303, 307, 308):
+                                break
+                            location = resp.headers.get("location")
+                            if not location:
+                                break
+                            nxt = str(resp.url.join(location))
+                            hop_safe, _hop_err = is_safe_public_url(nxt)
+                            if not hop_safe:
+                                resp = None
+                                break
+                            resp = client.get(nxt, headers=fetch_headers)
+                        if resp is None:
+                            raise ValueError("redirect to unsafe destination")
                         if resp.status_code == 200 and resp.text:
                             html_content = resp.text
             except Exception:

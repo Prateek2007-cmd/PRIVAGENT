@@ -11,45 +11,35 @@ from typing import Any
 from . import db
 from .privacy import _redact_text
 
-_PRICE = re.compile(r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
-
-# Price-keyword context: a currency amount only counts as "the
-# price" when it sits next to a price word. A banner, a related
-# product or an MRP elsewhere on the page must not become the
-# watched price (the old first-currency-match did exactly that).
-_PRICE_CONTEXT_RES = [
-    re.compile(r"(?:selling|current|offer|sale|deal|discounted|special|now|today'?s|our)\s+price[^₹$\d]{0,40}?"
-               r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I),
-    re.compile(r"(?:price|mrp|buy\s+now|add\s+to\s+cart|check\s*out)[^₹$\d]{0,40}?"
-               r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)", re.I),
-    re.compile(r"(?:₹|\b(?:Rs\.?|INR|USD)\s*|\$)\s*([\d,]+(?:\.\d{1,2})?)[^.\n]{0,40}?"
-               r"(?:selling|current|offer|sale|deal|discounted|special)\s+price", re.I),
-]
-
-
-# A currency amount next to "Min"/"Max" is a price-filter bound
-# ("Price … Min ₹10000 ₹15000 …" in a search-page sidebar), never
-# the watched price. The old code returned the first contextual
-# match unconditionally, so a Flipkart search page baselined at
-# the ₹10,000 filter minimum while the real listings were ₹89,100
-# — and a 10%-drop condition then evaluated against a fabricated
-# ₹10,000. Filter-bound candidates are skipped; when nothing
-# survives, the price is honestly unknown (None), never a guess.
-_FILTER_BOUND_RE = re.compile(r"\b(?:min|max)\b", re.I)
-
-
+# Price extraction is label-aware (Stream 2): the disambiguator in
+# extractors.research classifies EVERY currency amount on the page
+# — current / MRP-original / discount / taxes / shipping-or-other —
+# and the watched price is only ever the current one. The old
+# contextual patterns listed "mrp" as a price word, so "MRP ₹9,999"
+# printed before the selling price BECAME the watched price; a
+# price-filter bound ("Price … Min ₹10,000" in a search sidebar) did
+# the same until it was special-cased. Both are subsumed here: the
+# disambiguator's exclusion labels run before its current-price
+# labels, and a filter bound is classified as "other". Imported
+# lazily: extractors.research only needs website_resolver (stdlib),
+# but change_detector sits on the monitoring import path and must
+# never gain an import-time cycle.
 def _extract_price(observation: dict[str, Any], text: str) -> tuple[float | None, str | None]:
     """The watched price for an observation — structured first,
-    contextual second, unambiguous-single-amount last.
+    label-disambiguated second, unambiguous-single-amount last.
 
     1. Structured metadata (``observation["price"]`` from
        monitor_check: JSON-LD / microdata / meta / JSON product
        API), already validated there.
-    2. A currency amount adjacent to a price word ("selling price
-       ₹4,199", "Price: ₹4,199") — EXCEPT a filter bound ("Price …
-       Min ₹10,000" on a search page), which is skipped.
+    2. The amount labelled as the current/selling price
+       ("Selling price ₹4,199", "Price: ₹4,199") — an MRP, a
+       discount ("Save ₹5,800"), a tax amount, a shipping amount
+       or a filter bound is never the current price, however early
+       it appears on the page.
     3. The ONLY currency amount in the whole text (unambiguous —
-       a one-line browser observation such as "₹100").
+       a one-line browser observation such as "₹100"), and only
+       when it carries no exclusion label (a lone "MRP ₹9,999"
+       is not a price).
     4. None — several competing amounts and no structure means the
        price is unknown, and guessing the first one (often a banner
        or an MRP) is worse than reporting "Price unavailable".
@@ -57,32 +47,16 @@ def _extract_price(observation: dict[str, Any], text: str) -> tuple[float | None
     structured = observation.get("price")
     if isinstance(structured, (int, float)) and structured > 0:
         return float(structured), (observation.get("price_info") or {}).get("source") if isinstance(observation.get("price_info"), dict) else None
-    for pattern in _PRICE_CONTEXT_RES:
-        for match in pattern.finditer(text):
-            try:
-                value = float(match.group(1).replace(",", ""))
-            except (ValueError, IndexError):
-                continue
-            if not 0 < value <= 10_000_000:
-                continue
-            # The span from the price word to the amount must not
-            # carry filter language: "Price … Min ₹10000" is the
-            # filter sidebar, not a product price. The check covers
-            # a few characters before the match too — the third
-            # pattern starts AT the amount, so its "Min" sits just
-            # outside the span.
-            window = text[max(0, match.start() - 12):match.end()]
-            if _FILTER_BOUND_RE.search(window):
-                continue
-            return value, "contextual"
-    amounts = _PRICE.findall(text)
-    if len(amounts) == 1:
-        try:
-            value = float(amounts[0].replace(",", ""))
-        except ValueError:
-            return None, None
-        if 0 < value <= 10_000_000:
-            return value, "single-amount"
+    from .extractors.research import disambiguate_prices
+
+    prices = disambiguate_prices(text)
+    current = prices.get("current")
+    if current is not None:
+        # Source vocabulary is pinned by existing tests: a labelled
+        # current price is "contextual", a lone amount
+        # "single-amount".
+        source = "contextual" if prices.get("current_source") == "labelled" else "single-amount"
+        return float(current), source
     return None, None
 
 # Stream C (RC-LIVE-04): ONE URL gate for monitoring, used by creation

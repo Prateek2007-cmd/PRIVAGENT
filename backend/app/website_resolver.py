@@ -511,6 +511,21 @@ _NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 _V4_MAPPED_PREFIX = ipaddress.ip_network("::ffff:0:0/96")
 
 
+def _canonical_ipv4(hostname: str) -> str | None:
+    """Canonical dotted-quad for an inet_aton-style numeric host, or None.
+
+    Merge phase (v4, Stream D gaps D1/D2): mirrors monitor_check._canonical_ipv4.
+    Non-canonical spellings (decimal/hex/octal/short, e.g. 2130706433,
+    0x7f000001, 127.1) must be judged by the address the resolver will
+    actually use, never by the spelling.
+    """
+    try:
+        packed = socket.inet_aton(hostname)
+    except (OSError, ValueError):
+        return None
+    return socket.inet_ntoa(packed)
+
+
 def _is_ip_safe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> tuple[bool, Optional[str]]:
     """Verify an IP address is a safe public endpoint, properly inspecting NAT64 / IPv4-mapped IPv6."""
     if isinstance(ip, ipaddress.IPv6Address) and (ip in _NAT64_PREFIX or ip in _V4_MAPPED_PREFIX):
@@ -588,6 +603,13 @@ def is_safe_public_url(url_or_domain: str, resolver=None) -> tuple[bool, Optiona
     hostname = hostname.lower().strip()
     if not hostname:
         return False, "Empty hostname."
+    # Merge phase (v4, Stream D gap D2): a trailing dot is insignificant in
+    # DNS ("localhost." is "localhost") but defeats the internal-hostname
+    # check and the IP-literal parse below — strip it before any comparison,
+    # as monitor_check._validate_monitor_url already does.
+    hostname = hostname.rstrip(".")
+    if not hostname:
+        return False, "Empty hostname."
 
     if (
         hostname in INTERNAL_HOSTNAMES
@@ -603,6 +625,23 @@ def is_safe_public_url(url_or_domain: str, resolver=None) -> tuple[bool, Optiona
         if not safe:
             return False, err
     except ValueError:
+        # Merge phase (v4, Stream D gaps D1/D2): non-canonical IPv4
+        # (decimal/hex/octal/short) — judge the canonical address the
+        # resolver will use, never the spelling. Mirrors
+        # monitor_check._canonical_ipv4.
+        canonical = _canonical_ipv4(hostname)
+        if canonical is not None:
+            ip = ipaddress.ip_address(canonical)
+            safe, err = _is_ip_safe(ip)
+            if not safe:
+                return False, err
+            return True, None
+        if "%" in hostname:
+            # A '%' is never a legitimate DNS name here (an IPv6 zone id
+            # was already consumed by the IP-literal check): it is a
+            # percent-encoded host, which WHATWG parsers (Chrome) decode
+            # to the real host. Reject rather than pass it on.
+            return False, f"Percent-encoded hostname '{hostname}' is blocked."
         # Hostname is not an IP literal. Check for embedded private IPs in domain patterns (e.g. nip.io, sslip.io)
         embedded_ip = re.search(
             r"(?:127(?:\.\d+){3}|10(?:\.\d+){3}|192\.168(?:\.\d+){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d+){2}|169\.254(?:\.\d+){2})",

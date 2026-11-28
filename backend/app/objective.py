@@ -40,9 +40,26 @@ rules are generic patterns over verbs, nouns and parameters.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger("app.objective")
+
+# CONTRACTS5 requires the DETERMINISTIC_ROUTE lines in backend logs
+# for verification, but uvicorn only configures its own loggers at
+# INFO (the root logger stays at WARNING), so INFO records from this
+# module would be swallowed — verified live 2026-11-27: zero
+# DETERMINISTIC_ROUTE lines in the backend log while WARNINGs did
+# appear. Give this logger its own INFO handler; records still
+# propagate, so test caplog keeps working, and the handler is added
+# once so the lines appear exactly once.
+if not logger.handlers:
+    _route_handler = logging.StreamHandler()
+    _route_handler.setLevel(logging.INFO)
+    logger.addHandler(_route_handler)
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Canonical intent vocabulary (CONTRACTS4 §1). Every router/dispatcher
@@ -217,9 +234,38 @@ class Objective:
     completion_criteria: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
+    # Stream B (CONTRACTS6): provenance of the routing decision —
+    # "deterministic" (exactly one rule family fired), "semantic"
+    # (the model classified an ambiguous/compound instruction), or
+    # "fallback" (no usable classification exists). Dispatch reads
+    # this; it never re-infers provenance from the text.
+    source: str = "deterministic"
+    # True when a semantic classifier was consulted and produced
+    # nothing usable (raised / empty / invalid / non-canonical).
+    # Dispatch treats that as "ask, don't guess" (see
+    # intent_router.resolve_dispatch).
+    semantic_failed: bool = False
+    # True when semantic classification was structurally unavailable:
+    # the configured provider is the mock provider (or no provider
+    # could be built), so no real model exists to consult. This is
+    # NOT a failure — the system runs on legacy routing, as designed
+    # — and dispatch must NOT ask the user about it (see
+    # build_objective). Distinct from semantic_failed, which is a
+    # transient failure of a real provider.
+    semantic_unavailable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # Stream B (CONTRACTS6): ``source`` / ``semantic_failed`` are
+        # dispatch-local provenance carried on the live object, NOT
+        # part of the serialized objective schema — the schema key set
+        # is pinned by test_objective_routing.py (CONTRACTS4 §1) and
+        # the verifier / companion read the dict for routing fields
+        # only. ``from_dict`` still restores them when present.
+        data = asdict(self)
+        data.pop("source", None)
+        data.pop("semantic_failed", None)
+        data.pop("semantic_unavailable", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Objective":
@@ -271,6 +317,9 @@ def _make_objective(
     condition: Optional[dict[str, Any]] = None,
     target_url: Optional[str] = None,
     missing: Optional[list[str]] = None,
+    source: str = "deterministic",
+    semantic_failed: bool = False,
+    semantic_unavailable: bool = False,
 ) -> Objective:
     defaults = _defaults_for_intent(primary_intent)
     return Objective(
@@ -287,6 +336,9 @@ def _make_objective(
         completion_criteria=defaults["completion_criteria"],
         tools=defaults["tools"],
         permissions=defaults["permissions"],
+        source=source,
+        semantic_failed=semantic_failed,
+        semantic_unavailable=semantic_unavailable,
     )
 
 
@@ -441,7 +493,7 @@ _STOPWORDS = {
 }
 _LEADING_FILLER_RE = re.compile(
     r"^(?:(?:please|hey|hi|hello|ok|okay|so|well|yeah|yep|yes|bro|dude|man|"
-    r"can\s+you|can\s+u|could\s+you|would\s+you)[\s,]+)+",
+    r"can\s+you|can\s+u|cn\s+u|could\s+you|would\s+you)(?:[\s,]+|$))+",
     re.IGNORECASE,
 )
 _TRAILING_FILLER_RE = re.compile(
@@ -581,6 +633,7 @@ def _clean_phrase(phrase: str) -> str:
     if words[0].lower() in {
         "on", "for", "over", "about", "of", "at", "to", "in", "with",
         "from", "by", "out", "and", "then", "so", "if", "when",
+        "instead", "rather",
         "change", "update", "set", "modify", "start", "stop", "pause",
         "resume", "cancel", "delete", "remove", "create", "make", "give",
         "send", "tell", "remind", "schedule", "do", "run",
@@ -588,8 +641,10 @@ def _clean_phrase(phrase: str) -> str:
         return ""
     # Possessive pronouns name someone's account, not a product
     # ("my email", "your inbox" must never become a watch title or
-    # a product entity — they are the email object).
-    if words[0].lower() in {"my", "your", "his", "her", "our", "their", "its"}:
+    # a product entity — they are the email object). First-person
+    # pronouns are the same shape ("I made" is a clause about the
+    # user, never a product — it used to title a bogus watch).
+    if words[0].lower() in {"my", "your", "his", "her", "our", "their", "its", "i", "we", "you"}:
         return ""
     # An email noun on its own is the mailbox, never a product.
     if all(w.lower() in {"email", "emails", "mail", "mails", "inbox", "mailbox", "gmail", "outlook"} for w in words):
@@ -802,13 +857,30 @@ def classify_semantic(
     (expected to be JSON). Returns None when the model output is
     missing, malformed, or names an intent outside the canonical
     vocabulary — the caller must then fall back to the deterministic
-    result instead of trusting it.
+    result instead of trusting it. One exception propagates instead:
+    :class:`app.semantic_classifier.MockProviderRefused` (the
+    configured provider is the mock provider, so no real model
+    exists). The caller (:func:`build_objective`) catches it to tell
+    structural unavailability apart from a transient failure — a
+    mock refusal must never be treated as "the model failed, ask
+    the user", or every mock-provider turn would block on a
+    question nobody can answer (Stream B regression, found live in
+    the suite: compound sub-tasks hung 300 s in the ask gate).
     """
     if not text or not callable(call_model):
         return None
     try:
         raw_reply = call_model(SEMANTIC_PROMPT + text.strip())
-    except Exception:
+    except Exception as exc:
+        # Stream B: mock refusal is structural, not transient — let
+        # it propagate (see docstring). Lazy import: this module
+        # must not import semantic_classifier at top level.
+        try:
+            from .semantic_classifier import MockProviderRefused
+        except Exception:
+            MockProviderRefused = None  # type: ignore[assignment]
+        if MockProviderRefused is not None and isinstance(exc, MockProviderRefused):
+            raise
         return None
     if not raw_reply:
         return None
@@ -861,6 +933,10 @@ def classify_semantic(
         condition=condition,
         target_url=target_url or None,
         missing=missing,
+        # Stream B (CONTRACTS6): a model-built objective carries its
+        # provenance so dispatch can tell it apart from a keyword
+        # fast-path result without re-matching the text.
+        source="semantic",
     )
 
 
@@ -954,6 +1030,335 @@ _EXPORT_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Precedence gate (Stream 1, CONTRACTS5): the deterministic fast path
+# runs ONLY when the instruction is genuinely unambiguous.
+#
+# THE RULE (one sentence): exactly one deterministic rule may fire.
+# Count the distinct primary intents the deterministic rules imply
+# (``_deterministic_families``); 1 -> run the deterministic cascade
+# below and log DETERMINISTIC_ROUTE; 0 (vague / pronoun-only, e.g.
+# "hmm, what about that thing") or >= 2 (a compound, e.g. a monitor
+# plus a schedule) -> semantic classification first. When semantic
+# returns None / invalid / unavailable, the answer is honest
+# (``conversational`` with missing=["intent_ambiguous"]) — never a
+# guess, never a silent fall-through to an unrelated branch
+# (especially never configure_email_polling: an interval token is a
+# parameter, never evidence of an email intent).
+#
+# The family detectors below mirror the cascade sections' conditions,
+# with the cascade's own priority order encoded as guards (a rule
+# lower in the cascade cannot also claim an instruction a higher
+# rule already owns — e.g. "check my email every 15 minutes" is
+# email polling, not a search for "my email"; a URL inside a monitor
+# instruction is the monitor's object, not navigation). ONE deliberate
+# deviation: the cascade's schedule rule excludes monitor verbs, so a
+# monitor+schedule compound would silently drop the schedule half;
+# the gate counts it as TWO families so it reaches semantic instead.
+# A bare remind/notify on a monitor ("then remind, check every 10
+# minutes") is NOT a second intent — it is the monitor's own
+# notification secondary — so only a non-notification schedule verb
+# (schedule/do/run/...) counts as a second family next to a monitor.
+# ---------------------------------------------------------------------------
+
+# Schedule verbs for the gate. Deliberately narrower than
+# _SCHEDULE_VERB_RE: "search"/"fetch" are retrieval verbs owned by
+# the search family ("search for X every day" is a recurring lookup,
+# not a scheduled job).
+_SCHEDULE_GATE_VERB_RE = re.compile(
+    r"\b(?:schedule|remind|do|run|repeat|perform|summari[sz]e|give|tell|"
+    r"send|generate|create|write)\b",
+    re.IGNORECASE,
+)
+# A schedule verb that is NOT a notification: next to a monitor verb
+# only these count as a second intent. "tell" counts only when it is
+# not "tell me" (a notification phrase).
+_SCHEDULE_NON_NOTIFICATION_VERB_RE = re.compile(
+    r"\b(?:schedule|do|run|repeat|perform|summari[sz]e|give|send|"
+    r"generate|create|write)\b|\btell\b(?!\s+me\b)",
+    re.IGNORECASE,
+)
+_STRONG_SEARCH_VERB_RE = re.compile(
+    r"\b(?:search|find|look\s+up|look\s+for)\b", re.IGNORECASE
+)
+_EMAIL_ONLY_QUERIES = frozenset({
+    "my email", "email", "mail", "my mail", "gmail", "inbox", "my inbox",
+})
+
+
+def _listing_noun_for(t: str, product: str, has_price: bool) -> Optional[str]:
+    """Module-level form of the listings-noun rule (shared by the gate
+    and the deterministic cascade so the two cannot drift apart)."""
+    if has_price:
+        return None
+    if not re.search(
+        r"\b(?:appears?|shows?\s+up|comes?\s+up|posted|listed)\b", t
+    ):
+        return None
+    if product and product.lower().startswith("new "):
+        noun = product[4:].strip()
+        if noun and noun.lower() not in {"one", "ones", "it", "this", "that"}:
+            return noun
+    m = _NEW_LISTING_RE.search(t)
+    if m:
+        noun = m.group(1).strip()
+        if noun and noun.lower() not in {"one", "ones", "it", "this", "that"}:
+            return noun
+    return None
+
+
+def _monitor_control_intent(
+    t: str, *, product: str, interval: Optional[int], references: list[str]
+) -> Optional[str]:
+    """The monitor-control intent (cascade §4) if one fires, else None.
+    The watch-summary ask (list_monitors) is NOT included here: the
+    cascade answers it in §3 (memory), so it belongs to that family.
+    """
+    if _MONITOR_CONTROL_RE.search(t):
+        if re.search(r"\bpause\b", t, re.IGNORECASE):
+            return "pause_monitor"
+        if re.search(r"\bresume\b", t, re.IGNORECASE):
+            return "resume_monitor"
+        return "cancel_monitor"
+    if _UPDATE_MONITOR_RE.search(t) and _MONITOR_VERB_RE.search(t):
+        return "update_monitor"
+    if interval is not None and _PRONOUN_INTERVAL_UPDATE_RE.search(t):
+        return "update_monitor"
+    _rel = _RELATIVE_INTERVAL_RE.search(t)
+    if _rel and (
+        references
+        or _MONITOR_VERB_RE.search(t)
+        or re.search(r"\bcheck\b", t, re.IGNORECASE)
+    ):
+        return "update_monitor"
+    return None
+
+
+def _monitor_intent(
+    t: str,
+    *,
+    product: str,
+    target_url: Optional[str],
+    has_email: bool,
+    has_product: bool,
+    has_website: bool,
+    has_price: bool,
+    condition: Optional[dict[str, Any]],
+    notify: bool,
+) -> Optional[str]:
+    """The monitor intent (cascade §6) if one fires, else None."""
+    # A control turn (§4) or a watch-summary ask (§3) owns the
+    # instruction first — a "watch" noun inside them is not a new
+    # monitor (e.g. "what did I ask you to watch earlier" is a
+    # list_monitors ask, not a monitor_product watch; "cancel the
+    # watch" is a cancel, not a monitor).
+    if _LIST_MONITORS_RE.search(t):
+        return None
+    if _MONITOR_CONTROL_RE.search(t):
+        return None
+    if _UPDATE_MONITOR_RE.search(t) and _MONITOR_VERB_RE.search(t):
+        return None
+    if _MONITOR_VERB_RE.search(t) and (
+        product
+        or target_url
+        or has_website
+        or has_email
+        or _listing_noun_for(t, product, has_price) is not None
+    ):
+        if has_email and not has_product and not has_website and not has_price:
+            return "monitor_inbox"
+        if _listing_noun_for(t, product, has_price) is not None:
+            return "monitor_new_listings"
+        if (target_url or has_website) and not has_product and not has_price:
+            return "monitor_website"
+        if product or has_price:
+            return "monitor_product"
+        return "monitor_website"
+    if (
+        product
+        and condition is not None
+        and condition.get("kind") == "percent_discount"
+        and notify
+    ):
+        return "monitor_product"
+    return None
+
+
+def _schedule_fires(t: str, *, monitor_fires: bool) -> bool:
+    """The schedule_task rule (cascade §8) if it fires, else False."""
+    if not (
+        _SCHEDULE_GATE_VERB_RE.search(t) and _SCHEDULE_CADENCE_RE.search(t)
+    ):
+        return False
+    if not monitor_fires:
+        return True
+    # A monitor verb is present: a bare remind/notify is the monitor's
+    # own notification secondary, not a second job — only a
+    # non-notification schedule verb is a second intent.
+    return bool(_SCHEDULE_NON_NOTIFICATION_VERB_RE.search(t))
+
+
+def _search_fires(
+    t: str,
+    *,
+    query: str,
+    monitor_fires: bool,
+    control_fires: bool,
+    email_polling_fires: bool,
+) -> bool:
+    """The simple_search rule (cascade §11) if it fires, else False."""
+    if not _SEARCH_VERB_RE.search(t) or not query:
+        return False
+    if monitor_fires:
+        # A monitor verb + object owns the instruction ("watch the
+        # price of X" is a monitor, not a search); the search verb
+        # inside it ("check every 20 minutes") is not a second intent.
+        return False
+    if control_fires:
+        # A monitor-control turn owns the instruction too ("update it
+        # to check every 45 minutes", "make that check twice as
+        # often"): the "check" inside it is the control's verb, not
+        # a search (cascade §4 precedes §11).
+        return False
+    if email_polling_fires:
+        # "check my email every 15 minutes" is polling, not a search
+        # for "my email" — unless a STRONG search verb names a real
+        # query too ("search for Fairphone and check my email ..."),
+        # which is a compound and both families must count.
+        if not _STRONG_SEARCH_VERB_RE.search(t):
+            return False
+        if query.strip().lower() in _EMAIL_ONLY_QUERIES:
+            return False
+    return True
+
+
+def _deterministic_families(
+    t: str,
+    ctx: dict[str, Any],
+    *,
+    product: str,
+    target_url: Optional[str],
+    has_email: bool,
+    has_product: bool,
+    has_website: bool,
+    has_price: bool,
+    interval: Optional[int],
+    condition: Optional[dict[str, Any]],
+    notify: bool,
+    references: list[str],
+) -> dict[str, str]:
+    """Distinct primary intents the deterministic rules imply.
+
+    Returns ``{family_label: primary_intent}`` — one entry per rule
+    family that fires. Exactly one entry means genuinely unambiguous.
+    """
+    families: dict[str, str] = {}
+
+    # §1. Greeting / capability question (whole-instruction matches).
+    if _GREETING_RE.match(t):
+        families["greet"] = "greet"
+    if _CAPABILITY_RE.match(t):
+        families["capability_query"] = "capability_query"
+
+    # §2. Connector route supplied by the caller.
+    if ctx.get("connector_route") is not None:
+        families["connector_task"] = "connector_task"
+
+    # §3. Memory (list first: a watch-summary ask beats recall).
+    if _LIST_MONITORS_RE.search(t):
+        families["memory"] = "list_monitors"
+    elif _REMEMBER_RE.search(t):
+        families["memory"] = "memory_store"
+    elif _RECALL_RE.search(t):
+        families["memory"] = "memory_recall"
+
+    # §4. Monitor control.
+    control = _monitor_control_intent(
+        t, product=product, interval=interval, references=references
+    )
+    if control is not None:
+        families["monitor_control"] = control
+
+    # §5. Schedule control.
+    if _SCHEDULE_CONTROL_RE.search(t):
+        families["schedule_control"] = (
+            "cancel_schedule"
+            if re.search(r"\b(?:cancel|delete|remove)\b", t, re.IGNORECASE)
+            else "update_schedule"
+        )
+
+    # §6. Monitor intents, classified by OBJECT.
+    monitor = _monitor_intent(
+        t,
+        product=product,
+        target_url=target_url,
+        has_email=has_email,
+        has_product=has_product,
+        has_website=has_website,
+        has_price=has_price,
+        condition=condition,
+        notify=notify,
+    )
+    if monitor is not None:
+        families["monitor"] = monitor
+
+    # §7. Email polling — ONLY when the object is email/inbox polling.
+    email_polling = False
+    if has_email and not has_product and not has_website and not has_price:
+        if _INTERVAL_CHANGE_VERB_RE.search(t) or interval is not None:
+            families["email_polling"] = "configure_email_polling"
+            email_polling = True
+    if (
+        interval is not None
+        and not has_product
+        and not has_website
+        and not has_price
+        and not has_email
+        and ctx.get("has_active_email_mission") is True
+    ):
+        families["email_polling"] = "configure_email_polling"
+        email_polling = True
+
+    # §8. Schedule a task (see _schedule_fires for the monitor rule).
+    if _schedule_fires(t, monitor_fires=monitor is not None):
+        families["schedule"] = "schedule_task"
+
+    # §9. Research / deliverable.
+    if _RESEARCH_WORD_RE.search(t) or (
+        _DELIVERABLE_WORD_RE.search(t)
+        and re.search(
+            r"\b(?:prepare|create|generate|write|make|build|produce|export|need|want|give\s+me|research|compare)\b",
+            t,
+            re.IGNORECASE,
+        )
+    ):
+        families["research"] = "research"
+
+    # §10. Export of existing work (no new topic).
+    if _EXPORT_RE.search(t) and not _RESEARCH_WORD_RE.search(t):
+        families["export"] = "artifact_request"
+
+    # §11. Simple search (guarded: see _search_fires).
+    if _search_fires(
+        t,
+        query=_extract_search_query(t),
+        monitor_fires=monitor is not None,
+        control_fires=control is not None,
+        email_polling_fires=email_polling,
+    ):
+        families["simple_search"] = "simple_search"
+
+    # §12. Explicit navigation; a bare URL counts only when no other
+    # family claimed the instruction (a URL inside a monitor/search
+    # instruction is that instruction's object, not navigation).
+    if _NAVIGATE_RE.search(t):
+        families["navigate"] = "browser_task"
+    elif target_url and not families:
+        families["navigate"] = "browser_task"
+
+    return families
+
+
 def build_objective(
     text: str,
     context: Optional[dict[str, Any]] = None,
@@ -961,11 +1366,22 @@ def build_objective(
 ) -> Objective:
     """Build the structured Objective for one instruction.
 
-    Deterministic rules first; the semantic classifier (a model
-    callable) runs ONLY when no deterministic rule fires. ``context``
-    may carry ``has_active_email_mission`` (bool|None — a bare
-    interval is ambiguous without it), ``conversation_history`` and
-    ``connector_route``.
+    Precedence rule (CONTRACTS5, Stream 1): the deterministic fast
+    path runs ONLY when exactly one deterministic rule fires (see
+    :func:`_deterministic_families`). Ambiguous (zero rules) or
+    compound (>= 2 rules) instructions go to the semantic classifier
+    first; when it is absent or returns None/invalid, the result is
+    honestly ``conversational`` with missing=["intent_ambiguous"] —
+    never a guess, never a fall-through to an unrelated branch.
+    Stream B (CONTRACTS6): when >= 2 rules fired and the semantic
+    result differs from what the deterministic cascade would have
+    picked, a ``SEMANTIC_OVERRIDE`` line records the override
+    (keyword_rule = the cascade's answer). The returned objective
+    carries ``source`` ("deterministic" | "semantic" | "fallback")
+    and ``semantic_failed`` so dispatch never re-infers provenance.
+    ``context`` may carry ``has_active_email_mission`` (bool|None —
+    a bare interval is ambiguous without it), ``conversation_history``,
+    ``connector_route`` and ``task_id`` (used in the route log lines).
     """
     raw = text or ""
     t = raw.strip()
@@ -982,6 +1398,155 @@ def build_objective(
     has_price = _PRICE_NOUN_RE.search(t) is not None
     notify = bool(_NOTIFICATION_RE.search(t))
     secondary = ["notify"] if notify else []
+
+    if not t:
+        return _make_objective(raw, "conversational", missing=["instruction"])
+
+    # Precedence gate: exactly one deterministic rule -> fast path;
+    # zero or >= 2 -> semantic classification first.
+    families = _deterministic_families(
+        t,
+        ctx,
+        product=product,
+        target_url=target_url,
+        has_email=has_email,
+        has_product=has_product,
+        has_website=has_website,
+        has_price=has_price,
+        interval=interval,
+        condition=condition,
+        notify=notify,
+        references=references,
+    )
+    task_id = ctx.get("task_id") or "unknown"
+
+    def _det() -> Objective:
+        # The deterministic cascade (same arguments in both call
+        # sites, so the gate and the conflict check cannot drift).
+        return _build_deterministic(
+            raw,
+            t,
+            ctx,
+            references=references,
+            interval=interval,
+            condition=condition,
+            target_url=target_url,
+            product=product,
+            has_email=has_email,
+            has_product=has_product,
+            has_website=has_website,
+            has_price=has_price,
+            notify=notify,
+            secondary=secondary,
+        )
+
+    if len(families) == 1:
+        obj = _det()
+        logger.info(
+            "DETERMINISTIC_ROUTE task_id=%s rule=%s", task_id, obj.primary_intent
+        )
+        expected = next(iter(families.values()))
+        if obj.primary_intent != expected:
+            # Tripwire: the gate and the cascade disagree. The
+            # cascade's answer stands (behaviour unchanged), but the
+            # mismatch is a gate bug to fix, not something to hide.
+            logger.warning(
+                "DETERMINISTIC_MISMATCH task_id=%s family=%s expected=%s got=%s text=%r",
+                task_id,
+                next(iter(families)),
+                expected,
+                obj.primary_intent,
+                t[:120],
+            )
+        return obj
+    _semantic_unavailable = False
+    if semantic_classifier is not None:
+        try:
+            semantic = classify_semantic(t, semantic_classifier)
+        except Exception as exc:
+            # Stream B: a mock-provider refusal is structural
+            # unavailability (no real model exists), not a failure —
+            # see classify_semantic. Anything else is a transient
+            # failure of a real provider.
+            try:
+                from .semantic_classifier import MockProviderRefused
+            except Exception:
+                MockProviderRefused = None  # type: ignore[assignment]
+            if MockProviderRefused is not None and isinstance(exc, MockProviderRefused):
+                semantic = None
+                _semantic_unavailable = True
+            else:
+                raise
+        if semantic is not None:
+            if len(families) >= 2:
+                # Stream B (CONTRACTS6): deterministic-vs-semantic
+                # conflict. Two or more keyword families fired, so
+                # the deterministic cascade WOULD have picked one —
+                # if the model picked a different one, it overrode a
+                # real keyword match, and that override is logged
+                # (keyword_rule = the cascade's answer). Zero
+                # families means no deterministic match existed, so
+                # there is nothing to override and nothing is logged.
+                try:
+                    would_be = _det()
+                except Exception:
+                    would_be = None
+                if (
+                    would_be is not None
+                    and would_be.primary_intent != "conversational"
+                    and would_be.primary_intent != semantic.primary_intent
+                ):
+                    logger.info(
+                        "SEMANTIC_OVERRIDE task_id=%s keyword_rule=%s semantic_result=%s reason=deterministic_cascade",
+                        task_id,
+                        would_be.primary_intent,
+                        semantic.primary_intent,
+                    )
+            return semantic
+    return _make_objective(
+        raw,
+        "conversational",
+        references=references,
+        missing=["intent_ambiguous"],
+        # Stream B (CONTRACTS6): no usable classification exists.
+        # semantic_failed is True only when a REAL classifier was
+        # consulted and failed transiently (raised / empty /
+        # invalid); semantic_unavailable is True when no real model
+        # exists at all (mock provider) — the system then runs on
+        # legacy routing, as designed, and dispatch must NOT ask the
+        # user about it. With no classifier at all this is the old
+        # honest fallback (both False).
+        source="fallback",
+        semantic_failed=semantic_classifier is not None
+        and not _semantic_unavailable,
+        semantic_unavailable=_semantic_unavailable,
+    )
+
+
+def _build_deterministic(
+    raw: str,
+    t: str,
+    ctx: dict[str, Any],
+    *,
+    references: list[str],
+    interval: Optional[int],
+    condition: Optional[dict[str, Any]],
+    target_url: Optional[str],
+    product: str,
+    has_email: bool,
+    has_product: bool,
+    has_website: bool,
+    has_price: bool,
+    notify: bool,
+    secondary: list[str],
+) -> Objective:
+    """The deterministic cascade (the old build_objective body).
+
+    Called ONLY when the precedence gate counted exactly one
+    deterministic rule family. Every ``return`` below is a
+    deterministic routing decision; the semantic fallback lives in
+    :func:`build_objective`, not here.
+    """
 
     def _monitor_objective(primary: str, entities_override: Optional[dict[str, Any]] = None) -> Objective:
         cond = condition
@@ -1016,29 +1581,10 @@ def build_objective(
     def _listing_noun() -> Optional[str]:
         """The thing a new-listings watch is for, or None.
 
-        The product phrase itself names it ("track new SDE
-        internships ...") — a later anaphoric "a new one appears"
-        must not override it with the pronoun "one".
+        Delegates to the module-level rule shared with the precedence
+        gate so the two cannot drift apart.
         """
-        if has_price:
-            return None
-        if not re.search(
-            r"\b(?:appears?|shows?\s+up|comes?\s+up|posted|listed)\b", t
-        ):
-            return None
-        if product and product.lower().startswith("new "):
-            noun = product[4:].strip()
-            if noun and noun.lower() not in {"one", "ones", "it", "this", "that"}:
-                return noun
-        m = _NEW_LISTING_RE.search(t)
-        if m:
-            noun = m.group(1).strip()
-            if noun and noun.lower() not in {"one", "ones", "it", "this", "that"}:
-                return noun
-        return None
-
-    if not t:
-        return _make_objective(raw, "conversational", missing=["instruction"])
+        return _listing_noun_for(t, product, has_price)
 
     # 1. Greeting / capability question.
     if _GREETING_RE.match(t):
@@ -1256,11 +1802,8 @@ def build_objective(
             target_url=target_url,
         )
 
-    # 13. Genuinely ambiguous: semantic classification only when the
-    # caller supplied a model callable; otherwise say so honestly
-    # instead of guessing an intent.
-    if semantic_classifier is not None:
-        semantic = classify_semantic(t, semantic_classifier)
-        if semantic is not None:
-            return semantic
+    # 13. No deterministic rule fired. The gate only calls this
+    # function when exactly one family fired, so reaching here means
+    # the gate and the cascade disagree — the tripwire warning in
+    # build_objective records it. Say so honestly instead of guessing.
     return _make_objective(raw, "conversational", references=references, missing=["intent_ambiguous"])

@@ -1003,9 +1003,33 @@ async function doSpecialInput(
     : method === "setDate" ? await agent.setDate(target.targetId, p.date, target.name)
     : await agent.uploadFile(target.targetId, p.fileName, p.base64, target.name);
   if (!result.ok) return err("STALE_TARGET", `${actionLabel(action)}: ${result.error ?? "input not verified"}`, true);
+  if (method === "setDate") {
+    // Stream C (round 6): a date set is a field REPLACEMENT — verify the
+    // exact final value with an independent read-back, exactly like the
+    // type path, instead of trusting the content script's ok flag (its
+    // "selected and read back" evidence below was asserted without ever
+    // reading back). A malformed date silently leaves the old value in a
+    // date input, and without this check the planner concludes the refine
+    // worked and re-submits the old date.
+    const expected = String(p.date ?? "");
+    let actual: string | undefined = result.value;
+    try {
+      const probe = await agent.readValue(target.targetId, target.name);
+      if (probe.ok && typeof probe.value === "string") actual = probe.value;
+    } catch {
+      // Fall through to the comparison against result.value.
+    }
+    const verified = actual === expected;
+    logInputVerify(target.name || target.targetId, true, expected, undefined, actual, verified);
+    if (!verified) {
+      // Never embed the values: the mismatch itself is all the planner
+      // needs to retry or re-ground.
+      return err("STALE_TARGET", `${actionLabel(action)}: date value not confirmed in the DOM`, true);
+    }
+  }
   await settleDom(tabId);
   return { ok: true, targetId: target.targetId, observation: await observe(tabId),
-    evidence: `${action.type} selected and read back`,
+    evidence: method === "setDate" ? `${action.type} set and read back` : `${action.type} selected`,
     verification: { targetConfidence: 0.85, dispatchAcknowledged: false, surfaceChanged: true } };
 }
 
@@ -1202,12 +1226,13 @@ const CDP_KEYS = {
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: "\r", unmodifiedText: "\r" },
   Backspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
   A: { key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
+  End: { key: "End", code: "End", windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
 } as const;
 
 const CTRL_MODIFIER = 2;
 const META_MODIFIER = 4;
 
-export type CdpKeyIntent = "enter" | "backspace" | "selectAll";
+export type CdpKeyIntent = "enter" | "backspace" | "selectAll" | "caretEnd";
 
 /**
  * Build the raw CDP key events for one intent.
@@ -1223,6 +1248,7 @@ export function cdpKeySequence(
   const desc =
     intent === "enter" ? CDP_KEYS.Enter
     : intent === "backspace" ? CDP_KEYS.Backspace
+    : intent === "caretEnd" ? CDP_KEYS.End
     : CDP_KEYS.A;
   const base: Record<string, unknown> = {
     modifiers,
@@ -1342,13 +1368,59 @@ async function dispatchKeySequence(
   }
 }
 
-/** Compare the DOM value read back after typing with what we asked for. */
-export function typedValueMatches(actual: string | undefined, expected: string, clear: boolean): boolean {
+/** Compare the DOM value read back after typing with what we asked for.
+ *
+ * Stream C (round 6): replace vs append.
+ * - Replace (`clear`): the final DOM value must EQUAL the intended value
+ *   exactly — no trim forgiveness, no contains/endsWith. A padded, echoed
+ *   or buried value is a different final value and fails honestly.
+ * - Append (`!clear`): the final DOM value must EQUAL the EXPECTED
+ *   COMBINED value, `original + expected`, where `original` is the field's
+ *   value read immediately before typing. Ends-with alone used to verify
+ *   here, which let an append onto a corrupted original pass (the field
+ *   held junk before the appended text, so the submitted value was wrong).
+ * - Append with an unknown original (`original` null/undefined): there is
+ *   no combined value to check against, so verification FAILS honestly
+ *   instead of guessing from endsWith. Callers always capture the
+ *   pre-typing value; when they cannot, the planner retries with clear.
+ */
+export function typedValueMatches(actual: string | undefined, expected: string, clear: boolean, original?: string | null): boolean {
   const value = actual ?? "";
   if (clear) {
-    return value === expected || value.trim() === expected.trim();
+    return value === expected;
   }
-  return value === expected || value.endsWith(expected) || value.includes(expected);
+  if (typeof original !== "string") {
+    return false;
+  }
+  return value === original + expected;
+}
+
+/** Emit the shared INPUT_VERIFY vocabulary line for one typing verification.
+ *
+ * Values are logged because the contract's evidence format requires
+ * expected-vs-actual; this goes to the extension service worker console
+ * (the user's own browser profile, the same trust domain that already
+ * holds the values) — never into error strings returned to the backend,
+ * which keep the existing no-values rule for secrets.
+ */
+export function logInputVerify(
+  field: string,
+  clear: boolean,
+  text: string,
+  original: string | null | undefined,
+  actual: string | undefined,
+  verified: boolean,
+): void {
+  const clean = (s: string | undefined) => String(s ?? "").replace(/[\r\n]+/g, " ");
+  const mode = clear ? "replace" : "append";
+  const expected = clear ? text : (typeof original === "string" ? original + text : text);
+  try {
+    console.log(
+      `INPUT_VERIFY field=${clean(field)} mode=${mode} expected=${clean(expected)} actual=${clean(actual)} result=${verified ? "pass" : "fail"}`,
+    );
+  } catch {
+    // Logging must never break typing.
+  }
 }
 
 interface FocusPoint {
@@ -1470,9 +1542,26 @@ async function cdpType(
     // what allows insertText to target the right editable.
     await cdpMouseClick(target, coords);
 
+    // Read the pre-typing value BEFORE clearing or inserting: append
+    // verification needs the original to compute the expected combined
+    // value (original + text). The click focuses the field, so the active
+    // value is the field's value when the target lookup itself misses.
+    const beforeProbe = await cdpEvaluate(target, valueProbeExpression(options.targetId, options.targetName));
+    const originalValue: string | undefined =
+      beforeProbe?.targetFound ? beforeProbe.targetValue
+      : beforeProbe?.activeEditable ? beforeProbe.activeValue
+      : undefined;
+
     if (clear) {
       await dispatchKeySequence(target, cdpKeySequence("selectAll", isMacPlatform()));
       await dispatchKeySequence(target, cdpKeySequence("backspace"));
+    } else {
+      // The focus click lands at the element's centre, which puts the caret
+      // mid-text; an append must insert at the END of the value, or the
+      // text lands buried mid-string and verification (correctly) fails.
+      // The in-page fallback appends at the end by construction; the
+      // native path has to move the caret there explicitly.
+      await dispatchKeySequence(target, cdpKeySequence("caretEnd"));
     }
 
     await debugSend(target, "Input.insertText", { text });
@@ -1482,7 +1571,8 @@ async function cdpType(
     await new Promise(r => setTimeout(r, 60));
     const probe = await cdpEvaluate(target, valueProbeExpression(options.targetId, options.targetName));
     const actualValue: string = probe?.targetFound ? probe.targetValue : probe.activeValue;
-    const verified = typedValueMatches(actualValue, text, clear);
+    const verified = typedValueMatches(actualValue, text, clear, originalValue);
+    logInputVerify(options.targetName || options.targetId || "", clear, text, originalValue, actualValue, verified);
     let submitted = false;
     let submitMethod: "button" | "enter" | undefined;
 
@@ -2019,6 +2109,20 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
   // 2. In-page fallback only when the native path is unavailable or could not
   //    verify the actual DOM value. It is not described as trusted input.
   if (!verified) {
+    // Capture the pre-typing value first: append verification needs the
+    // original to compute the expected combined value. (If the native
+    // path already typed, this is the post-native value — an append onto
+    // a native-corrupted value then fails honestly instead of verifying
+    // against a stale original.)
+    let fallbackOriginal: string | undefined;
+    if (target.tag !== "select") {
+      try {
+        const before = await agent.readValue(targetId, targetName);
+        if (before.ok && typeof before.value === "string") fallbackOriginal = before.value;
+      } catch {
+        // Unknown original: append verification fails honestly below.
+      }
+    }
     let res: { ok: boolean; error?: string; value?: string };
     try {
       throwIfAborted(signal);
@@ -2036,7 +2140,9 @@ async function doType(action: Extract<BrowserAction, { type: "type" }>, taskId: 
       if (!probe.ok && res.value === undefined) {
         return err("STALE_TARGET", `${actionLabel(action)}: typed value could not be read back from the page`, true);
       }
-      if (!typedValueMatches(actual, typedText, clear)) {
+      const fallbackVerified = typedValueMatches(actual, typedText, clear, fallbackOriginal);
+      logInputVerify(targetName || targetId, clear, typedText, fallbackOriginal, actual, fallbackVerified);
+      if (!fallbackVerified) {
         // Never embed the values: the typed text and the DOM value
         // can both be secrets (a password, PIN, OTP). The mismatch
         // itself is all the planner needs to retry or re-ground.

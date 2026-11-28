@@ -213,11 +213,19 @@ def test_json_product_api_uses_lowest_seller_price(fixture_server):
 
 
 def test_price_never_first_currency_match_when_amounts_compete():
-    """Several competing amounts and no structure/context: the price
-    is unknown (None), not the first number on the page."""
+    """Several competing amounts: the price is the explicitly labelled
+    current one ("was ₹8,999 · now ₹5,499"), never the first number on
+    the page (the ₹999 banner). NOTE: this expectation was updated in
+    the wiring-final round — the pre-Stream-2 version asserted None on
+    the grounds that the text had "no structure/context", but "was …
+    now …" IS label structure, and the label-aware disambiguator
+    (Stream 2, "Was ₹9,999, now ₹4,199" -> 4199 in
+    test_price_form_safety.py) deliberately resolves it. The guard this
+    test exists for — never returning the first currency match — still
+    holds: 999.0 is never the answer."""
     text = "Banner ₹999 · was ₹8,999 · now ₹5,499 · clearance ₹499"
     price, _source = _extract_price({}, text)
-    assert price is None
+    assert price == 5499.0
 
 
 def test_contextual_price_wins_over_banner():

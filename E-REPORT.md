@@ -352,3 +352,109 @@ cd extension && npm test
   stream's files; each defect is reported above with file:line for the owner.
 - The bare-password 1/24 privacy leak is left as a documented gap (no safe
   pattern exists).
+
+---
+
+# v4 appendix — Stream E (round 6): live verification driver + regression + delivery
+
+> Status: **PREP DONE — WAITING FOR MERGE SIGNAL** (2026-11-27 ~23:00 IST).
+>
+> NOTE: this file already existed at base `ab003b9` (the round-3 stream-E
+> report above); the v4 work is APPENDED here, not overwriting it, per the
+> task's named report path `~/workspace/navigator-audit/worktrees6/E-REPORT.md`.
+> Base commit: `ab003b9`. Streams A–D worktrees are still at `ab003b9`
+> with no stream commits yet (checked 2026-11-27 ~22:55 IST). **No final
+> verification run starts until the coordinator signals the merge is done.**
+
+## v4.1 Prep completed (this turn)
+
+- Read `~/workspace/navigator-audit/worktrees6/CONTRACTS6.md` and
+  `~/workspace/navigator-audit/reports/FINAL_DELIVERY3.md` (v3 baseline:
+  12-step 10/12, orig5 3/5, regression 1848 passed / 6 failed — all 6
+  pre-existing on `bddb272`; frontend + extension builds exit 0; vitest 208).
+- Verified FreePi live: `curl --noproxy '*' http://127.0.0.1:8452/v1/models`
+  lists `deepseek-v4.1-flash`. No second proxy started.
+- Created E worktree `~/workspace/navigator-audit/worktrees6/E` at `ab003b9`
+  (detached; none existed — A–D only).
+- Recon for the drivers (all against the `ab003b9` tree, read-only):
+  - Notification pull endpoint is `GET /api/monitoring/events?since=&unread=true`
+    + `POST /api/monitoring/events/{id}/read` (`backend/app/main.py:1128+`,
+    `monitoring_scheduler.py:152+` — missed-event pull marks rows delivered;
+    outbox table `notification_outbox`). Note: v3 §8 listed
+    "`/api/notifications` returns 404" — the pull endpoint above is the
+    live path; re-verify at runtime whether streams A–D changed it.
+  - ShopSphere sandbox: `demo-sandboxes/ecommerce/`, port 8125, operator
+    token `demo-operator`, `POST /api/v1/operator/price {seller_id, price}`,
+    changes visible only via normal GET endpoints (README verified).
+  - Provider-failure leg design: dead endpoint `http://127.0.0.1:9/v1` +
+    invalid model, each on a scratch backend (port 8001, fresh DB). The
+    shared FreePi proxy is NOT stopped (other streams use it); the dead
+    endpoint is the controlled equivalent and is recorded as such.
+  - Prior round-3 findings above still constrain the design: D2 (Wikipedia
+    does not load in sandboxed Chrome) and D3 (host:port verifier mismatch
+    for `127.0.0.1:<port>` sandbox URLs) are re-checked at runtime, not
+    assumed fixed; the egress-proxy forwarder (`/tmp/e-fwd-proxy.js`,
+    §1 above) is the fallback if Playwright's direct proxy config fails.
+- Built the driver suite in `~/workspace/navigator-audit/final4/` (canonical
+  location, per CONTRACTS6 file ownership) with a copy in this worktree's
+  `e-drivers/` for the commit record. All drivers syntax-checked:
+  `py_compile` OK, `bash -n` OK, `node --check` OK, all 6 prompt files
+  parse as JSON (5 + 12 + 9 + 3 + 5 + 4 prompts).
+
+## v4.2 Driver inventory
+
+| Driver / file | Verifies (task item) |
+| ---- | ---- |
+| `run_replay4.py` (+ `prompts-*.json`) | Items 1, 2, 3, 5, 6 + 12-step regression baseline. Extends the v3 driver: snapshots `notification_outbox` + full `monitoring_events`, row counts for EVERY sqlite table, settings-like tables in full, per-step + per-run contract log-line counts (`SEMANTIC_CLASSIFY` / `SEMANTIC_OVERRIDE` / `DETERMINISTIC_ROUTE` / `DISPATCH_DECISION` / `PRICE_EXTRACT` / `INPUT_VERIFY` / `SSRF_PROBE`, plus `model=mock` detection) |
+| `prompts-orig5.json` | Item 1 — original failed conversation, verbatim |
+| `prompts-watches.json` (9 turns) | Item 2 — two watches (Sony WH-1000XM5 15%/20 min; AirPods Pro 3 <₹15000/hourly), list, "change that watch" (records which it resolves to), pause first, resume, explicit Sony threshold change to 20%, final list |
+| `prompts-nonshopping.json` (3 turns) | Item 3 — Wikipedia page watch for Samsung Galaxy S26, 30 min; verify `text_change` type + URL |
+| `prompts-ambiguous.json` (5 turns) | Item 5 — "hmm, what about that thing", compound Sony watch + daily summary, pronoun follow-up, final watches+jobs list |
+| `prompts-browser-search.json` (4 turns) | Item 6 — flight search HYD→DEL 5 Dec 2026, refine destination to Mumbai, refine date to 12 Dec 2026, cheapest from results (real extension path) |
+| `price_change_probe.py` | Item 4 — ShopSphere operator price drop (~20%) → scheduler detection → `monitoring_events` + `notification_outbox` + `GET /api/monitoring/events` pull (incl. reconnect re-pull) + backend broadcast log lines + chat alert; dedup leg re-applies the SAME price and expects exactly 1 event. Stops with a recorded finding (no forcing) if the stored `target_url` is not the ShopSphere URL |
+| `provider_failure_probe.py` | Item 7 — dead endpoint + invalid model legs, scratch backend port 8001, fresh DB each; records verbatim task messages, zero-`model=mock` check, semantic/error log lines |
+| `run_regression4.sh` | Item 8 — full backend pytest + frontend build + extension build + vitest on the merged copy AND a fresh pristine `ab003b9` worktree; emits `-merged.json`, `-base.json`, `-diff.txt` with named merged-only failures |
+| `run-backend-freepi4.sh` / `ext-launch4.cjs` | Harness: merged copy, fresh DB, FreePi `deepseek-v4.1-flash`, port 8000; real CFT Chrome + real built extension |
+| `build-v4.sh` | ZIP builder: tracked tree + staging extras (`start-navigator.bat/.ps1`, `scripts/`, `PROVIDER_SETUP.md`, `FINAL_DELIVERY.md`, `FINAL_DELIVERY4.md`), testzip + exclusion + staging-presence checks, SHA-256 |
+| `make-patch-v4.sh` | `git diff ab003b9..FINAL` + `git apply --check` + apply on fresh `ab003b9` checkout + file-set + tree-match verification |
+| `final4/README.md` | Full runbook (merge-gate, venv, extension build, fresh-DB-per-series order, delivery steps) |
+
+## v4.3 Verification results (TO BE FILLED AFTER THE MERGE SIGNAL)
+
+### v4.3.1 Original conversation (item 1) — pending
+### v4.3.2 Two watches, modify / pause / resume (item 2) — pending
+### v4.3.3 Non-shopping monitor (item 3) — pending
+### v4.3.4 Controlled price change → real notification (item 4) — pending
+### v4.3.5 Ambiguous instruction + semantic trace (item 5) — pending
+### v4.3.6 Browser search + refine (item 6) — pending
+### v4.3.7 Provider failure, honest error, no mock (item 7) — pending
+### v4.3.8 Full regression: merged vs pristine ab003b9 (item 8) — pending
+
+Result separation (per task): LIVE-VERIFIED / IMPLEMENTED BUT UNVERIFIED /
+REQUIRES USER'S LOCAL CHROME. No prices, identities, or dates fabricated;
+no notifications injected; every live claim carries task id, provider/model,
+log excerpt or DB row, timestamp.
+
+## v4.4 Delivery (pending — after verification)
+
+- `~/workspace/your_files/NAVIGATOR-final-v4.zip` (build-v4.sh, testzip + SHA-256)
+- `~/workspace/your_files/NAVIGATOR-patch-v4.diff` (make-patch-v4.sh, apply verified)
+- `~/workspace/navigator-audit/reports/FINAL_DELIVERY4.md`
+- Evidence under `~/workspace/navigator-audit/final4/`
+
+## v4.5 Notes / risks for the coordinator
+
+- Streams A–D had no commits at prep time; the merged FINAL SHA is still
+  unknown. All runbook steps key off the coordinator's merge signal.
+- `prompts-browser-search.json` uses flight search (destination + date
+  refinement). If the merged build routes travel searches to the local
+  travel demo-sandbox instead of the public web, record which path was
+  actually taken — do not force the public-web path.
+- `price_change_probe.py` depends on the conversational watch landing on
+  the ShopSphere URL. v3 §5 U1 showed silent site substitution
+  (Amazon → Flipkart); if that recurs here the probe records it as a
+  finding and the item-4 verdict becomes "not demonstrable via this path",
+  not a forced pass. Round-3 defect D3 (host:port verifier) may also affect
+  sandbox-URL tasks — re-check at runtime.
+- FreePi 429s ("one request at a time") flaked v3 step 4; browser turns
+  may need a retry at runtime — retries are recorded, never hidden.

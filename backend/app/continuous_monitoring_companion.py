@@ -817,10 +817,17 @@ def _handle_watch_list(instruction: str, chat_id: Optional[str],
             and "my watches" not in (instruction or "").lower()
             and not _history_has_watch_marker(history)):
         return None
+    # LIVE-REPLAY (Stream 4): oldest first — the list order must
+    # agree with ordinal resolution ("first watch" = oldest,
+    # working_context.resolve_watch_target). Newest-first listed the
+    # Galaxy watch first, so "pause the first watch" paused the
+    # iPhone while the list said first = Galaxy; the next "resume
+    # it" turn then refused on the mismatch and left the iPhone
+    # paused.
     db.init_db(db_path)
     with db.get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM monitoring_missions ORDER BY created_at DESC"
+            "SELECT * FROM monitoring_missions ORDER BY created_at ASC"
         ).fetchall()
     if not rows:
         return (
@@ -1263,6 +1270,79 @@ def parse_percent_drop(instruction: str) -> float | None:
     return None
 
 
+def _parse_percent_threshold(instruction: str) -> float | None:
+    """A percent threshold named as a value to SET, not a drop event.
+
+    Merge phase (v4, Stream D G25): "change the threshold to 5 percent"
+    names a threshold value, but parse_percent_drop only recognises
+    drop constructions ("10% off", "drops by 10%") — it returns None
+    here, so the update was a no-op. Generic: the words threshold /
+    discount / drop followed by a number + percent. Only used by the
+    absolute-update handler, never by creation routing.
+    """
+    m = re.search(
+        r"\b(?:threshold|discount|drop)\b[^0-9\n]{0,30}?"
+        r"(\d+(?:\.\d{1,2})?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty)"
+        r"\s*(?:%|percent|per\s*cent)",
+        instruction or "",
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    raw = m.group(1).lower()
+    try:
+        value = float(_WORD_NUMBERS[raw]) if raw in _WORD_NUMBERS else float(raw.replace(",", ""))
+    except ValueError:
+        return None
+    return value if 0 < value <= 100 else None
+
+
+def _parse_replacement_price(instruction: str) -> tuple[float | None, float | None]:
+    """(new, old) for a replace-the-value construction.
+
+    Merge phase (v4, Stream D G27-live): "actually make that 10000
+    rupees not 5000" replaces one absolute price with another, but no
+    existing parser recognises the shape (no below/under/drop word),
+    so the update minted a bogus watch titled "I Made". Generic
+    construction — make/change/set/update <new> [currency] not /
+    instead of / rather than / from <old> — never a product or site.
+    """
+    m = re.search(
+        r"\b(?:make|change|set|update)\b[^0-9\n]{0,40}?"
+        r"([\d,]+(?:\.\d{1,2})?)\s*(?:rupees|rs\.?|₹|\$)?\s*"
+        r"(?:not|instead\s+of|rather\s+than|from)\s*([\d,]+(?:\.\d{1,2})?)",
+        instruction or "",
+        re.IGNORECASE,
+    )
+    if not m:
+        return None, None
+    try:
+        new = float(m.group(1).replace(",", ""))
+        old = float(m.group(2).replace(",", ""))
+    except ValueError:
+        return None, None
+    return new, old
+
+
+def _parse_threshold_price(instruction: str) -> float | None:
+    """A price named as the threshold value: "change the threshold
+    to ₹4000". Only used by the absolute-update handler. The number
+    must not be followed by %/percent (that is a percent threshold,
+    handled by _parse_percent_threshold first)."""
+    m = re.search(
+        r"\bthreshold\b[^0-9\n]{0,30}?[₹$]?\s*([\d,]+(?:\.\d{1,2})?)"
+        r"(?!\s*(?:%|percent))",
+        instruction or "",
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
 def _percent_from_history(history: Optional[list[dict[str, Any]]]) -> float | None:
     """Most recent %-drop in the last few history turns.
 
@@ -1599,12 +1679,14 @@ def _product_phrase_from_text(text: str) -> str:
     # product — without this the greeting alone counts as a product).
     # "out" covers the phrasal verbs ("check out the new deals",
     # "watch out for ..."), which name no product.
-    if words[0].lower() in {"on", "for", "over", "about", "of", "at", "to", "in", "with", "from", "by", "out"}:
+    if words[0].lower() in {"on", "for", "over", "about", "of", "at", "to", "in", "with", "from", "by", "out", "instead", "rather"}:
         return ""
     # Possessive pronouns name someone's account, not a product
     # ("watch my email", "check your inbox" must not become watches
-    # for "my email" / "your inbox").
-    if words[0].lower() in {"its", "it", "this", "that", "them", "their", "they", "he", "she", "my", "your", "his", "her", "our"}:
+    # for "my email" / "your inbox"). First-person pronouns are the
+    # same shape ("I made" is a clause about the user, never a
+    # product — it used to title a bogus watch).
+    if words[0].lower() in {"its", "it", "this", "that", "them", "their", "they", "he", "she", "my", "your", "his", "her", "our", "i", "we", "you"}:
         return ""
     if _is_service_name(phrase):
         return ""
@@ -1843,11 +1925,47 @@ def needs_unverified_suggestion_note(instruction: str, answer: str) -> bool:
 def _is_garbage_product_title(title: str) -> bool:
     """True when a candidate "product" is really the instruction's
     tail misread as a name: a pronoun-led fragment ("This For Every
-    5 Mins", "That Watch") or a bare cadence ("Twice As Often",
-    "Every 5 Mins"). No real product name contains those words, so
+    5 Mins", "That Watch"), a bare cadence ("Twice As Often",
+    "Every 5 Mins"), a connective ("Instead"), or a clause about the
+    user ("I Made"). No real product name contains those words, so
     this is a safe repair trigger — never a product filter."""
-    words = set(re.findall(r"[a-z]+", (title or "").lower()))
-    return bool(words & {"this", "that", "it", "every", "twice", "half"})
+    words = re.findall(r"[a-z]+", (title or "").lower())
+    if not words:
+        # Empty is absence, not garbage: callers already test
+        # `not candidate_title` separately, and the repair branches
+        # erase a candidate when ANY of (candidate, raw candidate)
+        # is garbage — counting "" as garbage erased good history
+        # candidates whenever the instruction named nothing (v4
+        # merge regression: the Grandbiker cadence follow-up).
+        return False
+    if words[0] in {"i", "we", "you", "my", "your"}:
+        return True
+    return bool(set(words) & {"this", "that", "it", "every", "twice", "half", "instead", "rather", "made", "make"})
+
+
+def _store_search_query(url: str) -> str | None:
+    """The q= value of a store search URL, else None. Product pages
+    (no /search path) and non-store hosts are not search URLs."""
+    try:
+        from urllib.parse import urlsplit, parse_qs
+        parts = urlsplit(url or "")
+        if not any(d in (parts.hostname or "") for d in ("flipkart.", "amazon.", "croma.")):
+            return None
+        if "search" not in parts.path:
+            return None
+        vals = parse_qs(parts.query).get("q") or []
+        return vals[0] if vals else None
+    except Exception:
+        return None
+
+
+def _query_names_product(query: str, product: str) -> bool:
+    """True when a store search query and a product share a
+    distinctive token (\"iphone 17\" names iPhone 17; \"kindle
+    paperwhite\" does not name Sony WH-1000XM5)."""
+    def _toks(s: str) -> set[str]:
+        return {t for t in re.findall(r"[a-z0-9][a-z0-9\-]*", (s or "").lower()) if len(t) >= 3}
+    return bool(_toks(query) & _toks(product))
 
 
 def _extract_monitored_product(instruction: str, history: Optional[list[dict[str, Any]]] = None,
@@ -1933,6 +2051,24 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     if objective_url:
         best_url = objective_url
 
+    # LIVE-REPLAY (Stream 4): "watch the Wikipedia page for <Topic>"
+    # names a page, not a product — live it became a price watch
+    # titled "Wikipedia Page For Kindle For Changes" on a Flipkart
+    # search URL. Resolve it to the article URL so the handler builds
+    # a text_change page watch for the topic instead.
+    if not best_url:
+        _wiki_m = re.search(
+            r"\bwikipedia\s+page\s+(?:for|on|about)\s+([A-Za-z][\w\-]*(?:\s+[A-Za-z][\w\-]*){0,2})",
+            instruction or "", re.IGNORECASE)
+        if _wiki_m:
+            _topic = re.split(
+                r"\s+(?:for|on|about|changes?|every|each|hours?|minutes?|days?)\b",
+                _wiki_m.group(1), flags=re.IGNORECASE)[0].strip()
+            if _topic:
+                candidate_title = _topic
+                raw_candidate_title = _topic
+                best_url = f"https://en.wikipedia.org/wiki/{urllib_quote(_topic)}"
+
     # Look back in history for product name and URL. The history scan
     # used to take the first brand+model match from ANY message —
     # including the agent's own greeting ("Connected apps — Gmail,
@@ -1948,6 +2084,13 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     # Two passes, user first: the operator's own words outrank the
     # assistant's paraphrase, so an assistant-derived candidate can
     # never shadow the product the user actually named.
+    # LIVE-REPLAY (Stream 4): remember what THIS instruction yielded
+    # before the history scan — a history-derived candidate must not
+    # outrank the objective's product, which is extracted from this
+    # instruction itself (see the repair below).
+    instruction_candidate = candidate_title
+    raw_instruction_candidate = raw_candidate_title
+    best_url_from_history = False
     if history:
         # Pass 0: a store URL from any message (a pasted URL is a real
         # signal whatever its role) — only when the instruction gave none.
@@ -1957,6 +2100,7 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
                 url_match = re.search(r"https?://[^\s\"'<>)]+", content)
                 if url_match and ("amazon" in url_match.group(0) or "flipkart" in url_match.group(0) or "croma" in url_match.group(0)):
                     best_url = url_match.group(0)
+                    best_url_from_history = True
                     break
         # A garbage candidate ("This For Every 5 Mins") must not
         # block the history scan: a real product named in an
@@ -2009,17 +2153,71 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
     # candidate is empty or garbage; otherwise drop the garbage so the
     # caller asks instead of minting a watch for it. A clean regex
     # candidate still wins — the objective is the repair, not the
-    # default. Then strip any threshold tail the history scan may have
-    # kept ("kestrel 4k drone below 40000"). Judge garbage-ness on the
+    # default. LIVE-REPLAY (Stream 4): the same repair applies when
+    # the candidate came ONLY from history — the history scan can
+    # lift a question phrase ("latest samsung phone thats released"
+    # from "check the latest samsung phone thats released") while
+    # the objective correctly extracted the product named in THIS
+    # instruction ("Galaxy S26 Ultra 5G"). The objective is built
+    # from this instruction alone, so it outranks a history guess;
+    # an instruction-derived clean candidate still wins. Then strip
+    # any threshold tail the history scan may have kept ("kestrel
+    # 4k drone below 40000"). Judge garbage-ness on the
     # pre-sanitize candidate too (see above): a sanitized remnant like
     # "3 so can u watch" must still trigger the objective repair.
-    if not candidate_title or _is_garbage_product_title(candidate_title) or _is_garbage_product_title(raw_candidate_title):
-        if objective_product and not _is_service_name(objective_product) and not _is_retailer_or_place_product(objective_product):
-            candidate_title = objective_product
-        elif candidate_title:
-            candidate_title = ""
+    _history_only_candidate = (
+        not instruction_candidate
+        or _is_garbage_product_title(instruction_candidate)
+        or _is_garbage_product_title(raw_instruction_candidate)
+    )
+    # LIVE-REPLAY (Stream 4): the objective's own product extraction
+    # is unreliable for pronoun follow-ups — build_objective("or do
+    # one thing, check its price ...") yields product "or do one
+    # thing". Such a phrase must never override a good history
+    # candidate (the Grandbiker follow-up tests regressed on this).
+    # Only a product-like objective product — a model number / digit
+    # ("Galaxy S26 Ultra 5G", "iPhone 17") or a known brand token —
+    # outranks history; anything else falls back to the history
+    # candidate (pre-existing behaviour).
+    _objective_product_like = bool(
+        objective_product
+        and (
+            re.search(r"\d", objective_product)
+            or re.search(rf"\b(?:{_MONITORED_BRANDS})\b", objective_product, re.IGNORECASE)
+        )
+    )
+    if (
+        objective_product
+        and not _is_service_name(objective_product)
+        and not _is_retailer_or_place_product(objective_product)
+        and (
+            not candidate_title
+            or _is_garbage_product_title(candidate_title)
+            or _is_garbage_product_title(raw_candidate_title)
+            or (_history_only_candidate and _objective_product_like)
+        )
+    ):
+        candidate_title = objective_product
+    elif candidate_title and (
+        _is_garbage_product_title(candidate_title)
+        or _is_garbage_product_title(raw_candidate_title)
+    ):
+        candidate_title = ""
     if candidate_title:
         candidate_title = sanitize_query_text(candidate_title)
+
+    # LIVE-REPLAY (Stream 4): a store SEARCH url inherited from
+    # history belongs to the product it was built for — live: the Sony
+    # WH-1000XM5 watch inherited the Kindle Paperwhite Flipkart search
+    # URL from the previous turn and would have checked Kindle prices.
+    # When the search query names a different product, drop it so the
+    # default below rebuilds the search from this product. Only
+    # history-inherited URLs are guarded — a URL the user pasted in
+    # this instruction (or the objective's) is theirs to keep.
+    if best_url_from_history and best_url and candidate_title:
+        _q = _store_search_query(best_url)
+        if _q is not None and not _query_names_product(_q, candidate_title):
+            best_url = ""
 
     if not candidate_title and not best_url:
         # No product was named anywhere: say so instead of inventing
@@ -2027,14 +2225,22 @@ def _extract_monitored_product(instruction: str, history: Optional[list[dict[str
         # would have watched the wrong product entirely.
         return "", ""
     if not candidate_title:
-        # A URL but no name: title it from the URL. A store product
-        # page gets "Product on <host>"; any other page gets its path
-        # slug ("Field Notes" for /notes) or the host.
-        host = (urlsplit(best_url).hostname or "store").removeprefix("www.")
-        if any(d in best_url.lower() for d in ("amazon.", "flipkart.", "croma.")):
-            candidate_title = f"Product on {host}"
+        # LIVE-REPLAY (Stream 4): a history-inherited store SEARCH
+        # url names its own product in q= — title from the query
+        # ("Kindle Paperwhite"), never the generic "Product on
+        # flipkart.com" the old branch minted for it.
+        _q = _store_search_query(best_url)
+        if _q:
+            candidate_title = _q
         else:
-            candidate_title = _title_from_listing_url(best_url) or f"Page on {host}"
+            # A URL but no name: title it from the URL. A store product
+            # page gets "Product on <host>"; any other page gets its path
+            # slug ("Field Notes" for /notes) or the host.
+            host = (urlsplit(best_url).hostname or "store").removeprefix("www.")
+            if any(d in best_url.lower() for d in ("amazon.", "flipkart.", "croma.")):
+                candidate_title = f"Product on {host}"
+            else:
+                candidate_title = _title_from_listing_url(best_url) or f"Page on {host}"
     if not best_url:
         # A product but no store URL: watch its search page, never a
         # store homepage (whose first price is a banner, not the
@@ -2394,10 +2600,20 @@ def _objective_for(instruction: str, objective: Any | None = None) -> dict | Non
         return None
     try:
         from .objective import build_objective
+        from .semantic_classifier import make_semantic_classifier
     except Exception:
         return None
     try:
-        obj = build_objective(instruction or "")
+        # Merge phase (wiring): the companion path is also a production
+        # caller, so it gets the provider-backed classifier too — an
+        # ambiguous instruction here previously never reached semantic
+        # classification. The classifier is cached per prompt and only
+        # fires when deterministic routing is ambiguous; failures
+        # inside it fall back honestly via build_objective.
+        obj = build_objective(
+            instruction or "",
+            semantic_classifier=make_semantic_classifier(),
+        )
     except Exception:
         return None
     to_dict = getattr(obj, "to_dict", None)
@@ -2527,6 +2743,199 @@ def _apply_relative_interval_update(objective: dict, instruction: str,
     ) + f"\n\n<!-- privagent-watch: {mission_id} -->"
 
 
+_UPDATE_VERB_RE = re.compile(r"\b(?:change|update|modify|adjust|switch)\b", re.IGNORECASE)
+_UPDATE_MAKE_RE = re.compile(r"\bmake\s+(?:it|that|this|them)\b", re.IGNORECASE)
+_UPDATE_CREATION_RE = re.compile(
+    r"\b(?:set\s+up|create|start\s+(?:a\s+)?(?:new\s+)?watch|new\s+watch)\b",
+    re.IGNORECASE,
+)
+
+
+def _apply_absolute_update(objective: dict, instruction: str,
+                           chat_id: Optional[str],
+                           history: Optional[list[dict[str, Any]]],
+                           db_path: Optional[str]) -> str | None:
+    """In-place update for ABSOLUTE follow-up modifications.
+
+    Merge phase (v4, Stream D G25/G26/G27-live): only *relative*
+    interval updates ("twice as often") were handled in place. An
+    absolute interval ("make it check every hour instead of every
+    day"), an absolute price ("make that 10000 rupees not 5000") or
+    a percent threshold ("change the threshold to 5 percent") fell
+    through to creation, which minted bogus watches titled "Instead"
+    and "I Made" while the real watch never changed. This handler
+    extends the relative-update precedent: resolve the target watch
+    and apply interval / below-price / percent in place, verify by
+    DB re-read, and answer what changed. Returns None when the turn
+    is not an update, when no value is named (so creation/ask paths
+    still handle new watches), or when no watch resolves (so a new
+    watch can still be created). Never mints a watch.
+    """
+    obj = objective or {}
+    text = instruction or ""
+    intent = obj.get("primary_intent")
+    is_update = (
+        intent == "update_monitor"
+        or bool(_UPDATE_VERB_RE.search(text))
+        or bool(_UPDATE_MAKE_RE.search(text))
+    )
+    if not is_update:
+        return None
+    # A creation-shaped turn ("set up a watch", "create", "new watch")
+    # names a NEW watch, not a change to an existing one.
+    if _UPDATE_CREATION_RE.search(text):
+        return None
+    # Values named by this turn: structured objective first, raw-text
+    # parsers second (the objective may carry none when the turn was
+    # classified semantically without a condition).
+    interval = obj.get("interval_seconds")
+    if interval is None and _INTERVAL_RE.search(text):
+        interval = _parse_interval_seconds(text)
+    percent = None
+    cond = obj.get("condition") or {}
+    if isinstance(cond, dict) and cond.get("kind") == "percent_discount":
+        try:
+            percent = float(cond.get("value"))
+        except (TypeError, ValueError):
+            percent = None
+    if percent is None:
+        percent = _parse_percent_threshold(text)
+    below = None
+    if isinstance(cond, dict) and cond.get("kind") == "absolute_price":
+        try:
+            below = float(cond.get("value"))
+        except (TypeError, ValueError):
+            below = None
+    if below is None:
+        repl_new, _repl_old = _parse_replacement_price(text)
+        if repl_new is not None:
+            below = repl_new
+    if below is None:
+        below = _parse_threshold_price(text)
+    row, ambiguous = _resolve_update_target(obj, chat_id, history, db_path)
+    if ambiguous:
+        return ("That matches more than one watch — tell me which one to change, "
+                "by name or id (from the watch card). No watch was changed.")
+    if row is None:
+        return None
+    # A product named in this turn that does not match the resolved
+    # row is a different watch — never silently update the wrong one.
+    named = (obj.get("entities") or {}).get("product") or _product_phrase_from_text(text)
+    if named and not _is_garbage_product_title(str(named)):
+        if not _query_names_product(str(named), row.get("title") or ""):
+            _display = str(named)
+            if not any(
+                len(t) >= 4 and t.lower() not in {
+                    "threshold", "thresholds", "price", "prices", "watch",
+                    "product", "alert", "check", "monitor",
+                }
+                for t in re.findall(r"[A-Za-z0-9]+", _display)
+            ):
+                _display = "that product"
+            return (f"I couldn't find a watch for **{_display}** in this chat — "
+                    f"your watches here are listed on the dashboard. No watch was changed.")
+    mission_id = row["id"]
+    title = row.get("title") or mission_id
+    try:
+        params = json.loads(row.get("condition_params") or "{}")
+        if not isinstance(params, dict):
+            params = {}
+    except Exception:
+        params = {}
+    old_interval = row.get("interval_seconds") or 300
+    old_threshold = _as_float(params.get("threshold"))
+    old_percent = _as_float(params.get("min_percent"))
+    changes: list[str] = []
+    new_interval = old_interval
+    new_trigger = row.get("trigger_type")
+    new_cron = row.get("schedule_cron")
+    if interval is not None:
+        new_interval = max(60, min(604800, int(interval)))
+        new_trigger = "interval"
+        new_cron = None
+        if new_interval != old_interval:
+            changes.append(
+                f"checking {_describe_interval(old_interval)} → {_describe_interval(new_interval)}"
+            )
+    new_condition = row.get("condition_type")
+    if percent is not None:
+        new_condition = "price_drop"
+        if (old_percent or 0) != percent:
+            changes.append(
+                f"alert threshold {(_percent_threshold_text(old_percent) if old_percent else 'no percent threshold')} → {percent:g}% drop"
+            )
+        params["min_percent"] = percent
+    if below is not None:
+        new_condition = "below_price"
+        if old_threshold != below:
+            changes.append(
+                f"alert threshold {(f'below ₹{old_threshold:g}' if old_threshold is not None else 'no price threshold')} → below ₹{below:g}"
+            )
+        params["threshold"] = below
+    if interval is None and percent is None and below is None:
+        # An update-shaped turn with no value to apply: ask what to
+        # change instead of falling through to creation, which used
+        # to mint a bogus watch from the instruction's tail.
+        return ("What should I change on the watch for "
+                f"**{title}** — a new interval, price, or discount "
+                "percent? Tell me the new value and I'll update it. "
+                "No watch was changed.")
+    # The reply restates the watch's full current condition (the old
+    # rebuild path did the same): a pure interval change must still
+    # name the stored threshold, or the user cannot tell the watch
+    # kept it (regression tests in test_working_context_format_string).
+    _final_threshold = _as_float(params.get("threshold"))
+    _final_percent = _as_float(params.get("min_percent"))
+    if new_condition == "below_price" and _final_threshold is not None:
+        condition_line = f", alerting below ₹{_final_threshold:g}"
+    elif new_condition == "price_drop":
+        condition_line = _percent_threshold_text(_final_percent)
+    else:
+        condition_line = ""
+    if not changes:
+        return (
+            f"That watch is already running — **{title}** is being checked "
+            f"{_describe_interval(new_interval)}{condition_line}."
+        )
+    now = time.time()
+    with db.get_connection(db_path) as conn:
+        conn.execute(
+            """UPDATE monitoring_missions
+               SET trigger_type=?, schedule_cron=?, interval_seconds=?,
+                   condition_type=?, condition_params=?, next_run_at=?
+               WHERE id=?""",
+            (new_trigger, new_cron, new_interval, new_condition,
+             json.dumps(params), now, mission_id),
+        )
+        conn.commit()
+    with db.get_connection(db_path) as conn:
+        reread = conn.execute(
+            "SELECT * FROM monitoring_missions WHERE id=?", (mission_id,)
+        ).fetchone()
+    if reread is None:
+        return ("The watch change did not persist — the watch is gone. "
+                "No watch was changed; say 'list watches' to see the current state.")
+    _stored = json.loads(reread["condition_params"] or "{}") if isinstance(reread["condition_params"], str) else {}
+    if (
+        reread["interval_seconds"] != new_interval
+        or reread["condition_type"] != new_condition
+        or (percent is not None and _as_float(_stored.get("min_percent")) != percent)
+        or (below is not None and _as_float(_stored.get("threshold")) != below)
+    ):
+        return ("The watch change did not persist — the stored settings "
+                "are unchanged. No watch was changed; try again or check the dashboard.")
+    hub.spawn(hub.broadcast_control_state())
+    from .monitoring_scheduler import format_ist_short
+
+    return (
+        f"Updated the watch for **{title}** — " + "; ".join(changes) + condition_line + ".\n\n"
+        f"• **Watch ID:** `{mission_id}`\n"
+        f"• **Next check:** {format_ist_short(now) or '—'}\n"
+        f"• **Manage:** say `pause watch {mission_id[:8]}`, `resume watch {mission_id[:8]}`, "
+        f"or `cancel watch {mission_id[:8]}`, or use the card below."
+    ) + f"\n\n<!-- privagent-watch: {mission_id} -->"
+
+
 async def handle_continuous_monitoring_instruction(
     instruction: str,
     chat_id: Optional[str] = None,
@@ -2548,6 +2957,17 @@ async def handle_continuous_monitoring_instruction(
             obj, instruction, chat_id, history, db_path)
         if relative_answer is not None:
             return relative_answer
+    # Merge phase (v4, Stream D G25/G26/G27-live): absolute
+    # modifications ("check every hour instead of every day",
+    # "make that 10000 rupees not 5000", "change the threshold to
+    # 5 percent") are updated in place here, exactly like the
+    # relative ones above — they must never fall through to creation,
+    # which minted bogus watches titled "Instead" and "I Made".
+    if obj:
+        absolute_answer = _apply_absolute_update(
+            obj, instruction, chat_id, history, db_path)
+        if absolute_answer is not None:
+            return absolute_answer
     # Stream C: chat control + NL scheduling dispatch first — but a
     # genuine monitor ask always wins over a control phrase that
     # happens to share a word ("show me the jobs" inside a track-new
@@ -2667,7 +3087,19 @@ async def handle_continuous_monitoring_instruction(
     # from a paraphrase (in the live run, from the assistant's own
     # "Sony India" text). Ask instead — never create a watch from a
     # follow-up with no resolvable existing watch.
-    if _is_pure_follow_up(instruction) and _find_watch_by_product(product_title, chat_id, db_path) is None:
+    # LIVE-REPLAY (Stream 4): the objective's product is a product
+    # named in THIS instruction (the objective is built from this
+    # instruction alone) — e.g. "Galaxy S26 Ultra 5G so can u watch
+    # the price of this for every 5 mins", where the regexes miss
+    # "Galaxy S26 Ultra 5G" (no Samsung brand token) and the turn
+    # looks like a pure follow-up. With an objective product the
+    # turn names its product, so it is not a pure follow-up and
+    # must create, not ask.
+    if (
+        _is_pure_follow_up(instruction)
+        and not obj_product
+        and _find_watch_by_product(product_title, chat_id, db_path) is None
+    ):
         return (
             f"I don't have a watch running for **{product_title}** yet, so there's "
             "nothing to change — the earlier ask never became a watch. Tell me "
@@ -2702,6 +3134,21 @@ async def handle_continuous_monitoring_instruction(
     # the same-product case; a different product never inherits.
     if percent is None and below is None:
         below, percent = _thresholds_from_existing_watch(product_title, chat_id, db_path)
+    elif not percent_named:
+        # LIVE-REPLAY (Stream 4): a percent inherited from HISTORY
+        # must never override the running watch's own stored
+        # threshold for THIS product. _percent_from_history scans
+        # assistant text and can leak another product's percent —
+        # live: "Change that watch to every 15 minutes" rebuilt the
+        # Galaxy S26 Ultra 5G watch (stored min_percent 0, any drop)
+        # with min_percent 10.0 lifted from the iPhone 17 turn's
+        # "drops 10% or more" text. The stored row wins; history is
+        # only a fallback when no watch exists for this product.
+        _stored_below, _stored_percent = _thresholds_from_existing_watch(
+            product_title, chat_id, db_path
+        )
+        if _stored_below is not None or _stored_percent is not None:
+            below, percent = _stored_below, _stored_percent
 
     # Stream 3: the mission id is minted inside upsert_monitor_mission
     # (shared creation core) — no id is allocated before the dedup

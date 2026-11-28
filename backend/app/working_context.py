@@ -702,10 +702,13 @@ def resolve_watch_target(ctx: WorkingContext, text: str) -> dict[str, Any]:
                     "question": None, "candidates": slot_matches}
         if len(slot_matches) > 1:
             return _clarify(slot_matches)
-        return {"status": "clarification", "watch": None, "score": 0.0,
-                "question": f"I couldn't find a watch for '{slot}'. "
-                            f"{_list_hint(watches)} Which one did you mean?",
-                "candidates": watches}
+        # LIVE-REPLAY (Stream 4): a slot that matches nothing is NOT
+        # yet a failed reference — fall through to step 4, where any
+        # other word in the text can still resolve it ("Cancel the
+        # Sony headphones watch": slot "headphones" matches no title,
+        # but "sony" matches exactly one watch). Step 4 still
+        # clarifies when no word matches at all ("pause the zebra
+        # watch"), so the failed-reference behaviour is preserved.
 
     # 4. Any other distinctive word in the text ("headphones" in
     # "pause the headphones one"). A distinctive word that matches
@@ -723,8 +726,12 @@ def resolve_watch_target(ctx: WorkingContext, text: str) -> dict[str, Any]:
     if len(token_matches) > 1:
         return _clarify(token_matches)
     if words:
+        # LIVE-REPLAY (Stream 4): quote the named slot with its
+        # original casing when there is one ("Zebra", not "zebra") —
+        # the step-3 clarification used to carry the case.
+        _missing = slot if slot else words[0]
         return {"status": "clarification", "watch": None, "score": 0.0,
-                "question": f"I couldn't find a watch for '{words[0]}'. "
+                "question": f"I couldn't find a watch for '{_missing}'. "
                             f"{_list_hint(watches)} Which one did you mean?",
                 "candidates": watches}
 
